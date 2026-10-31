@@ -174,6 +174,7 @@ void main() {
         colliders: &[Collider],
         faucets: &[Faucet],
         drains: &[Drain],
+        is_2d: bool,
     ) {
         unsafe {
             gl.enable(glow::DEPTH_TEST);
@@ -184,24 +185,57 @@ void main() {
 
             // 1. Draw Chamber, Colliders, Faucets, and Drains
             let mut line_vertices = Vec::new();
-            for (p0, p1) in chamber.generate_wireframe_lines(&bounds) {
+            let chamber_wireframe = if is_2d {
+                chamber.generate_wireframe_lines_2d(&bounds)
+            } else {
+                chamber.generate_wireframe_lines(&bounds)
+            };
+            for (p0, p1) in chamber_wireframe {
                 line_vertices.push(LineVertex { pos: p0.to_array() });
                 line_vertices.push(LineVertex { pos: p1.to_array() });
             }
             for collider in colliders {
                 if collider.enabled {
-                    match &collider.shape {
-                        ColliderShape::Sphere { center, radius } => {
-                            Self::generate_sphere_lines(*center, *radius, 24, &mut line_vertices);
+                    if is_2d {
+                        match &collider.shape {
+                            ColliderShape::Sphere { center, radius } => {
+                                Self::generate_circle_lines_xy(*center, *radius, 32, &mut line_vertices);
+                            }
+                            ColliderShape::Box { aabb } => {
+                                let p0 = Vec3::new(aabb.min.x, aabb.min.y, 0.0);
+                                let p1 = Vec3::new(aabb.max.x, aabb.min.y, 0.0);
+                                let p2 = Vec3::new(aabb.max.x, aabb.max.y, 0.0);
+                                let p3 = Vec3::new(aabb.min.x, aabb.max.y, 0.0);
+                                line_vertices.push(LineVertex { pos: p0.to_array() });
+                                line_vertices.push(LineVertex { pos: p1.to_array() });
+                                line_vertices.push(LineVertex { pos: p1.to_array() });
+                                line_vertices.push(LineVertex { pos: p2.to_array() });
+                                line_vertices.push(LineVertex { pos: p2.to_array() });
+                                line_vertices.push(LineVertex { pos: p3.to_array() });
+                                line_vertices.push(LineVertex { pos: p3.to_array() });
+                                line_vertices.push(LineVertex { pos: p0.to_array() });
+                            }
+                            ColliderShape::Cylinder { center, radius, .. } => {
+                                Self::generate_circle_lines_xy(*center, *radius, 32, &mut line_vertices);
+                            }
+                            ColliderShape::Mesh(mesh) => {
+                                Self::generate_mesh_lines(mesh, &mut line_vertices);
+                            }
                         }
-                        ColliderShape::Box { aabb } => {
-                            Self::generate_box_lines(aabb, &mut line_vertices);
-                        }
-                        ColliderShape::Cylinder { center, radius, height } => {
-                            Self::generate_cylinder_lines(*center, *radius, *height, 16, &mut line_vertices);
-                        }
-                        ColliderShape::Mesh(mesh) => {
-                            Self::generate_mesh_lines(mesh, &mut line_vertices);
+                    } else {
+                        match &collider.shape {
+                            ColliderShape::Sphere { center, radius } => {
+                                Self::generate_sphere_lines(*center, *radius, 24, &mut line_vertices);
+                            }
+                            ColliderShape::Box { aabb } => {
+                                Self::generate_box_lines(aabb, &mut line_vertices);
+                            }
+                            ColliderShape::Cylinder { center, radius, height } => {
+                                Self::generate_cylinder_lines(*center, *radius, *height, 16, &mut line_vertices);
+                            }
+                            ColliderShape::Mesh(mesh) => {
+                                Self::generate_mesh_lines(mesh, &mut line_vertices);
+                            }
                         }
                     }
                 }
@@ -276,6 +310,25 @@ void main() {
             gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.use_program(None);
+        }
+    }
+
+    fn generate_circle_lines_xy(
+        center: Vec3,
+        radius: f32,
+        segments: usize,
+        lines: &mut Vec<LineVertex>,
+    ) {
+        let d_theta = std::f32::consts::TAU / segments as f32;
+        for i in 0..segments {
+            let t0 = i as f32 * d_theta;
+            let t1 = (i + 1) as f32 * d_theta;
+            lines.push(LineVertex {
+                pos: (center + Vec3::new(t0.cos() * radius, t0.sin() * radius, 0.0)).to_array(),
+            });
+            lines.push(LineVertex {
+                pos: (center + Vec3::new(t1.cos() * radius, t1.sin() * radius, 0.0)).to_array(),
+            });
         }
     }
 

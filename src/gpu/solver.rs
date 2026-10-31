@@ -466,6 +466,7 @@ impl GpuSphSolver {
         mouse_force_strength: f32,
         mouse_force_mode: i32,
         dt: f32,
+        is_2d: bool,
     ) {
         if self.particle_count == 0 || self.bind_group.is_none() {
             return;
@@ -584,7 +585,7 @@ impl GpuSphSolver {
                 self.particle_count as u32,
                 config.solver_iterations as u32,
                 substeps as u32,
-                num_colliders,
+                num_colliders | (if is_2d { 0x80000000 } else { 0 }),
             ],
             colliders: gpu_colliders,
             chamber_info: chamber.gpu_info(&bounds),

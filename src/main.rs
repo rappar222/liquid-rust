@@ -26,6 +26,10 @@ struct Args {
     #[arg(long)]
     headless: bool,
 
+    /// Run simulation in 2D mode (planar fluid physics on XY plane)
+    #[arg(long = "2d", alias = "two-d")]
+    mode_2d: bool,
+
     /// Scene preset to simulate: dam-break, double-dam, splash, obstacle, tornado, zero-g, empty. If omitted, no preset is added.
     #[arg(long)]
     preset: Option<String>,
@@ -595,6 +599,9 @@ fn run_headless(
     config.rest_density = compute_lattice_rest_density(config.smoothing_length, config.spacing);
 
     let mut solver = SphSolver::new(bounds, config);
+    if args.mode_2d {
+        solver.set_2d(true);
+    }
     solver.set_chamber(chamber);
     SceneGenerator::setup_scene(&mut solver, preset);
 
@@ -721,6 +728,7 @@ fn run_headless(
                 solver.mouse_force_strength,
                 solver.mouse_force_mode,
                 dt,
+                args.mode_2d,
             );
             gpu.read_particles(&mut solver.particles);
 
@@ -850,12 +858,19 @@ fn run_gui(
     parsed_colliders: Vec<Collider>,
     parsed_faucets: Vec<Faucet>,
     parsed_drains: Vec<Drain>,
+    is_2d: bool,
 ) -> Result<(), eframe::Error> {
+    let window_title = if is_2d {
+        "Liquid Rust 2D - Physics Sandbox"
+    } else {
+        "liquid-rust - 3D SPH Fluid Simulator"
+    };
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_title("liquid-rust - 3D SPH Fluid Simulator"),
+            .with_title(window_title),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -865,6 +880,9 @@ fn run_gui(
         native_options,
         Box::new(move |cc| {
             let mut app = LiquidApp::new(cc);
+            if is_2d {
+                app.set_2d(true);
+            }
             if (initial_speed - 1.0).abs() > 1e-4 {
                 app.sim_speed = initial_speed;
             }
@@ -942,6 +960,7 @@ fn main() {
             parsed_colliders,
             parsed_faucets,
             parsed_drains,
+            args.mode_2d,
         ) {
             eprintln!("GUI Error: {}", e);
         }

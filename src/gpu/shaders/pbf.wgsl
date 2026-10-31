@@ -177,6 +177,12 @@ fn predict_positions(@builtin(global_invocation_id) id: vec3<u32>) {
     let radius = uniforms.bounds_max.w;
     pred = resolve_chamber_gpu(pred, radius);
     
+    let is_2d = (uniforms.counts.w & 0x80000000u) != 0u;
+    if (is_2d) {
+        pred.z = 0.0;
+        vel.z = 0.0;
+    }
+
     predicted_positions[i] = vec4<f32>(pred, 0.0);
     particles[i].vel_dens = vec4<f32>(vel, particles[i].vel_dens.w);
 }
@@ -397,7 +403,7 @@ fn apply_delta_and_collide(@builtin(global_invocation_id) id: vec3<u32>) {
     pos = resolve_chamber_gpu(pos, radius);
     
     // Dynamic Obstacles Collision Resolution (Spheres, Boxes, Cylinders)
-    let num_colliders = min(uniforms.counts.w, 16u);
+    let num_colliders = min(uniforms.counts.w & 0x7FFFFFFFu, 16u);
     for (var c = 0u; c < num_colliders; c++) {
         let col = uniforms.colliders[c];
         if (col.info.y == 0u) { continue; }
@@ -464,6 +470,11 @@ fn apply_delta_and_collide(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     
+    let is_2d = (uniforms.counts.w & 0x80000000u) != 0u;
+    if (is_2d) {
+        pos.z = 0.0;
+    }
+
     predicted_positions[i] = vec4<f32>(pos, 0.0);
 }
 
@@ -651,6 +662,11 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
         vel *= (max_v / speed);
     }
     
+    let is_2d = (uniforms.counts.w & 0x80000000u) != 0u;
+    if (is_2d) {
+        vel.z = 0.0;
+    }
+
     particles[i].pos_type = vec4<f32>(new_pos, p_type);
     particles[i].vel_dens = vec4<f32>(vel, particles[i].vel_dens.w);
 }

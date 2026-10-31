@@ -132,7 +132,7 @@ impl Default for SolverConfig {
     }
 }
 
-/// Compute exact rest density on regular cubic lattice with given spacing
+/// Compute exact rest density on regular cubic lattice with given spacing (3D)
 pub fn compute_lattice_rest_density(h: f32, spacing: f32) -> f32 {
     let kernels = SphKernels::new(h);
     let mut rho0 = kernels.poly6(0.0);
@@ -157,6 +157,28 @@ pub fn compute_lattice_rest_density(h: f32, spacing: f32) -> f32 {
     rho0
 }
 
+/// Compute exact rest density on regular planar square lattice with given spacing (2D)
+pub fn compute_lattice_rest_density_2d(h: f32, spacing: f32) -> f32 {
+    let kernels = SphKernels::new(h);
+    let mut rho0 = kernels.poly6(0.0);
+    let steps = (h / spacing).ceil() as i32;
+    let h2 = h * h;
+
+    for ix in -steps..=steps {
+        for iy in -steps..=steps {
+            if ix == 0 && iy == 0 {
+                continue;
+            }
+            let r2 = (ix as f32 * spacing).powi(2)
+                + (iy as f32 * spacing).powi(2);
+            if r2 < h2 {
+                rho0 += kernels.poly6(r2);
+            }
+        }
+    }
+    rho0
+}
+
 pub struct SphSolver {
     pub particles: Vec<Particle>,
     pub bounds: Aabb,
@@ -168,6 +190,7 @@ pub struct SphSolver {
     pub config: SolverConfig,
     pub kernels: SphKernels,
     pub grid: SpatialHashGrid,
+    pub is_2d: bool,
 
     // Working buffers for PBF (Position-Based Fluids)
     predicted_positions: Vec<Vec3>,
@@ -199,6 +222,7 @@ impl SphSolver {
             config,
             kernels,
             grid,
+            is_2d: false,
             predicted_positions: Vec::new(),
             old_positions: Vec::new(),
             lambdas: Vec::new(),
@@ -211,9 +235,26 @@ impl SphSolver {
         }
     }
 
+    pub fn set_2d(&mut self, is_2d: bool) {
+        self.is_2d = is_2d;
+        if is_2d {
+            self.config.rest_density = compute_lattice_rest_density_2d(self.config.smoothing_length, self.config.spacing);
+            for p in &mut self.particles {
+                p.position.z = 0.0;
+                p.velocity.z = 0.0;
+            }
+        } else {
+            self.config.rest_density = compute_lattice_rest_density(self.config.smoothing_length, self.config.spacing);
+        }
+    }
+
     pub fn set_smoothing_length(&mut self, h: f32) {
         self.config.smoothing_length = h;
-        self.config.rest_density = compute_lattice_rest_density(h, self.config.spacing);
+        if self.is_2d {
+            self.config.rest_density = compute_lattice_rest_density_2d(h, self.config.spacing);
+        } else {
+            self.config.rest_density = compute_lattice_rest_density(h, self.config.spacing);
+        }
         self.kernels = SphKernels::new(h);
         self.grid = SpatialHashGrid::new(h, self.particles.len().max(1024));
     }
@@ -225,6 +266,9 @@ impl SphSolver {
 
     pub fn apply_quality(&mut self, quality: SimulationQuality) {
         quality.apply(&mut self.config);
+        if self.is_2d {
+            self.config.rest_density = compute_lattice_rest_density_2d(self.config.smoothing_length, self.config.spacing);
+        }
         self.kernels = SphKernels::new(self.config.smoothing_length);
         self.grid = SpatialHashGrid::new(self.config.smoothing_length, self.particles.len().max(1024));
     }
@@ -250,6 +294,12 @@ impl SphSolver {
             let spawned = faucet.emit(dt, self.config.spacing, &mut self.next_particle_id);
             count += spawned.len();
             new_particles.extend(spawned);
+        }
+        if self.is_2d {
+            for p in &mut new_particles {
+                p.position.z = 0.0;
+                p.velocity.z = 0.0;
+            }
         }
         if !new_particles.is_empty() {
             self.particles.extend(new_particles);
@@ -322,16 +372,30 @@ impl SphSolver {
             let mut f_user = Vec3::ZERO;
             if mouse_mode != 0 {
                 if let Some(ray) = mouse_ray {
-                    let to_p = p.position - ray.origin;
-                    let proj = to_p.dot(ray.direction);
-                    if proj > 0.0 {
-                        let closest = ray.origin + ray.direction * proj;
-                        let diff = closest - p.position;
-                        let dist = diff.length();
-                        if dist < 0.6 && dist > 1e-4 {
-                            let dir = diff / dist;
-                            let factor = (1.0 - dist / 0.6) * mouse_strength;
-                            f_user = dir * (factor * mouse_mode as f32);
+                    if self.is_2d {
+                        if let Some(t) = ray.intersect_plane(Vec3::ZERO, Vec3::Z) {
+                            let hit = ray.at(t);
+                            let diff = hit - p.position;
+                            let diff_2d = Vec3::new(diff.x, diff.y, 0.0);
+                            let dist = diff_2d.length();
+                            if dist < 0.8 && dist > 1e-4 {
+                                let dir = diff_2d / dist;
+                                let factor = (1.0 - dist / 0.8) * mouse_strength;
+                                f_user = dir * (factor * mouse_mode as f32);
+                            }
+                        }
+                    } else {
+                        let to_p = p.position - ray.origin;
+                        let proj = to_p.dot(ray.direction);
+                        if proj > 0.0 {
+                            let closest = ray.origin + ray.direction * proj;
+                            let diff = closest - p.position;
+                            let dist = diff.length();
+                            if dist < 0.6 && dist > 1e-4 {
+                                let dir = diff / dist;
+                                let factor = (1.0 - dist / 0.6) * mouse_strength;
+                                f_user = dir * (factor * mouse_mode as f32);
+                            }
                         }
                     }
                 }
@@ -342,8 +406,15 @@ impl SphSolver {
             p.velocity += accel * dt;
 
             let mut pred = p.position + p.velocity * dt;
+            if self.is_2d {
+                pred.z = 0.0;
+                p.velocity.z = 0.0;
+            }
             // Prevent leaving container
             self.chamber.resolve_collision(&mut pred, radius, &bounds);
+            if self.is_2d {
+                pred.z = 0.0;
+            }
             self.predicted_positions[i] = pred;
         }
 
@@ -460,10 +531,14 @@ impl SphSolver {
             // 4c. Apply displacements and project collisions onto predicted positions
             let colliders = &self.colliders;
             let chamber = &self.chamber;
+            let is_2d = self.is_2d;
             for i in 0..n {
                 self.predicted_positions[i] += self.delta_positions[i];
 
                 let p_pos = &mut self.predicted_positions[i];
+                if is_2d {
+                    p_pos.z = 0.0;
+                }
 
                 // Chamber collision projection
                 chamber.resolve_collision(p_pos, radius, &bounds);
@@ -473,6 +548,10 @@ impl SphSolver {
                 for collider in colliders {
                     collider.resolve(p_pos, &mut dummy_vel, radius);
                 }
+
+                if is_2d {
+                    p_pos.z = 0.0;
+                }
             }
         }
 
@@ -481,6 +560,7 @@ impl SphSolver {
         let max_vel = self.config.max_velocity;
         let restitution = self.config.restitution;
         let friction = self.config.boundary_friction;
+        let is_2d = self.is_2d;
 
         for (i, p) in self.particles.iter_mut().enumerate() {
             if p.particle_type == ParticleType::Boundary {
@@ -507,6 +587,11 @@ impl SphSolver {
             // Obstacle Colliders (Sphere, Box, Cylinder, OBJ Mesh)
             for collider in &self.colliders {
                 collider.resolve(&mut new_pos, &mut vel, radius);
+            }
+
+            if is_2d {
+                new_pos.z = 0.0;
+                vel.z = 0.0;
             }
 
             // Velocity clamping
@@ -554,6 +639,9 @@ impl SphSolver {
 
             for (i, p) in self.particles.iter_mut().enumerate() {
                 p.velocity = self.xsph_velocities[i];
+                if is_2d {
+                    p.velocity.z = 0.0;
+                }
             }
         }
     }

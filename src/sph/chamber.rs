@@ -296,6 +296,67 @@ impl Chamber {
         }
     }
 
+    pub fn generate_wireframe_lines_2d(&self, bounds: &Aabb) -> Vec<(Vec3, Vec3)> {
+        let mut lines = Vec::new();
+        match self.shape {
+            ChamberShape::Box => {
+                let p0 = Vec3::new(bounds.min.x, bounds.min.y, 0.0);
+                let p1 = Vec3::new(bounds.max.x, bounds.min.y, 0.0);
+                let p2 = Vec3::new(bounds.max.x, bounds.max.y, 0.0);
+                let p3 = Vec3::new(bounds.min.x, bounds.max.y, 0.0);
+                lines.push((p0, p1));
+                lines.push((p1, p2));
+                lines.push((p2, p3));
+                lines.push((p3, p0));
+            }
+            ChamberShape::Sphere => {
+                let r = (bounds.max.y - bounds.min.y) * 0.5;
+                let c = Vec3::new(
+                    (bounds.min.x + bounds.max.x) * 0.5,
+                    bounds.min.y + r,
+                    0.0,
+                );
+                let segments = 64;
+                let step = (2.0 * PI) / segments as f32;
+                for i in 0..segments {
+                    let a0 = i as f32 * step;
+                    let a1 = (i + 1) as f32 * step;
+                    let p0 = c + Vec3::new(a0.cos() * r, a0.sin() * r, 0.0);
+                    let p1 = c + Vec3::new(a1.cos() * r, a1.sin() * r, 0.0);
+                    lines.push((p0, p1));
+                }
+            }
+            ChamberShape::Bathtub => {
+                let h = bounds.max.y - bounds.min.y;
+                let l = bounds.max.x - bounds.min.x;
+                let y_top = bounds.max.y;
+                let y_bot = bounds.min.y;
+                let slope_offset = (l * self.tub_slope_ratio).min(l * 0.45);
+                let x_back_bot = bounds.min.x + slope_offset;
+                let bot_corner_r = (h * self.tub_fillet_ratio).min(h * 0.35);
+
+                // Top rim
+                lines.push((Vec3::new(bounds.min.x, y_top, 0.0), Vec3::new(bounds.max.x, y_top, 0.0)));
+                // Front vertical wall
+                lines.push((Vec3::new(bounds.max.x, y_top, 0.0), Vec3::new(bounds.max.x, y_bot + bot_corner_r, 0.0)));
+                // Front bottom fillet curve
+                let segs = 12;
+                for i in 0..segs {
+                    let a0 = (i as f32 / segs as f32) * (PI * 0.5);
+                    let a1 = ((i + 1) as f32 / segs as f32) * (PI * 0.5);
+                    let p0 = Vec3::new(bounds.max.x - bot_corner_r + a0.sin() * bot_corner_r, y_bot + bot_corner_r - a0.cos() * bot_corner_r, 0.0);
+                    let p1 = Vec3::new(bounds.max.x - bot_corner_r + a1.sin() * bot_corner_r, y_bot + bot_corner_r - a1.cos() * bot_corner_r, 0.0);
+                    lines.push((p0, p1));
+                }
+                // Flat bottom floor
+                lines.push((Vec3::new(x_back_bot, y_bot, 0.0), Vec3::new(bounds.max.x - bot_corner_r, y_bot, 0.0)));
+                // Sloped back rest
+                lines.push((Vec3::new(bounds.min.x, y_top, 0.0), Vec3::new(x_back_bot, y_bot, 0.0)));
+            }
+        }
+        lines
+    }
+
     pub fn generate_wireframe_lines(&self, bounds: &Aabb) -> Vec<(Vec3, Vec3)> {
         let mut lines = Vec::new();
 

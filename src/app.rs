@@ -77,6 +77,7 @@ pub struct LiquidApp {
     pub next_collider_id: u32,
     pub next_faucet_id: u32,
     pub next_drain_id: u32,
+    pub is_2d: bool,
     pub cli_mode: CliCommandMode,
     pub cli_duration: f32,
     pub cli_fps: u32,
@@ -149,6 +150,7 @@ impl LiquidApp {
             next_collider_id: 1,
             next_faucet_id: 1,
             next_drain_id: 1,
+            is_2d: false,
             cli_mode: CliCommandMode::Gui,
             cli_duration: 5.0,
             cli_fps: 60,
@@ -198,11 +200,29 @@ impl LiquidApp {
             next_collider_id: 1,
             next_faucet_id: 1,
             next_drain_id: 1,
+            is_2d: false,
             cli_mode: CliCommandMode::Gui,
             cli_duration: 5.0,
             cli_fps: 60,
             cli_mp4_output: "simulation.mp4".to_string(),
         }
+    }
+
+    pub fn set_2d(&mut self, is_2d: bool) {
+        self.is_2d = is_2d;
+        self.solver.set_2d(is_2d);
+        if is_2d {
+            self.camera.azimuth = 0.0;
+            self.camera.elevation = 0.0;
+            self.camera.target = Vec3::new(0.0, 0.6, 0.0);
+            self.camera.distance = 2.4;
+        }
+        self.load_preset(self.current_preset);
+        self.status_message = if is_2d {
+            "Switched to 2D Planar Mode".to_string()
+        } else {
+            "Switched to 3D Simulation Mode".to_string()
+        };
     }
 
     pub fn load_preset(&mut self, preset: ScenePreset) {
@@ -285,6 +305,10 @@ impl LiquidApp {
                 parts.push(format!("--time {:.1}", self.cli_duration));
                 parts.push(format!("--fps {}", self.cli_fps));
             }
+        }
+
+        if self.is_2d {
+            parts.push("--2d".to_string());
         }
 
         // Preset
@@ -483,6 +507,7 @@ impl eframe::App for LiquidApp {
                         self.solver.mouse_force_strength,
                         self.solver.mouse_force_mode,
                         effective_dt,
+                        self.is_2d,
                     );
                     gpu.read_particles(&mut self.solver.particles);
                 }
@@ -519,7 +544,33 @@ impl eframe::App for LiquidApp {
         // 1. Top Panel: Toolbar
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("🌊 LiquidRust 3D");
+                ui.heading(if self.is_2d { "🌊 LiquidRust 2D" } else { "🌊 LiquidRust 3D" });
+                ui.separator();
+
+                if ui
+                    .selectable_label(self.is_2d, "📐 2D Mode")
+                    .on_hover_text("Toggle planar 2D simulation mode")
+                    .clicked()
+                {
+                    let next = !self.is_2d;
+                    self.set_2d(next);
+                }
+
+                if ui
+                    .button("🎥 Reset View")
+                    .on_hover_text("Reset camera to center front view")
+                    .clicked()
+                {
+                    if self.is_2d {
+                        self.camera.azimuth = 0.0;
+                        self.camera.elevation = 0.0;
+                        self.camera.target = Vec3::new(0.0, 0.6, 0.0);
+                        self.camera.distance = 2.4;
+                    } else {
+                        self.camera.reset();
+                    }
+                }
+
                 ui.separator();
 
                 if ui
@@ -544,6 +595,7 @@ impl eframe::App for LiquidApp {
                                 self.solver.mouse_force_strength,
                                 self.solver.mouse_force_mode,
                                 effective_dt,
+                                self.is_2d,
                             );
                             gpu.read_particles(&mut self.solver.particles);
                         }
@@ -1322,18 +1374,11 @@ impl eframe::App for LiquidApp {
                 ui.allocate_exact_size(available_size, egui::Sense::click_and_drag());
 
             let is_shift_held = ctx.input(|i| i.modifiers.shift);
+            let is_2d = self.is_2d;
 
-            // Handle Camera Navigation
-            if !is_shift_held {
-                if response.dragged_by(egui::PointerButton::Primary) {
-                    let delta = response.drag_delta();
-                    self.camera.rotate(delta.x * 0.006, -delta.y * 0.006);
-                } else if response.dragged_by(egui::PointerButton::Secondary)
-                    || response.dragged_by(egui::PointerButton::Middle)
-                {
-                    let delta = response.drag_delta();
-                    self.camera.pan(delta.x, delta.y);
-                }
+            if is_2d {
+                self.camera.azimuth = 0.0;
+                self.camera.elevation = 0.0;
             }
 
             // Mouse Zoom
@@ -1349,8 +1394,9 @@ impl eframe::App for LiquidApp {
             let view_proj = proj * view;
             let fov_y = self.camera.fov_y;
 
-            // Handle Fluid Interaction with Shift + Mouse
-            if is_shift_held && response.hovered() {
+            // Handle Fluid Interaction and Camera Navigation
+            let interact_active = (is_2d && !is_shift_held) || (!is_2d && is_shift_held);
+            if interact_active && response.hovered() && (response.dragged_by(egui::PointerButton::Primary) || response.dragged_by(egui::PointerButton::Secondary)) {
                 if let Some(hover_pos) = response.hover_pos() {
                     let local_x = hover_pos.x - rect.min.x;
                     let local_y = hover_pos.y - rect.min.y;
@@ -1366,12 +1412,30 @@ impl eframe::App for LiquidApp {
                         self.solver.mouse_force_mode = 1; // attract
                     } else if response.dragged_by(egui::PointerButton::Secondary) {
                         self.solver.mouse_force_mode = -1; // repel
-                    } else {
-                        self.solver.mouse_force_mode = 0;
                     }
                 }
             } else {
                 self.solver.mouse_force_mode = 0;
+            }
+
+            // Camera panning / rotation
+            if is_2d {
+                if response.dragged_by(egui::PointerButton::Middle)
+                    || (is_shift_held && (response.dragged_by(egui::PointerButton::Primary) || response.dragged_by(egui::PointerButton::Secondary)))
+                {
+                    let delta = response.drag_delta();
+                    self.camera.pan(delta.x, delta.y);
+                }
+            } else if !is_shift_held {
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    let delta = response.drag_delta();
+                    self.camera.rotate(delta.x * 0.006, -delta.y * 0.006);
+                } else if response.dragged_by(egui::PointerButton::Secondary)
+                    || response.dragged_by(egui::PointerButton::Middle)
+                {
+                    let delta = response.drag_delta();
+                    self.camera.pan(delta.x, delta.y);
+                }
             }
 
             // Prepare vertex data with optional view frustum culling
@@ -1453,6 +1517,7 @@ impl eframe::App for LiquidApp {
                             &colliders,
                             &faucets,
                             &drains,
+                            is_2d,
                         );
                     }
                 }

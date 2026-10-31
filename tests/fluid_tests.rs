@@ -245,7 +245,7 @@ fn test_gpu_sph_solver() {
     println!("Testing GPU SPH Solver on: {}", gpu_solver.device_name);
 
     for _ in 0..10 {
-        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, 1.0 / 60.0);
+        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, 1.0 / 60.0, false);
     }
 
     let mut readback_particles = Vec::new();
@@ -283,7 +283,7 @@ fn test_gpu_slow_motion_stability() {
     println!("Initial max y: {}", initial_max_y);
 
     for frame in 0..100 {
-        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, slow_dt);
+        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, slow_dt, false);
         let mut readback = Vec::new();
         gpu_solver.read_particles(&mut readback);
         let max_y = readback.iter().map(|p| p.position.y).fold(0.0f32, f32::max);
@@ -314,7 +314,7 @@ fn test_ultra_quality_gpu_stability() {
     };
 
     for _ in 0..10 {
-        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, 1.0 / 60.0);
+        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, 1.0 / 60.0, false);
     }
 
     let mut readback = Vec::new();
@@ -547,4 +547,43 @@ fn test_cli_command_generator() {
     app.cli_mode = CliCommandMode::Headless;
     let cmd_headless = app.generate_cli_command();
     assert!(cmd_headless.contains("--headless"));
+
+    // Switch to 2D mode
+    app.set_2d(true);
+    let cmd_2d = app.generate_cli_command();
+    assert!(cmd_2d.contains("--2d"), "Command should include --2d flag");
+}
+
+#[test]
+fn test_2d_simulation_planar_physics() {
+    use liquid_rust::sph::{SceneGenerator, ScenePreset, SolverConfig, SphSolver};
+
+    let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.05), Vec3::new(1.0, 1.2, 0.05));
+    let config = SolverConfig::default();
+    let mut solver = SphSolver::new(bounds, config);
+    solver.set_2d(true);
+
+    assert!(solver.is_2d);
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DamBreak);
+
+    assert!(solver.particle_count() > 0);
+
+    // Initial particles must all be in Z = 0 plane
+    for p in &solver.particles {
+        assert_eq!(p.position.z, 0.0, "Initial particle Z must be 0.0");
+        assert_eq!(p.velocity.z, 0.0, "Initial velocity Z must be 0.0");
+    }
+
+    // Step the simulation in 2D mode
+    for _ in 0..60 {
+        solver.step(0.016);
+    }
+
+    // After 60 steps of fluid motion, all particles must strictly remain at Z = 0
+    for p in &solver.particles {
+        assert!(p.position.z.abs() < 1e-6, "Particle Z must remain 0.0 after steps, got {}", p.position.z);
+        assert!(p.velocity.z.abs() < 1e-6, "Velocity Z must remain 0.0 after steps, got {}", p.velocity.z);
+        assert!(!p.position.is_nan());
+        assert!(!p.velocity.is_nan());
+    }
 }

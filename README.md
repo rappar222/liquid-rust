@@ -78,6 +78,8 @@ Or download the latest release bundle from [GitHub Releases](https://github.com/
     - **High**: ~18,000 particles (smooth, fine liquid details)
     - **Ultra**: ~70,000–120,000 particles (hyper-realistic, fine water)
     - **Cinematic**: ~160,000+ particles (VFX film quality)
+    - **Extreme**: 1,000,000+ particles (1M+ GPU mega-simulation with freeze warning modal)
+  - ASMR & Slow-Motion controls (16x slow, 4x slow, 2x slow, fine speed slider down to 0.01x).
   - Custom particle radius and lattice spacing sliders for precision control.
 
 - **Headless & Benchmark CLI Modes**:

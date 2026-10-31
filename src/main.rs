@@ -18,7 +18,7 @@ use std::time::Instant;
 #[command(
     name = "liquid-rust",
     author = "Radu <rappar222>",
-    version = "0.1.0",
+    version = "0.1.1",
     about = "High-performance 3D SPH Fluid Simulator in Rust with Real-time 3D Viewport, MP4 Video & PLY Export"
 )]
 struct Args {

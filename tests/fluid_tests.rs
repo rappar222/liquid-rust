@@ -219,3 +219,60 @@ fn test_gpu_sph_solver() {
         assert!(bounds.contains(p.position), "GPU particle inside bounds");
     }
 }
+
+#[test]
+fn test_slow_motion_no_liftoff() {
+    use liquid_rust::sph::SimulationQuality;
+
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
+    let mut config = SolverConfig::default();
+    SimulationQuality::Draft.apply(&mut config);
+
+    let mut solver = SphSolver::new(bounds, config.clone());
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DamBreak);
+
+    // Simulate at 0.1x slow motion (small dt)
+    let slow_dt = 0.016 * 0.1;
+    for _ in 0..40 {
+        solver.step(slow_dt);
+    }
+
+    for p in &solver.particles {
+        assert!(!p.position.is_nan());
+        assert!(!p.velocity.is_nan());
+        assert!(p.speed() < 10.0, "Particles must not explode under slow motion");
+        // Particles must not lift off into the sky (dam break initial height is <= 0.85)
+        assert!(p.position.y <= 1.0, "Particles must not lift off in slow motion, got y={}", p.position.y);
+    }
+}
+
+#[test]
+fn test_ultra_quality_gpu_stability() {
+    use liquid_rust::gpu::GpuSphSolver;
+    use liquid_rust::sph::SimulationQuality;
+
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
+    let mut config = SolverConfig::default();
+    SimulationQuality::Ultra.apply(&mut config);
+
+    let mut cpu_solver = SphSolver::new(bounds, config.clone());
+    SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DamBreak);
+
+    let mut gpu_solver = match GpuSphSolver::new(bounds, &config, &cpu_solver.particles) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    for _ in 0..10 {
+        gpu_solver.step(bounds, &config, &[], None, 0.0, 0, 1.0 / 60.0);
+    }
+
+    let mut readback = Vec::new();
+    gpu_solver.read_particles(&mut readback);
+
+    for p in &readback {
+        assert!(!p.position.is_nan());
+        assert!(!p.velocity.is_nan());
+        assert!(p.speed() < 15.0, "Ultra quality must be completely stable, got speed {}", p.speed());
+    }
+}

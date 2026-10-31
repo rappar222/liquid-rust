@@ -72,15 +72,12 @@ void main() {
 
         float diff = max(dot(normal, u_light_dir), 0.0);
         vec3 half_dir = normalize(u_light_dir + vec3(0.0, 0.0, 1.0));
-        float spec = pow(max(dot(normal, half_dir), 0.0), 24.0);
+        float spec = pow(max(dot(normal, half_dir), 0.0), 32.0);
 
-        vec3 rgb = v_color.rgb * (0.4 + 0.6 * diff) + vec3(0.5) * spec;
-        float rim = pow(1.0 - z, 3.0) * 0.2;
-        rgb += vec3(rim);
-
-        FragColor = vec4(rgb, v_color.a);
+        vec3 rgb = v_color.rgb * (0.45 + 0.55 * diff) + vec3(0.35) * spec;
+        FragColor = vec4(rgb, 1.0);
     } else {
-        FragColor = v_color;
+        FragColor = vec4(v_color.rgb, 1.0);
     }
 }
 "#;
@@ -177,8 +174,8 @@ void main() {
         unsafe {
             gl.enable(glow::DEPTH_TEST);
             gl.depth_func(glow::LEQUAL);
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.depth_mask(true);
+            gl.disable(glow::BLEND);
             gl.enable(glow::PROGRAM_POINT_SIZE);
 
             // 1. Draw Bounding Box & Colliders

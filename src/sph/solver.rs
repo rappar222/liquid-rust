@@ -30,8 +30,8 @@ impl SimulationQuality {
             SimulationQuality::Draft => "Draft (Fast, ~2.5k particles)",
             SimulationQuality::Medium => "Medium (Balanced, ~5.5k particles)",
             SimulationQuality::High => "High (Smooth, ~18k particles)",
-            SimulationQuality::Ultra => "Ultra (Hyper-realistic, ~70k particles)",
-            SimulationQuality::Cinematic => "Cinematic (VFX Film, ~160k particles)",
+            SimulationQuality::Ultra => "Ultra (High-Res, ~50k particles)",
+            SimulationQuality::Cinematic => "Cinematic (~120k particles)",
             SimulationQuality::Custom => "Custom",
         }
     }
@@ -60,16 +60,16 @@ impl SimulationQuality {
                 config.solver_iterations = 3;
             }
             SimulationQuality::Ultra => {
-                config.particle_radius = 0.009;
-                config.spacing = 0.015;
-                config.smoothing_length = 0.028;
-                config.substeps = 4;
+                config.particle_radius = 0.012;
+                config.spacing = 0.020;
+                config.smoothing_length = 0.038;
+                config.substeps = 3;
                 config.solver_iterations = 4;
             }
             SimulationQuality::Cinematic => {
-                config.particle_radius = 0.0065;
-                config.spacing = 0.011;
-                config.smoothing_length = 0.020;
+                config.particle_radius = 0.009;
+                config.spacing = 0.015;
+                config.smoothing_length = 0.028;
                 config.substeps = 4;
                 config.solver_iterations = 4;
             }
@@ -301,8 +301,9 @@ impl SphSolver {
         let surface_tension = self.config.surface_tension;
         let w_q = kernels.poly6((0.15 * h).powi(2)).max(1e-12);
         let inv_rho0 = 1.0 / rho0;
-        let relaxation_epsilon = 1200.0;
-        let max_displacement = radius * 0.35; // Strict clamping to prevent catapult/trampoline bounce
+        let dt_factor = (dt / 0.016).clamp(0.05, 1.0);
+        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2);
+        let max_displacement = radius * 0.35 * dt_factor; // Scales with time step to prevent slow-mo explosions
 
         // 4. PBF Incompressibility Solver Iterations
         for _ in 0..self.config.solver_iterations {
@@ -365,17 +366,22 @@ impl SphSolver {
                             if r2 < h2 && r2 > 1e-12 {
                                 let r = r2.sqrt();
                                 let lambda_j = lambdas[j];
+                                let lambda_sum = lambda_i + lambda_j;
 
-                                // Tensile instability correction
+                                // Tensile instability correction (only active during compression)
                                 let w_r = kernels.poly6(r2);
-                                let s_corr = -tensile_k * (w_r / w_q).powi(4);
+                                let s_corr = if lambda_sum < -1e-6 {
+                                    -tensile_k * (w_r / w_q).powi(4) * (h * h)
+                                } else {
+                                    0.0
+                                };
 
                                 let grad_w = kernels.spiky_gradient(r_vec, r);
-                                delta += grad_w * ((lambda_i + lambda_j + s_corr) * inv_rho0);
+                                delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
 
-                                // Surface tension cohesion: gently pulls nearby droplets together
+                                // Surface tension cohesion: scales with dt^2 so slow-motion doesn't over-amplify it into cubes
                                 if surface_tension > 0.0 {
-                                    let cohesion_factor = (w_r * surface_tension * 0.05) / rho0;
+                                    let cohesion_factor = (w_r * surface_tension * 0.05 * dt_factor * dt_factor) / rho0;
                                     delta -= (r_vec / r) * cohesion_factor;
                                 }
                             }

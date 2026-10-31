@@ -186,7 +186,7 @@ fn compute_density_lambda(@builtin(global_invocation_id) id: vec3<u32>) {
                 let c_idx = u32(cx + cy * i32(dim.x) + cz * i32(dim.x * dim.y));
                 var curr = atomicLoad(&grid_heads[c_idx]);
                 var iter_count = 0u;
-                while (curr != 0u && iter_count < 128u) {
+                while (curr != 0u && iter_count < 256u) {
                     let j = curr - 1u;
                     curr = grid_next[j];
                     iter_count++;
@@ -263,7 +263,7 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
                 let c_idx = u32(cx + cy * i32(dim.x) + cz * i32(dim.x * dim.y));
                 var curr = atomicLoad(&grid_heads[c_idx]);
                 var iter_count = 0u;
-                while (curr != 0u && iter_count < 128u) {
+                while (curr != 0u && iter_count < 256u) {
                     let j = curr - 1u;
                     curr = grid_next[j];
                     iter_count++;
@@ -276,16 +276,23 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
                         if (r2 < h2 && r2 > 1e-12) {
                             let r = sqrt(r2);
                             let lambda_j = lambdas[j];
+                            let lambda_sum = lambda_i + lambda_j;
                             
-                            let w_r = poly6(r2, h2, poly6_factor);
-                            let ratio = w_r / w_q;
-                            let s_corr = -tensile_k * (ratio * ratio * ratio * ratio);
+                            var s_corr = 0.0;
+                            if (lambda_sum < -1e-6) {
+                                let w_r = poly6(r2, h2, poly6_factor);
+                                let ratio = w_r / w_q;
+                                s_corr = -tensile_k * (ratio * ratio * ratio * ratio) * (h * h);
+                            }
                             
                             let grad_w = spiky_gradient(r_vec, r, h, spiky_factor);
-                            delta += grad_w * ((lambda_i + lambda_j + s_corr) * inv_rho0);
+                            delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
                             
                             if (surface_tension > 0.0) {
-                                let cohesion = (w_r * surface_tension * 0.05) / rho0;
+                                let dt = uniforms.gravity.w;
+                                let dt_factor = clamp(dt / 0.016, 0.05, 1.0);
+                                let w_r = poly6(r2, h2, poly6_factor);
+                                let cohesion = (w_r * surface_tension * 0.05 * dt_factor * dt_factor) / rho0;
                                 delta -= (r_vec / r) * cohesion;
                             }
                         }

@@ -502,6 +502,10 @@ impl GpuSphSolver {
             ([0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
         };
 
+        let dt_factor = (sub_dt / 0.016).clamp(0.05, 1.0);
+        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2);
+        let max_displacement = config.particle_radius * 0.35 * dt_factor;
+
         let uniforms = GpuUniforms {
             bounds_min: [bounds.min.x, bounds.min.y, bounds.min.z, self.cell_size],
             bounds_max: [bounds.max.x, bounds.max.y, bounds.max.z, config.particle_radius],
@@ -513,8 +517,8 @@ impl GpuSphSolver {
             kernel_params: [h, h2, inv_rho0, rho0],
             kernel_factors: [poly6_factor, spiky_factor, w_q, config.tensile_k],
             solver_params: [
-                1200.0, // relaxation epsilon
-                config.particle_radius * 0.35, // max displacement
+                relaxation_epsilon,
+                max_displacement,
                 config.restitution,
                 config.boundary_friction,
             ],

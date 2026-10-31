@@ -656,7 +656,7 @@ impl eframe::App for LiquidApp {
                             c[0] as f32 / 255.0,
                             c[1] as f32 / 255.0,
                             c[2] as f32 / 255.0,
-                            0.95,
+                            1.0,
                         ],
                     }
                 })

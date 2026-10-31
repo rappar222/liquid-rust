@@ -39,6 +39,7 @@ pub struct GpuUniforms {
 pub struct GpuParticle {
     pub pos_type: [f32; 4], // xyz = position, w = type (0.0 fluid, 1.0 boundary)
     pub vel_dens: [f32; 4], // xyz = velocity, w = density
+    pub temp_mat: [f32; 4], // x = temperature, y = material code, z = life, w = pad
 }
 
 pub struct GpuSphSolver {
@@ -341,6 +342,7 @@ impl GpuSphSolver {
             gpu_particles.push(GpuParticle {
                 pos_type: [p.position.x, p.position.y, p.position.z, p_type],
                 vel_dens: [p.velocity.x, p.velocity.y, p.velocity.z, p.density],
+                temp_mat: [p.temperature, p.material.code() as f32, p.life, 0.0],
             });
         }
         // Pad to capacity
@@ -348,6 +350,7 @@ impl GpuSphSolver {
             gpu_particles.push(GpuParticle {
                 pos_type: [0.0; 4],
                 vel_dens: [0.0; 4],
+                temp_mat: [20.0, 0.0, 0.0, 0.0],
             });
         }
 
@@ -727,6 +730,26 @@ impl GpuSphSolver {
             }
             drop(data);
             r_buf.unmap();
+        }
+    }
+
+    /// Update particle temperatures, materials, and lifespans on the GPU
+    pub fn update_particle_materials(&self, particles: &[Particle]) {
+        if let Some(ref p_buf) = self.particle_buf {
+            let count = particles.len().min(self.particle_count);
+            let mut gpu_particles: Vec<GpuParticle> = Vec::with_capacity(count);
+            for p in &particles[..count] {
+                let p_type = if p.particle_type == ParticleType::Boundary { 1.0f32 } else { 0.0f32 };
+                gpu_particles.push(GpuParticle {
+                    pos_type: [p.position.x, p.position.y, p.position.z, p_type],
+                    vel_dens: [p.velocity.x, p.velocity.y, p.velocity.z, p.density],
+                    temp_mat: [p.temperature, p.material.code() as f32, p.life, 0.0],
+                });
+            }
+            if !gpu_particles.is_empty() {
+                let bytes = bytemuck::cast_slice(&gpu_particles);
+                self.queue.write_buffer(p_buf, 0, bytes);
+            }
         }
     }
 }

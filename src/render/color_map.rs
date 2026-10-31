@@ -11,6 +11,8 @@ pub enum ColorMapType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorMode {
+    Material,
+    Temperature,
     Velocity,
     Pressure,
     Density,
@@ -21,6 +23,8 @@ pub enum ColorMode {
 
 impl ColorMode {
     pub const ALL: &'static [ColorMode] = &[
+        ColorMode::Material,
+        ColorMode::Temperature,
         ColorMode::Velocity,
         ColorMode::Pressure,
         ColorMode::Density,
@@ -31,6 +35,8 @@ impl ColorMode {
 
     pub fn name(&self) -> &'static str {
         match self {
+            ColorMode::Material => "🎨 Natural Substance (Honey/Milk/Fire)",
+            ColorMode::Temperature => "🌡 Temperature Heat Map (20-800°C)",
             ColorMode::Velocity => "Velocity Magnitude",
             ColorMode::Pressure => "Pressure Field",
             ColorMode::Density => "Density Deviation",

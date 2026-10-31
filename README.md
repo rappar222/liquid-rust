@@ -22,6 +22,18 @@ Or download the latest release bundle from [GitHub Releases](https://github.com/
 
 ## ✨ Features
 
+- **🔥 Multiphase Liquids, Flammable Gases, Fire & Boiling Steam**:
+  - Full thermodynamic engine with conduction, radiation, buoyancy drafts, and phase changes.
+  - Distinct physical substances: **Water**, **Honey**, **Milk**, **Oil**, **Alcohol**, **Gas (Methane)**, **Fire**, **Steam**, and **Smoke**.
+  - **Combustion & Chain Reactions**: Flammable gas and volatile alcohol vapors ignite upon contact with flames or heat ($T \ge 220^\circ\text{C}$), expanding in explosive fireballs.
+  - **Boiling into Steam**: Water heated above $100^\circ\text{C}$ phase-changes into billowing white steam clouds that drift upward with high buoyancy.
+  - **Interactive Hand Torch**: Use the lighter tool to ignite gas pockets or boil basins into steam in real time.
+  - **Multi-Substance Inflow**: Faucets can emit any material—oozing golden honey, jetting flammable gas, or spitting continuous flames.
+
+- **🛁 Customizable Chamber Shapes & Scaling**:
+  - Choose between **Box (Cuboid)**, **Bathtub** (with backrest slope and rounded bottom fillets), and **Sphere** chambers.
+  - Scale chamber dimensions dynamically in real-time or via CLI (`--chamber-shape bathtub --chamber-scale 1.5,1.0,1.0`).
+
 - **⚡ GPU Acceleration via Vulkan Compute (`wgpu`)**:
   - Full parallel Position-Based Fluids (PBF) pipeline running on GPU compute shaders.
   - 3D uniform spatial hashing and neighbor search directly in WGSL compute passes.
@@ -135,6 +147,10 @@ Select presets directly from the GUI dropdown or launch them via the CLI:
 4. **Fluid onto Obstacle**: Fluid pouring over an interactive solid sphere collider.
 5. **Swirling Vortex / Tornado**: Rotational velocity field creating a whirlpool funnel.
 6. **Zero-G Droplet Coalescence**: Multiple floating fluid spheres in microgravity merging via surface tension.
+7. **🔥 Gas, Fire & Boiling Steam**: Water reservoir with buoyant gas cloud and flame ignition—watch gas ignite into fire, radiating heat to boil water into rising steam!
+8. **🍯 Viscous Honey Cascade**: Thick, golden, high-viscosity honey oozing and folding down tiered cascade obstacles.
+9. **🥛 Milk & Oil Layering**: Multi-phase immiscible fluid density demonstration with dense white milk and lighter floating golden oil.
+10. **🍸 Volatile Flammable Alcohol**: Highly volatile alcohol pool with flammable vapor cloud and falling fire spark.
 
 ---
 

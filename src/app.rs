@@ -2,7 +2,7 @@ use crate::export::PlyExporter;
 use crate::gpu::GpuSphSolver;
 use crate::math::{unproject_mouse_ray, Aabb};
 use crate::render::{Camera, ColorMap, ColorMapType, ColorMode, GlRenderer, ParticleVertex};
-use crate::sph::{ChamberShape, Collider, ColliderShape, CubeFace, Drain, Faucet, FaucetShape};
+use crate::sph::{ChamberShape, Collider, ColliderShape, CubeFace, Drain, Faucet, FaucetShape, MaterialType};
 use crate::sph::scene::{SceneGenerator, ScenePreset};
 use crate::sph::solver::{compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver};
 use eframe::egui;
@@ -100,7 +100,7 @@ impl LiquidApp {
             lit_spheres: true,
             enable_culling: true,
             drawn_particles_count: 0,
-            color_mode: ColorMode::Velocity,
+            color_mode: ColorMode::Material,
             color_map: ColorMapType::Ocean,
             display_size_factor: 1.0,
             sphere_obstacle_pos: Vec3::new(0.0, 0.45, 0.0),
@@ -170,30 +170,38 @@ impl LiquidApp {
     }
 
     fn compute_particle_color(&self, p: &crate::sph::particle::Particle) -> [u8; 3] {
-        let t = match self.color_mode {
+        match self.color_mode {
+            ColorMode::Material => p.material.color(p.temperature),
+            ColorMode::Temperature => {
+                let t = ((p.temperature - 20.0) / 650.0).clamp(0.0, 1.0);
+                ColorMap::sample(ColorMapType::Fire, t)
+            }
             ColorMode::Velocity => {
-                // Calm resting water: 0..0.4 m/s -> deep oceanic blue
-                // Moving wave: 0.5..1.8 m/s -> azure/turquoise
-                // Splash / impact: > 2.0 m/s -> white foam
-                (p.speed() / 2.4).clamp(0.0, 1.0)
+                let t = (p.speed() / 2.4).clamp(0.0, 1.0);
+                ColorMap::sample(self.color_map, t)
             }
             ColorMode::Pressure => {
-                (p.pressure / (self.solver.config.rest_density * 0.4)).clamp(0.0, 1.0)
+                let t = (p.pressure / (self.solver.config.rest_density * 0.4)).clamp(0.0, 1.0);
+                ColorMap::sample(self.color_map, t)
             }
             ColorMode::Density => {
                 let dev = (p.density - self.solver.config.rest_density).abs()
                     / self.solver.config.rest_density;
-                (dev * 4.0).clamp(0.0, 1.0)
+                let t = (dev * 4.0).clamp(0.0, 1.0);
+                ColorMap::sample(self.color_map, t)
             }
             ColorMode::Height => {
                 let y = p.position.y;
                 let b = &self.solver.bounds;
-                ((y - b.min.y) / (b.max.y - b.min.y)).clamp(0.0, 1.0)
+                let t = ((y - b.min.y) / (b.max.y - b.min.y)).clamp(0.0, 1.0);
+                ColorMap::sample(self.color_map, t)
             }
-            ColorMode::KineticEnergy => (p.kinetic_energy() / 4.0).clamp(0.0, 1.0),
-            ColorMode::SingleColor => return [30, 140, 225],
-        };
-        ColorMap::sample(self.color_map, t)
+            ColorMode::KineticEnergy => {
+                let t = (p.kinetic_energy() / 4.0).clamp(0.0, 1.0);
+                ColorMap::sample(self.color_map, t)
+            }
+            ColorMode::SingleColor => [30, 140, 225],
+        }
     }
 }
 
@@ -247,6 +255,11 @@ impl eframe::App for LiquidApp {
                     if let Some(ref mut gpu) = self.gpu_solver {
                         gpu.init_buffers(self.solver.bounds, &self.solver.config, &self.solver.particles);
                     }
+                }
+
+                self.solver.step_thermodynamics(effective_dt);
+                if let Some(ref gpu) = self.gpu_solver {
+                    gpu.update_particle_materials(&self.solver.particles);
                 }
             } else {
                 self.solver.step(effective_dt);
@@ -466,7 +479,7 @@ impl eframe::App for LiquidApp {
                     ui.separator();
 
                     // --- Simulation Chamber & Shape Controls ---
-                    ui.collapsing("🛁 Simulation Chamber & Bounds", |ui| {
+                    ui.collapsing("🛁 Simulation Chamber (Shape & Scale)", |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Shape:");
                             for &s in &ChamberShape::ALL {
@@ -555,6 +568,41 @@ impl eframe::App for LiquidApp {
                             )
                             .text("Wall Friction"),
                         );
+                    });
+
+                    ui.separator();
+
+                    // --- Fire, Gas & Thermodynamics ---
+                    ui.collapsing("🔥 Fire, Gas & Boiling Steam", |ui| {
+                        ui.label("Combustion, heat transfer, and phase changes:");
+                        ui.horizontal(|ui| {
+                            if ui.button("🔥 Spark / Ignite All Gas").clicked() {
+                                self.solver.ignite_all_gas();
+                                if let Some(ref gpu) = self.gpu_solver {
+                                    gpu.update_particle_materials(&self.solver.particles);
+                                }
+                            }
+                            if ui.button("♨ Boil Water to Steam").clicked() {
+                                self.solver.boil_water();
+                                if let Some(ref gpu) = self.gpu_solver {
+                                    gpu.update_particle_materials(&self.solver.particles);
+                                }
+                            }
+                            if ui.button("❄ Cool All (20°C)").clicked() {
+                                self.solver.cool_all();
+                                if let Some(ref gpu) = self.gpu_solver {
+                                    gpu.update_particle_materials(&self.solver.particles);
+                                }
+                            }
+                        });
+
+                        ui.separator();
+                        let mut is_torch = self.solver.mouse_force_mode == 2;
+                        if ui.checkbox(&mut is_torch, "🔥 Hand Torch / Lighter Tool").changed() {
+                            self.solver.mouse_force_mode = if is_torch { 2 } else { 0 };
+                        }
+                        ui.label("• Hold mouse over flammable gas to spark explosions and roaring fire!");
+                        ui.label("• Hold torch near water to heat it above 100°C and boil it into billowing steam.");
                     });
 
                     ui.separator();
@@ -757,6 +805,50 @@ impl eframe::App for LiquidApp {
                                 self.solver.faucets.push(f);
                             }
                         });
+                        ui.horizontal(|ui| {
+                            if ui.button("+ 🍯 Honey").clicked() {
+                                let id = self.next_faucet_id;
+                                self.next_faucet_id += 1;
+                                let mut f = Faucet::new_circle(
+                                    format!("Honey Tap #{}", id),
+                                    Vec3::new(0.0, 1.0, 0.0),
+                                    Vec3::new(0.0, -1.5, 0.0),
+                                    0.06,
+                                    350.0,
+                                );
+                                f.id = id;
+                                f.material = MaterialType::Honey;
+                                self.solver.faucets.push(f);
+                            }
+                            if ui.button("+ ☁ Gas Jet").clicked() {
+                                let id = self.next_faucet_id;
+                                self.next_faucet_id += 1;
+                                let mut f = Faucet::new_shower(
+                                    format!("Gas Jet #{}", id),
+                                    Vec3::new(0.0, 0.2, 0.0),
+                                    0.15,
+                                    450.0,
+                                    0.18,
+                                );
+                                f.id = id;
+                                f.material = MaterialType::Gas;
+                                self.solver.faucets.push(f);
+                            }
+                            if ui.button("+ 🔥 Flamethrower").clicked() {
+                                let id = self.next_faucet_id;
+                                self.next_faucet_id += 1;
+                                let mut f = Faucet::new_circle(
+                                    format!("Flame Jet #{}", id),
+                                    Vec3::new(-0.45, 0.35, 0.0),
+                                    Vec3::new(2.5, 0.5, 0.0),
+                                    0.06,
+                                    400.0,
+                                );
+                                f.id = id;
+                                f.material = MaterialType::Fire;
+                                self.solver.faucets.push(f);
+                            }
+                        });
 
                         if !self.solver.faucets.is_empty() {
                             if ui.button("🗑 Clear All Faucets").clicked() {
@@ -787,6 +879,16 @@ impl eframe::App for LiquidApp {
                                     ui.add(egui::DragValue::new(&mut faucet.direction.x).speed(0.05).prefix("Vx: "));
                                     ui.add(egui::DragValue::new(&mut faucet.direction.y).speed(0.05).prefix("Vy: "));
                                     ui.add(egui::DragValue::new(&mut faucet.direction.z).speed(0.05).prefix("Vz: "));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Substance:");
+                                    egui::ComboBox::from_id_salt(format!("faucet_mat_{}", idx))
+                                        .selected_text(faucet.material.name())
+                                        .show_ui(ui, |ui| {
+                                            for &mat in MaterialType::ALL {
+                                                ui.selectable_value(&mut faucet.material, mat, mat.name());
+                                            }
+                                        });
                                 });
                                 ui.add(egui::Slider::new(&mut faucet.flow_rate, 50.0..=2500.0).text("Flow Rate (p/s)"));
 
@@ -940,6 +1042,16 @@ impl eframe::App for LiquidApp {
                             egui::Slider::new(&mut self.solver.mouse_force_strength, 10.0..=120.0)
                                 .text("Interaction Force"),
                         );
+
+                        ui.separator();
+                        let mut is_torch = self.solver.mouse_force_mode == 2;
+                        if ui.checkbox(&mut is_torch, "🔥 Hand Torch / Lighter Tool").changed() {
+                            self.solver.mouse_force_mode = if is_torch { 2 } else { 0 };
+                        }
+                        if is_torch {
+                            ui.label("Moving mouse over gas ignites fireballs and boils water into steam!");
+                        }
+
                         if ui.button("Reset Camera View").clicked() {
                             self.camera.reset();
                         }

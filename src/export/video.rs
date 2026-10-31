@@ -246,20 +246,35 @@ impl SoftwareRenderer {
         rest_density: f32,
         bounds: &Aabb,
     ) -> [u8; 3] {
-        let t = match color_mode {
-            ColorMode::Velocity => (p.speed() / 2.4).clamp(0.0, 1.0),
-            ColorMode::Pressure => (p.pressure / (rest_density * 0.4)).clamp(0.0, 1.0),
+        match color_mode {
+            ColorMode::Material => p.material.color(p.temperature),
+            ColorMode::Temperature => {
+                let t = ((p.temperature - 20.0) / 650.0).clamp(0.0, 1.0);
+                ColorMap::sample(ColorMapType::Fire, t)
+            }
+            ColorMode::Velocity => {
+                let t = (p.speed() / 2.4).clamp(0.0, 1.0);
+                ColorMap::sample(color_map, t)
+            }
+            ColorMode::Pressure => {
+                let t = (p.pressure / (rest_density * 0.4)).clamp(0.0, 1.0);
+                ColorMap::sample(color_map, t)
+            }
             ColorMode::Density => {
                 let dev = (p.density - rest_density).abs() / rest_density;
-                (dev * 4.0).clamp(0.0, 1.0)
+                let t = (dev * 4.0).clamp(0.0, 1.0);
+                ColorMap::sample(color_map, t)
             }
             ColorMode::Height => {
-                ((p.position.y - bounds.min.y) / (bounds.max.y - bounds.min.y)).clamp(0.0, 1.0)
+                let t = ((p.position.y - bounds.min.y) / (bounds.max.y - bounds.min.y)).clamp(0.0, 1.0);
+                ColorMap::sample(color_map, t)
             }
-            ColorMode::KineticEnergy => (p.kinetic_energy() / 4.0).clamp(0.0, 1.0),
-            ColorMode::SingleColor => return [30, 140, 225],
-        };
-        ColorMap::sample(color_map, t)
+            ColorMode::KineticEnergy => {
+                let t = (p.kinetic_energy() / 4.0).clamp(0.0, 1.0);
+                ColorMap::sample(color_map, t)
+            }
+            ColorMode::SingleColor => [30, 140, 225],
+        }
     }
 
     fn draw_chamber_wireframe(&mut self, chamber: &crate::sph::chamber::Chamber, bounds: &Aabb, view_proj: Mat4) {

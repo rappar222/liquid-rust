@@ -1,5 +1,6 @@
 use crate::math::Aabb;
 use crate::sph::particle::Particle;
+use crate::sph::substance::MaterialType;
 use glam::Vec3;
 use std::f32::consts::PI;
 
@@ -34,6 +35,7 @@ pub struct Faucet {
     pub direction: Vec3,      // Flow velocity vector (m/s)
     pub flow_rate: f32,      // Particles per second
     pub spray_spread: f32,   // Spray divergence angle in radians (0.0 = laminar, 0.25 = shower cone)
+    pub material: MaterialType,
     pub enabled: bool,
     pub accumulator: f32,
     seed: u32,
@@ -49,6 +51,7 @@ impl Faucet {
             direction,
             flow_rate,
             spray_spread: 0.0,
+            material: MaterialType::Water,
             enabled: true,
             accumulator: 0.0,
             seed: 1234567,
@@ -64,6 +67,7 @@ impl Faucet {
             direction: Vec3::new(0.0, -2.5, 0.0),
             flow_rate,
             spray_spread: 0.0,
+            material: MaterialType::Water,
             enabled: true,
             accumulator: 0.0,
             seed: 7654321,
@@ -79,6 +83,7 @@ impl Faucet {
             direction: Vec3::new(0.0, -3.0, 0.0),
             flow_rate,
             spray_spread,
+            material: MaterialType::Water,
             enabled: true,
             accumulator: 0.0,
             seed: 9999999,
@@ -94,6 +99,7 @@ impl Faucet {
             direction,
             flow_rate,
             spray_spread: 0.0,
+            material: MaterialType::Water,
             enabled: true,
             accumulator: 0.0,
             seed: 5555555,
@@ -162,7 +168,7 @@ impl Faucet {
                 base_vel
             };
 
-            particles.push(Particle::new(spawn_pos, vel, 1.0, *next_id));
+            particles.push(Particle::new_with_material(spawn_pos, vel, 1.0, *next_id, self.material));
             *next_id += 1;
         }
 

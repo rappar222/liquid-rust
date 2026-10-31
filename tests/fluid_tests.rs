@@ -245,7 +245,7 @@ fn test_gpu_sph_solver() {
     println!("Testing GPU SPH Solver on: {}", gpu_solver.device_name);
 
     for _ in 0..10 {
-        gpu_solver.step(bounds, &config, &[], None, 0.0, 0, 1.0 / 60.0);
+        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, 1.0 / 60.0);
     }
 
     let mut readback_particles = Vec::new();
@@ -283,7 +283,7 @@ fn test_gpu_slow_motion_stability() {
     println!("Initial max y: {}", initial_max_y);
 
     for frame in 0..100 {
-        gpu_solver.step(bounds, &config, &[], None, 0.0, 0, slow_dt);
+        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, slow_dt);
         let mut readback = Vec::new();
         gpu_solver.read_particles(&mut readback);
         let max_y = readback.iter().map(|p| p.position.y).fold(0.0f32, f32::max);
@@ -314,7 +314,7 @@ fn test_ultra_quality_gpu_stability() {
     };
 
     for _ in 0..10 {
-        gpu_solver.step(bounds, &config, &[], None, 0.0, 0, 1.0 / 60.0);
+        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, 1.0 / 60.0);
     }
 
     let mut readback = Vec::new();
@@ -499,4 +499,61 @@ fn test_solver_faucets_and_drains_cycle() {
     assert_eq!(solver.particle_count(), 1);
     solver.drain_particles();
     assert_eq!(solver.particle_count(), 0, "Drain should eliminate particles over the aperture");
+}
+
+#[test]
+fn test_substance_thermodynamics_ignition_and_boiling() {
+    use liquid_rust::sph::{MaterialType, Particle};
+
+    let bounds = Aabb::new(Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5));
+    let config = SolverConfig::default();
+    let mut solver = SphSolver::new(bounds, config);
+
+    // Place a Water particle at 98°C
+    let p_water = Particle::new_with_material_and_temp(
+        Vec3::new(0.0, 0.1, 0.0),
+        Vec3::ZERO,
+        1.0,
+        0,
+        MaterialType::Water,
+        98.0,
+    );
+    // Place a Fire particle right next to the water
+    let p_fire = Particle::new_with_material_and_temp(
+        Vec3::new(0.01, 0.1, 0.0),
+        Vec3::ZERO,
+        1.0,
+        1,
+        MaterialType::Fire,
+        800.0,
+    );
+    // Place a Gas particle
+    let p_gas = Particle::new_with_material_and_temp(
+        Vec3::new(0.0, 0.5, 0.0),
+        Vec3::ZERO,
+        1.0,
+        2,
+        MaterialType::Gas,
+        25.0,
+    );
+
+    solver.add_particle(p_water);
+    solver.add_particle(p_fire);
+    solver.add_particle(p_gas);
+
+    // Step thermodynamics
+    for _ in 0..10 {
+        solver.step_thermodynamics(0.016);
+    }
+
+    // Check that water heated up and boiled into steam (> 100°C)
+    assert!(
+        solver.particles[0].material == MaterialType::Steam || solver.particles[0].temperature >= 100.0,
+        "Water heated by fire should reach 100°C or turn into Steam"
+    );
+
+    // Ignite gas test
+    solver.ignite_all_gas();
+    assert_eq!(solver.particles[2].material, MaterialType::Fire, "Igniting gas turns it into Fire");
+    assert!(solver.particles[2].temperature >= 700.0, "Ignited gas reaches flame temperatures");
 }

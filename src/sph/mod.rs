@@ -7,6 +7,7 @@ pub mod particle;
 pub mod scene;
 pub mod solver;
 pub mod spatial;
+pub mod substance;
 
 pub use chamber::{Chamber, ChamberShape};
 pub use collider::{Collider, ColliderShape};
@@ -17,3 +18,4 @@ pub use particle::{Particle, ParticleType};
 pub use scene::{SceneGenerator, ScenePreset};
 pub use solver::{compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver};
 pub use spatial::SpatialHashGrid;
+pub use substance::MaterialType;

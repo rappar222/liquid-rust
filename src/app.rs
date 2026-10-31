@@ -11,6 +11,32 @@ use glow::HasContext as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliCommandMode {
+    Gui,
+    Mp4Video,
+    Headless,
+    PlySequence,
+}
+
+impl CliCommandMode {
+    pub const ALL: &'static [CliCommandMode] = &[
+        CliCommandMode::Gui,
+        CliCommandMode::Mp4Video,
+        CliCommandMode::Headless,
+        CliCommandMode::PlySequence,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            CliCommandMode::Gui => "🖥 Interactive GUI",
+            CliCommandMode::Mp4Video => "🎬 Video Export (.mp4)",
+            CliCommandMode::Headless => "⚡ Headless Fast Sim",
+            CliCommandMode::PlySequence => "💾 Blender PLY Frames",
+        }
+    }
+}
+
 pub struct LiquidApp {
     pub solver: SphSolver,
     pub gpu_solver: Option<GpuSphSolver>,
@@ -41,7 +67,7 @@ pub struct LiquidApp {
     pub current_fps: f32,
     pub last_step_time_ms: f32,
 
-    // Export
+    // Export & CLI Generator
     pub export_path: String,
     pub export_sequence: bool,
     pub exported_frames_count: usize,
@@ -51,6 +77,10 @@ pub struct LiquidApp {
     pub next_collider_id: u32,
     pub next_faucet_id: u32,
     pub next_drain_id: u32,
+    pub cli_mode: CliCommandMode,
+    pub cli_duration: f32,
+    pub cli_fps: u32,
+    pub cli_mp4_output: String,
 }
 
 impl LiquidApp {
@@ -119,6 +149,59 @@ impl LiquidApp {
             next_collider_id: 1,
             next_faucet_id: 1,
             next_drain_id: 1,
+            cli_mode: CliCommandMode::Gui,
+            cli_duration: 5.0,
+            cli_fps: 60,
+            cli_mp4_output: "simulation.mp4".to_string(),
+        }
+    }
+
+    pub fn new_headless() -> Self {
+        let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
+        let config = SolverConfig::default();
+        let mut solver = SphSolver::new(bounds, config);
+
+        let preset = ScenePreset::DamBreak;
+        SceneGenerator::setup_scene(&mut solver, preset);
+
+        Self {
+            solver,
+            gpu_solver: None,
+            use_gpu: false,
+            gpu_device_name: "Headless".to_string(),
+            camera: Camera::default(),
+            is_playing: false,
+            fixed_dt: 0.016,
+            sim_speed: 1.0,
+            current_preset: preset,
+            current_quality: SimulationQuality::Medium,
+            renderer: Arc::new(Mutex::new(None)),
+            lit_spheres: true,
+            enable_culling: true,
+            drawn_particles_count: 0,
+            color_mode: ColorMode::Velocity,
+            color_map: ColorMapType::Ocean,
+            display_size_factor: 1.0,
+            sphere_obstacle_pos: Vec3::new(0.0, 0.45, 0.0),
+            sphere_obstacle_radius: 0.22,
+            sphere_obstacle_enabled: false,
+            last_frame_time: Instant::now(),
+            frame_counter: 0,
+            current_fps: 60.0,
+            last_step_time_ms: 0.0,
+            export_path: "exports".to_string(),
+            export_sequence: false,
+            exported_frames_count: 0,
+            status_message: "Ready".to_string(),
+            show_extreme_modal: false,
+            obj_file_path: "model.obj".to_string(),
+            next_collider_id: 1,
+            next_faucet_id: 1,
+            next_drain_id: 1,
+            cli_mode: CliCommandMode::Gui,
+            cli_duration: 5.0,
+            cli_fps: 60,
+            cli_mp4_output: "simulation.mp4".to_string(),
         }
     }
 
@@ -167,6 +250,173 @@ impl LiquidApp {
                 self.status_message = format!("Export error: {}", e);
             }
         }
+    }
+
+    /// Construct the exact CLI command string representing the active scene setup
+    pub fn generate_cli_command(&self) -> String {
+        let mut parts = vec!["liquid-rust".to_string()];
+
+        // Mode specific flags
+        match self.cli_mode {
+            CliCommandMode::Gui => {}
+            CliCommandMode::Headless => {
+                parts.push("--headless".to_string());
+                parts.push(format!("--time {:.1}", self.cli_duration));
+                parts.push(format!("--fps {}", self.cli_fps));
+            }
+            CliCommandMode::Mp4Video => {
+                let out = if self.cli_mp4_output.is_empty() {
+                    "simulation.mp4"
+                } else {
+                    &self.cli_mp4_output
+                };
+                parts.push(format!("--export-mp4 {}", out));
+                parts.push(format!("--time {:.1}", self.cli_duration));
+                parts.push(format!("--fps {}", self.cli_fps));
+            }
+            CliCommandMode::PlySequence => {
+                parts.push("--headless".to_string());
+                let dir = if self.export_path.is_empty() {
+                    "./ply_renders"
+                } else {
+                    &self.export_path
+                };
+                parts.push(format!("--export-ply {}", dir));
+                parts.push(format!("--time {:.1}", self.cli_duration));
+                parts.push(format!("--fps {}", self.cli_fps));
+            }
+        }
+
+        // Preset
+        let preset_slug = match self.current_preset {
+            ScenePreset::DamBreak => "dam-break",
+            ScenePreset::DoubleDamBreak => "double-dam",
+            ScenePreset::DropletSplash => "splash",
+            ScenePreset::ObstacleDrop => "obstacle",
+            ScenePreset::VortexTornado => "tornado",
+            ScenePreset::ZeroGravityBlobs => "zero-g",
+            ScenePreset::Empty => "empty",
+        };
+        parts.push(format!("--preset {}", preset_slug));
+
+        // Quality
+        let quality_slug = match self.current_quality {
+            SimulationQuality::Draft => Some("draft"),
+            SimulationQuality::Medium => Some("medium"),
+            SimulationQuality::High => Some("high"),
+            SimulationQuality::Ultra => Some("ultra"),
+            SimulationQuality::Cinematic => Some("cinematic"),
+            SimulationQuality::Extreme => Some("extreme"),
+            SimulationQuality::Custom => None,
+        };
+        if let Some(q) = quality_slug {
+            parts.push(format!("--quality {}", q));
+        } else {
+            parts.push(format!("--particle-radius {:.4}", self.solver.config.particle_radius));
+            parts.push(format!("--spacing {:.4}", self.solver.config.spacing));
+        }
+
+        // Simulation Speed / ASMR Slow-mo
+        if (self.sim_speed - 1.0).abs() > 0.02 {
+            parts.push(format!("--sim-speed {:.2}", self.sim_speed));
+        }
+
+        // Chamber shape & scale
+        if self.solver.chamber.shape != ChamberShape::Box {
+            let shape_str = match self.solver.chamber.shape {
+                ChamberShape::Bathtub => "bathtub",
+                ChamberShape::Sphere => "sphere",
+                ChamberShape::Box => "box",
+            };
+            parts.push(format!("--chamber-shape {}", shape_str));
+        }
+
+        let scale = self.solver.chamber.scale;
+        if (scale - Vec3::ONE).length_squared() > 1e-4 {
+            if (scale.x - scale.y).abs() < 1e-3 && (scale.x - scale.z).abs() < 1e-3 {
+                parts.push(format!("--chamber-scale {:.2}", scale.x));
+            } else {
+                parts.push(format!("--chamber-scale {:.2},{:.2},{:.2}", scale.x, scale.y, scale.z));
+            }
+        }
+
+        // Obstacles
+        for col in &self.solver.colliders {
+            if !col.enabled {
+                continue;
+            }
+            match &col.shape {
+                ColliderShape::Sphere { center, radius } => {
+                    parts.push(format!("--obstacle \"sphere:{:.2},{:.2},{:.2}:{:.2}\"", center.x, center.y, center.z, radius));
+                }
+                ColliderShape::Box { aabb } => {
+                    let c = aabb.center();
+                    let s = aabb.size();
+                    parts.push(format!("--obstacle \"box:{:.2},{:.2},{:.2}:{:.2},{:.2},{:.2}\"", c.x, c.y, c.z, s.x, s.y, s.z));
+                }
+                ColliderShape::Cylinder { center, radius, height } => {
+                    parts.push(format!("--obstacle \"cylinder:{:.2},{:.2},{:.2}:{:.2}:{:.2}\"", center.x, center.y, center.z, radius, height));
+                }
+                ColliderShape::Mesh(mesh) => {
+                    let path = mesh.source_path.as_deref().unwrap_or("model.obj");
+                    let p = mesh.position;
+                    parts.push(format!("--obstacle \"obj:{}:{:.2},{:.2},{:.2}:{:.2}\"", path, p.x, p.y, p.z, mesh.scale));
+                }
+            }
+        }
+
+        // Faucets
+        for f in &self.solver.faucets {
+            if !f.enabled {
+                continue;
+            }
+            let pos = f.position;
+            match &f.shape {
+                FaucetShape::Rectangle { width, .. } => {
+                    parts.push(format!("--faucet \"waterfall:{:.2},{:.2},{:.2}:{:.2}:{:.0}\"", pos.x, pos.y, pos.z, width, f.flow_rate));
+                }
+                FaucetShape::Circle { radius } => {
+                    if f.spray_spread > 0.08 {
+                        parts.push(format!("--faucet \"shower:{:.2},{:.2},{:.2}:{:.2}:{:.0}:{:.2}\"", pos.x, pos.y, pos.z, radius, f.flow_rate, f.spray_spread));
+                    } else if (f.direction - Vec3::new(0.0, -2.5, 0.0)).length_squared() > 1e-2 {
+                        let d = f.direction;
+                        parts.push(format!("--faucet \"stream:{:.2},{:.2},{:.2}:{:.2},{:.2},{:.2}:{:.0}:{:.2}\"", pos.x, pos.y, pos.z, d.x, d.y, d.z, f.flow_rate, f.spray_spread));
+                    } else {
+                        parts.push(format!("--faucet \"circle:{:.2},{:.2},{:.2}:{:.2}:{:.0}\"", pos.x, pos.y, pos.z, radius, f.flow_rate));
+                    }
+                }
+                FaucetShape::Point => {
+                    parts.push(format!("--faucet \"tap:{:.2},{:.2},{:.2}:{:.0}\"", pos.x, pos.y, pos.z, f.flow_rate));
+                }
+            }
+        }
+
+        // Drains
+        for d in &self.solver.drains {
+            if !d.enabled {
+                continue;
+            }
+            match d.face {
+                CubeFace::Floor => {
+                    if d.position.x.abs() > 1e-2 || d.position.z.abs() > 1e-2 {
+                        parts.push(format!("--drain \"floor:{:.2},{:.2}:{:.2}\"", d.position.x, d.position.z, d.radius));
+                    } else {
+                        parts.push(format!("--drain \"floor:{:.2}\"", d.radius));
+                    }
+                }
+                CubeFace::Ceiling => parts.push(format!("--drain \"ceiling:{:.2}\"", d.radius)),
+                CubeFace::Left => parts.push(format!("--drain \"left:{:.2}\"", d.radius)),
+                CubeFace::Right => parts.push(format!("--drain \"right:{:.2}\"", d.radius)),
+                CubeFace::Back => parts.push(format!("--drain \"back:{:.2}\"", d.radius)),
+                CubeFace::Front => parts.push(format!("--drain \"front:{:.2}\"", d.radius)),
+                CubeFace::Custom => {
+                    let p = d.position;
+                    parts.push(format!("--drain \"custom:{:.2},{:.2},{:.2}:{:.2}\"", p.x, p.y, p.z, d.radius));
+                }
+            }
+        }
+
+        parts.join(" ")
     }
 
     fn compute_particle_color(&self, p: &crate::sph::particle::Particle) -> [u8; 3] {
@@ -368,6 +618,11 @@ impl eframe::App for LiquidApp {
                 ui.label(format!("Sim: {:.1} ms", self.last_step_time_ms));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("📋 Copy CLI Command").clicked() {
+                        let cmd = self.generate_cli_command();
+                        ctx.copy_text(cmd);
+                        self.status_message = "Copied CLI command to clipboard!".to_string();
+                    }
                     if ui.button("📷 Export PLY").clicked() {
                         self.export_current_frame();
                     }
@@ -961,6 +1216,89 @@ impl eframe::App for LiquidApp {
                                 format!("Recording frame {:05}...", self.exported_frames_count),
                             );
                         }
+                    });
+
+                    ui.separator();
+
+                    // --- CLI Command Generator ---
+                    ui.collapsing("💻 CLI Command Generator", |ui| {
+                        ui.label("Export current scene as a runnable CLI command:");
+
+                        ui.horizontal(|ui| {
+                            ui.label("Mode:");
+                            for &m in CliCommandMode::ALL {
+                                if ui.selectable_label(self.cli_mode == m, m.name()).clicked() {
+                                    self.cli_mode = m;
+                                }
+                            }
+                        });
+
+                        match self.cli_mode {
+                            CliCommandMode::Gui => {
+                                ui.label("Launches this exact scene in a real-time 3D window.");
+                            }
+                            CliCommandMode::Mp4Video => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Output:");
+                                    ui.text_edit_singleline(&mut self.cli_mp4_output);
+                                });
+                                ui.add(egui::Slider::new(&mut self.cli_duration, 0.5..=60.0).text("Duration (s)").fixed_decimals(1));
+                                ui.horizontal(|ui| {
+                                    ui.label("FPS:");
+                                    for &f in &[30, 60, 120, 960] {
+                                        if ui.selectable_label(self.cli_fps == f, format!("{} FPS", f)).clicked() {
+                                            self.cli_fps = f;
+                                        }
+                                    }
+                                });
+                            }
+                            CliCommandMode::Headless => {
+                                ui.add(egui::Slider::new(&mut self.cli_duration, 0.5..=60.0).text("Duration (s)").fixed_decimals(1));
+                                ui.horizontal(|ui| {
+                                    ui.label("FPS:");
+                                    for &f in &[60, 120, 240, 960] {
+                                        if ui.selectable_label(self.cli_fps == f, format!("{} FPS", f)).clicked() {
+                                            self.cli_fps = f;
+                                        }
+                                    }
+                                });
+                            }
+                            CliCommandMode::PlySequence => {
+                                ui.add(egui::Slider::new(&mut self.cli_duration, 0.5..=60.0).text("Duration (s)").fixed_decimals(1));
+                                ui.horizontal(|ui| {
+                                    ui.label("FPS:");
+                                    for &f in &[30, 60, 120] {
+                                        if ui.selectable_label(self.cli_fps == f, format!("{} FPS", f)).clicked() {
+                                            self.cli_fps = f;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+
+                        let mut cmd = self.generate_cli_command();
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("📋 Copy Command").clicked() {
+                                ctx.copy_text(cmd.clone());
+                                self.status_message = "Copied CLI command to clipboard!".to_string();
+                            }
+                            if ui.button("⚡ Quick 60 FPS Video").clicked() {
+                                self.cli_mode = CliCommandMode::Mp4Video;
+                                self.cli_fps = 60;
+                                let c = self.generate_cli_command();
+                                ctx.copy_text(c);
+                                self.status_message = "Copied 60 FPS MP4 video render command!".to_string();
+                            }
+                        });
+
+                        ui.add(
+                            egui::TextEdit::multiline(&mut cmd)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY),
+                        );
                     });
 
                     ui.add_space(8.0);

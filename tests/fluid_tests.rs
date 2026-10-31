@@ -500,3 +500,51 @@ fn test_solver_faucets_and_drains_cycle() {
     solver.drain_particles();
     assert_eq!(solver.particle_count(), 0, "Drain should eliminate particles over the aperture");
 }
+
+#[test]
+fn test_cli_command_generator() {
+    use liquid_rust::app::{CliCommandMode, LiquidApp};
+    use liquid_rust::sph::{ChamberShape, CubeFace, Drain, Faucet, ScenePreset, SimulationQuality};
+
+    let mut app = LiquidApp::new_headless();
+
+    // Default GUI mode
+    let cmd = app.generate_cli_command();
+    assert!(cmd.starts_with("liquid-rust"));
+    assert!(cmd.contains("--preset dam-break"));
+    assert!(cmd.contains("--quality medium"));
+
+    // Switch to MP4 Video export mode
+    app.cli_mode = CliCommandMode::Mp4Video;
+    app.cli_duration = 3.5;
+    app.cli_fps = 60;
+    app.cli_mp4_output = "waterfall_test.mp4".to_string();
+    app.load_preset(ScenePreset::Empty);
+    app.current_quality = SimulationQuality::Cinematic;
+    app.sim_speed = 0.5;
+
+    // Chamber bathtub shape and scaling
+    app.solver.chamber.shape = ChamberShape::Bathtub;
+    app.solver.chamber.scale = glam::Vec3::new(1.5, 1.2, 1.0);
+
+    // Add faucet and drain
+    app.solver.faucets.push(Faucet::new_waterfall("Waterfall", glam::Vec3::new(0.0, 0.8, 0.0), 0.3, 0.05, 750.0));
+    app.solver.drains.push(Drain::new("Drain", CubeFace::Floor, glam::Vec3::new(0.1, 0.0, -0.1), 0.12));
+
+    let cmd_mp4 = app.generate_cli_command();
+    assert!(cmd_mp4.contains("--export-mp4 waterfall_test.mp4"));
+    assert!(cmd_mp4.contains("--time 3.5"));
+    assert!(cmd_mp4.contains("--fps 60"));
+    assert!(cmd_mp4.contains("--preset empty"));
+    assert!(cmd_mp4.contains("--quality cinematic"));
+    assert!(cmd_mp4.contains("--sim-speed 0.50"));
+    assert!(cmd_mp4.contains("--chamber-shape bathtub"));
+    assert!(cmd_mp4.contains("--chamber-scale 1.50,1.20,1.00"));
+    assert!(cmd_mp4.contains("--faucet \"waterfall:0.00,0.80,0.00:0.30:750\""));
+    assert!(cmd_mp4.contains("--drain \"floor:0.10,-0.10:0.12\""));
+
+    // Switch to Headless mode
+    app.cli_mode = CliCommandMode::Headless;
+    let cmd_headless = app.generate_cli_command();
+    assert!(cmd_headless.contains("--headless"));
+}

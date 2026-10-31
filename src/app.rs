@@ -449,6 +449,11 @@ impl LiquidApp {
 
 impl eframe::App for LiquidApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keyboard shortcuts (Space to toggle play/pause when not typing in text fields)
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.is_playing = !self.is_playing;
+        }
+
         // Calculate FPS
         self.frame_counter += 1;
         let elapsed = self.last_frame_time.elapsed().as_secs_f32();
@@ -518,7 +523,8 @@ impl eframe::App for LiquidApp {
                 ui.separator();
 
                 if ui
-                    .button(if self.is_playing { "⏸ Pause" } else { "▶ Play" })
+                    .button(if self.is_playing { "⏸ Pause (Space)" } else { "▶ Play (Space)" })
+                    .on_hover_text("Toggle simulation playback (Shortcut: Space)")
                     .clicked()
                 {
                     self.is_playing = !self.is_playing;

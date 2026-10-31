@@ -570,8 +570,8 @@ impl GpuSphSolver {
         let dt_ratio = (dt_ref / sub_dt.max(1e-5)).max(1.0);
         let cfm_scale = dt_ratio * dt_ratio;
         let dt_factor = (sub_dt / dt_ref).clamp(0.0001, 1.0);
-        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
-        let max_displacement = config.particle_radius * 0.35 * dt_factor;
+        let relaxation_epsilon = 150.0 * cfm_scale;
+        let max_displacement = (h * 0.5).max(config.particle_radius * 1.5) * dt_factor;
 
         let uniforms = GpuUniforms {
             bounds_min: [bounds.min.x, bounds.min.y, bounds.min.z, self.cell_size],

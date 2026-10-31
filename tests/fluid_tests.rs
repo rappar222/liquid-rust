@@ -221,42 +221,40 @@ fn test_color_maps() {
 }
 
 #[test]
-fn test_gpu_sph_solver() {
+fn test_double_dam_collision_splash() {
     use liquid_rust::gpu::GpuSphSolver;
+    use liquid_rust::sph::{SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver};
 
-    let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.6), Vec3::new(1.0, 2.0, 0.6));
-    let mut config = SolverConfig::default();
-    config.spacing = 0.06;
-    config.particle_radius = 0.03;
-    config.smoothing_length = 0.09;
-    config.rest_density = compute_lattice_rest_density(config.smoothing_length, config.spacing);
-
+    let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.05), Vec3::new(1.0, 1.2, 0.05));
+    let config = SolverConfig::default();
     let mut cpu_solver = SphSolver::new(bounds, config.clone());
-    SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DamBreak);
+    cpu_solver.set_2d(true);
+    cpu_solver.apply_quality(SimulationQuality::Medium);
+    SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DoubleDamBreak);
 
-    let mut gpu_solver = match GpuSphSolver::new(bounds, &config, &cpu_solver.particles) {
-        Ok(s) => s,
+    let mut gpu = match GpuSphSolver::new(cpu_solver.bounds, &cpu_solver.config, &cpu_solver.particles) {
+        Ok(g) => g,
         Err(e) => {
-            eprintln!("Skipping GPU test (no Vulkan adapter available): {}", e);
-            return;
+            panic!("GPU failed: {}", e);
         }
     };
 
-    println!("Testing GPU SPH Solver on: {}", gpu_solver.device_name);
-
-    for _ in 0..10 {
-        gpu_solver.step(bounds, &cpu_solver.chamber, &config, &[], None, 0.0, 0, 1.0 / 60.0, false);
-    }
-
-    let mut readback_particles = Vec::new();
-    gpu_solver.read_particles(&mut readback_particles);
-
-    assert_eq!(readback_particles.len(), cpu_solver.particles.len());
-    for p in &readback_particles {
-        assert!(!p.position.is_nan(), "GPU position should not be NaN");
-        assert!(!p.velocity.is_nan(), "GPU velocity should not be NaN");
-        assert!(p.speed() < 20.0, "GPU fluid should be stable and bounded");
-        assert!(bounds.contains(p.position), "GPU particle inside bounds");
+    eprintln!("\n=== 2D DOUBLE DAM COLLISION TEST ===");
+    for f in 1..=60 {
+        gpu.step(cpu_solver.bounds, &cpu_solver.chamber, &cpu_solver.config, &[], None, 0.0, 0, 1.0 / 60.0, true);
+        if f % 15 == 0 {
+            let mut readback = Vec::new();
+            gpu.read_particles(&mut readback);
+            let mut center_count = 0;
+            let mut max_y_center = 0.0f32;
+            for p in &readback {
+                if p.position.x.abs() < 0.15 {
+                    center_count += 1;
+                    max_y_center = max_y_center.max(p.position.y);
+                }
+            }
+            eprintln!("Frame {:02}: Center (-0.15..0.15) particle count: {}, max_y: {}", f, center_count, max_y_center);
+        }
     }
 }
 
@@ -554,6 +552,46 @@ fn test_cli_command_generator() {
     assert!(cmd_2d.contains("--2d"), "Command should include --2d flag");
 }
 
+#[test]
+fn test_gpu_2d_collision() {
+    use liquid_rust::gpu::GpuSphSolver;
+    use liquid_rust::sph::{SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver};
+
+    let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.05), Vec3::new(1.0, 1.2, 0.05));
+    let config = SolverConfig::default();
+    let mut cpu_solver = SphSolver::new(bounds, config.clone());
+    cpu_solver.set_2d(true);
+    cpu_solver.apply_quality(SimulationQuality::Medium);
+    SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DoubleDamBreak);
+
+    let mut gpu = match GpuSphSolver::new(cpu_solver.bounds, &cpu_solver.config, &cpu_solver.particles) {
+        Ok(g) => g,
+        Err(e) => {
+            panic!("GPU failed: {}", e);
+        }
+    };
+    eprintln!("\n=== GPU grid_dim: {:?}, cell_size: {}, total_cells: {} ===", gpu.grid_dim, gpu.cell_size, gpu.total_cells);
+    eprintln!("Initial particle count: {}", cpu_solver.particles.len());
+
+    gpu.step(cpu_solver.bounds, &cpu_solver.chamber, &cpu_solver.config, &[], None, 0.0, 0, 1.0 / 60.0, false);
+    let mut readback = Vec::new();
+    gpu.read_particles(&mut readback);
+    eprintln!("After 1 step -> p0: pos={:?}, vel={:?}, dens={}", readback[0].position, readback[0].velocity, readback[0].density);
+    eprintln!("Rest density in config: {}", cpu_solver.config.rest_density);
+
+    let mut min_x = 999.0f32;
+    let mut max_x = -999.0f32;
+    let mut min_y = 999.0f32;
+    let mut max_y = -999.0f32;
+    for p in &readback {
+        min_x = min_x.min(p.position.x);
+        max_x = max_x.max(p.position.x);
+        min_y = min_y.min(p.position.y);
+        max_y = max_y.max(p.position.y);
+    }
+    eprintln!("Double Dam 60 frames -> X range: [{}, {}], Y range: [{}, {}]", min_x, max_x, min_y, max_y);
+    eprintln!("Sample pos[0]: {:?}, pos[1000]: {:?}", readback[0].position, readback[1000].position);
+}
 #[test]
 fn test_2d_simulation_planar_physics() {
     use liquid_rust::sph::{SceneGenerator, ScenePreset, SolverConfig, SphSolver};

@@ -576,8 +576,8 @@ impl SphSolver {
         let dt_ratio = (dt_ref / dt.max(1e-5)).max(1.0);
         let cfm_scale = dt_ratio * dt_ratio;
         let dt_factor = (dt / dt_ref).clamp(0.0001, 1.0);
-        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
-        let max_displacement = radius * 0.35 * dt_factor; // Scales with time step to prevent slow-mo explosions
+        let relaxation_epsilon = 150.0 * cfm_scale;
+        let max_displacement = (h * 0.5).max(radius * 1.5) * dt_factor;
 
         // 4. PBF Incompressibility Solver Iterations
         for _ in 0..self.config.solver_iterations {

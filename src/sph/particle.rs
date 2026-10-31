@@ -1,4 +1,3 @@
-use super::substance::MaterialType;
 use glam::Vec3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,9 +18,6 @@ pub struct Particle {
     pub surface_laplacian: f32,
     pub id: u32,
     pub particle_type: ParticleType,
-    pub material: MaterialType,
-    pub temperature: f32,
-    pub life: f32,
 }
 
 impl Particle {
@@ -37,44 +33,6 @@ impl Particle {
             surface_laplacian: 0.0,
             id,
             particle_type: ParticleType::Fluid,
-            material: MaterialType::Water,
-            temperature: 20.0,
-            life: 1.0,
-        }
-    }
-
-    pub fn new_with_material(
-        position: Vec3,
-        velocity: Vec3,
-        mass: f32,
-        id: u32,
-        material: MaterialType,
-    ) -> Self {
-        Self::new_with_material_and_temp(position, velocity, mass, id, material, material.initial_temperature())
-    }
-
-    pub fn new_with_material_and_temp(
-        position: Vec3,
-        velocity: Vec3,
-        mass: f32,
-        id: u32,
-        material: MaterialType,
-        temperature: f32,
-    ) -> Self {
-        Self {
-            position,
-            velocity,
-            acceleration: Vec3::ZERO,
-            density: 1000.0 * material.density_factor(),
-            pressure: 0.0,
-            mass: mass * material.density_factor(),
-            surface_normal: Vec3::ZERO,
-            surface_laplacian: 0.0,
-            id,
-            particle_type: ParticleType::Fluid,
-            material,
-            temperature,
-            life: material.initial_life(),
         }
     }
 
@@ -90,9 +48,6 @@ impl Particle {
             surface_laplacian: 0.0,
             id,
             particle_type: ParticleType::Boundary,
-            material: MaterialType::Water,
-            temperature: 20.0,
-            life: 1.0,
         }
     }
 

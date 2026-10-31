@@ -6,7 +6,7 @@ use liquid_rust::gpu::GpuSphSolver;
 use liquid_rust::render::{Camera, ColorMapType, ColorMode};
 use liquid_rust::sph::{
     compute_lattice_rest_density, Chamber, ChamberShape, Collider, ColliderShape, CubeFace, Drain,
-    Faucet, MaterialType, SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver,
+    Faucet, SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver,
 };
 use liquid_rust::LiquidApp;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use std::time::Instant;
 #[command(
     name = "liquid-rust",
     author = "Radu <rappar222>",
-    version = "0.1.7",
+    version = "0.1.8",
     about = "High-performance 3D SPH Fluid Simulator in Rust with Real-time 3D Viewport, MP4 Video & PLY Export"
 )]
 struct Args {
@@ -29,10 +29,6 @@ struct Args {
     /// Scene preset to simulate: dam-break, double-dam, splash, obstacle, tornado, zero-g, empty. If omitted, no preset is added.
     #[arg(long)]
     preset: Option<String>,
-
-    /// Liquid substance preset: water, honey, milk, oil, alcohol, gas, fire, steam, smoke
-    #[arg(long, alias = "material")]
-    liquid: Option<String>,
 
     /// Particle quality / resolution: draft, medium, high, ultra, cinematic, extreme (1M+)
     #[arg(long, short = 'q', default_value = "medium")]
@@ -153,10 +149,6 @@ fn parse_preset(name: Option<&str>) -> ScenePreset {
             "obstacle" | "drop" | "obstacledrop" => ScenePreset::ObstacleDrop,
             "tornado" | "vortex" => ScenePreset::VortexTornado,
             "zero-g" | "zerog" | "blobs" => ScenePreset::ZeroGravityBlobs,
-            "gas-fire-boil" | "fire" | "gas" | "boil" | "steam" => ScenePreset::GasFireBoil,
-            "honey" | "honey-cascade" | "viscous" => ScenePreset::HoneyCascade,
-            "milk-oil" | "milk-and-oil" | "milk" | "oil" => ScenePreset::MilkAndOil,
-            "alcohol" | "flammable-alcohol" | "flammable" => ScenePreset::FlammableAlcohol,
             "empty" | "none" | "basin" | "faucet" => ScenePreset::Empty,
             _ => {
                 eprintln!("Unknown preset '{}', defaulting to empty", s);
@@ -267,28 +259,18 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
 }
 
 fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
-    let mut parts = clean_spec(spec);
+    let parts = clean_spec(spec);
     if parts.is_empty() {
         return Err("empty faucet specification".to_string());
     }
-
-    // Optional trailing material specifier (e.g. :honey, :gas, :fire, :oil, :milk, :alcohol)
-    let mut faucet_material = MaterialType::Water;
-    if parts.len() >= 2 {
-        if let Some(mat) = MaterialType::parse(parts.last().unwrap()) {
-            faucet_material = mat;
-            parts.pop();
-        }
-    }
-
     let kind = parts[0].to_lowercase();
-    let name = format!("Faucet #{} ({}, {})", index + 1, kind, faucet_material.name());
+    let name = format!("Faucet #{} ({})", index + 1, kind);
 
-    let mut faucet = match kind.as_str() {
+    match kind.as_str() {
         "waterfall" => {
             // waterfall:x,y,z:width[:flow_rate]
             if parts.len() < 3 {
-                return Err(format!("Invalid waterfall spec '{}'. Format: waterfall:x,y,z:width[:flow_rate][:material]", spec));
+                return Err(format!("Invalid waterfall spec '{}'. Format: waterfall:x,y,z:width[:flow_rate]", spec));
             }
             let pos = parse_vec3(&parts[1])?;
             let width = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid width: {}", e))?;
@@ -304,7 +286,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
         "shower" => {
             // shower:x,y,z:radius[:flow_rate[:spread]]
             if parts.len() < 3 {
-                return Err(format!("Invalid shower spec '{}'. Format: shower:x,y,z:radius[:flow_rate[:spread]][:material]", spec));
+                return Err(format!("Invalid shower spec '{}'. Format: shower:x,y,z:radius[:flow_rate[:spread]]", spec));
             }
             let pos = parse_vec3(&parts[1])?;
             let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
@@ -325,7 +307,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
         "circle" | "pipe" => {
             // circle:x,y,z:radius[:flow_rate]
             if parts.len() < 3 {
-                return Err(format!("Invalid circle spec '{}'. Format: circle:x,y,z:radius[:flow_rate][:material]", spec));
+                return Err(format!("Invalid circle spec '{}'. Format: circle:x,y,z:radius[:flow_rate]", spec));
             }
             let pos = parse_vec3(&parts[1])?;
             let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
@@ -341,7 +323,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
         "tap" | "point" => {
             // tap:x,y,z[:flow_rate]
             if parts.len() < 2 {
-                return Err(format!("Invalid tap spec '{}'. Format: tap:x,y,z[:flow_rate][:material]", spec));
+                return Err(format!("Invalid tap spec '{}'. Format: tap:x,y,z[:flow_rate]", spec));
             }
             let pos = parse_vec3(&parts[1])?;
             let flow_rate = if parts.len() > 2 {
@@ -356,7 +338,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
         "stream" => {
             // stream:x,y,z:vx,vy,vz[:flow_rate[:spread]]
             if parts.len() < 3 {
-                return Err(format!("Invalid stream spec '{}'. Format: stream:x,y,z:vx,vy,vz[:flow_rate[:spread]][:material]", spec));
+                return Err(format!("Invalid stream spec '{}'. Format: stream:x,y,z:vx,vy,vz[:flow_rate[:spread]]", spec));
             }
             let pos = parse_vec3(&parts[1])?;
             let vel = parse_vec3(&parts[2])?;
@@ -376,10 +358,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
             Ok(f)
         }
         _ => Err(format!("Unknown faucet shape '{}'. Expected 'waterfall', 'shower', 'circle', 'tap', or 'stream'", kind)),
-    }?;
-
-    faucet.material = faucet_material;
-    Ok(faucet)
+    }
 }
 
 fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
@@ -597,10 +576,6 @@ fn run_headless(
             ScenePreset::ObstacleDrop => 0.38f32,
             ScenePreset::VortexTornado => 0.30f32,
             ScenePreset::ZeroGravityBlobs => 0.25f32,
-            ScenePreset::GasFireBoil => 0.45f32,
-            ScenePreset::HoneyCascade => 0.35f32,
-            ScenePreset::MilkAndOil => 0.40f32,
-            ScenePreset::FlammableAlcohol => 0.38f32,
             ScenePreset::Empty => 0.40f32,
         };
         let s = (approx_vol / (target_n as f32).max(100.0)).cbrt();
@@ -622,22 +597,6 @@ fn run_headless(
     let mut solver = SphSolver::new(bounds, config);
     solver.set_chamber(chamber);
     SceneGenerator::setup_scene(&mut solver, preset);
-
-    if let Some(ref liquid_name) = args.liquid {
-        if let Some(mat) = MaterialType::parse(liquid_name) {
-            solver.config.viscosity = mat.viscosity();
-            for p in &mut solver.particles {
-                p.material = mat;
-                p.temperature = mat.initial_temperature();
-                p.life = mat.initial_life();
-                p.density = 1000.0 * mat.density_factor();
-                p.mass = mat.density_factor();
-            }
-            println!("  + Liquid preset: {}", mat.name());
-        } else {
-            eprintln!("Unknown liquid material '{}', defaulting to water", liquid_name);
-        }
-    }
 
     let ch_size = solver.bounds.size();
     println!("Chamber: {} (Scale: ({:.2}, {:.2}, {:.2}), Bounds: {:.2} x {:.2} x {:.2} m)",

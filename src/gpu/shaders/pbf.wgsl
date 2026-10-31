@@ -36,7 +36,6 @@ struct SimulationUniforms {
 struct Particle {
     pos_type: vec4<f32>, // xyz = position, w = particle_type (0 = fluid, 1 = boundary)
     vel_dens: vec4<f32>, // xyz = velocity, w = density
-    temp_mat: vec4<f32>, // x = temp, y = mat_code, z = life, w = pad
 };
 
 @group(0) @binding(0) var<uniform> uniforms: SimulationUniforms;
@@ -171,21 +170,7 @@ fn predict_positions(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     
-    // Material buoyancy:
-    // 5 = Gas (+14.5 m/s^2), 6 = Fire (+25.0 m/s^2), 7 = Steam (+22.0 m/s^2), 8 = Smoke (+12.0 m/s^2)
-    let mat = u32(particles[i].temp_mat.y + 0.5);
-    var buoy = 0.0;
-    if (mat == 5u) {
-        buoy = 14.5;
-    } else if (mat == 6u) {
-        buoy = 25.0;
-    } else if (mat == 7u) {
-        buoy = 22.0;
-    } else if (mat == 8u) {
-        buoy = 12.0;
-    }
-
-    let accel = uniforms.gravity.xyz + vec3<f32>(0.0, buoy, 0.0) + f_user;
+    let accel = uniforms.gravity.xyz + f_user;
     vel += accel * dt;
     var pred = p_pos + vel * dt;
     

@@ -4,7 +4,6 @@ use crate::sph::collider::Collider;
 use crate::sph::kernel::SphKernels;
 use crate::sph::particle::{Particle, ParticleType};
 use crate::sph::spatial::SpatialHashGrid;
-use crate::sph::substance::MaterialType;
 use glam::Vec3;
 use rayon::prelude::*;
 
@@ -338,18 +337,8 @@ impl SphSolver {
                 }
             }
 
-            // Predict position with material buoyancy & gas/fire upward draft
-            let mut accel = gravity + f_user;
-            if p.material.is_gas() {
-                accel.y += p.material.buoyancy();
-            }
-            if p.material == MaterialType::Fire {
-                let seed = p.id.wrapping_mul(1664525).wrapping_add(1013904223);
-                let fx = ((seed & 0xFF) as f32 / 255.0 - 0.5) * 6.0;
-                let fz = (((seed >> 8) & 0xFF) as f32 / 255.0 - 0.5) * 6.0;
-                accel.x += fx;
-                accel.z += fz;
-            }
+            // Predict position
+            let accel = gravity + f_user;
             p.velocity += accel * dt;
 
             let mut pred = p.position + p.velocity * dt;
@@ -451,7 +440,6 @@ impl SphSolver {
                                 let grad_w = kernels.spiky_gradient(r_vec, r);
                                 delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
 
-                                // Surface tension cohesion: scales with CFM to maintain perfect physical balance
                                 if surface_tension > 0.0 {
                                     let cohesion_factor = (w_r * surface_tension * 0.05) / (rho0 * cfm_scale);
                                     delta -= (r_vec / r) * cohesion_factor;
@@ -566,200 +554,6 @@ impl SphSolver {
 
             for (i, p) in self.particles.iter_mut().enumerate() {
                 p.velocity = self.xsph_velocities[i];
-            }
-        }
-
-        // 7. Thermodynamics, Combustion, Boiling & Phase Changes
-        self.step_thermodynamics(dt);
-    }
-
-    /// Step heat conduction, combustion (lighting gas into fire), and water boiling into steam
-    pub fn step_thermodynamics(&mut self, dt: f32) {
-        let n = self.particles.len();
-        if n == 0 {
-            return;
-        }
-
-        let positions: Vec<Vec3> = self.particles.iter().map(|p| p.position).collect();
-        self.grid.build(&positions);
-
-        let h2 = self.kernels.h2;
-        let w_zero = self.kernels.poly6(0.0).max(1e-12);
-
-        // Handle torch / lighter mouse mode (mode 2)
-        if self.mouse_force_mode == 2 {
-            self.apply_torch(self.mouse_ray, 0.45);
-        }
-
-        let mut new_temps = Vec::with_capacity(n);
-        let mut new_materials = Vec::with_capacity(n);
-        let mut new_lifes = Vec::with_capacity(n);
-        let mut blast_impulses = vec![Vec3::ZERO; n];
-
-        for i in 0..n {
-            let p = &self.particles[i];
-            let pos_i = p.position;
-            let mut temp_i = p.temperature;
-            let mut mat_i = p.material;
-            let mut life_i = p.life;
-
-            // Ambient heat dissipation towards 20°C
-            let ambient_rate = match mat_i {
-                MaterialType::Steam => 0.12,
-                MaterialType::Smoke => 0.08,
-                MaterialType::Fire => 0.06,
-                _ => 0.02,
-            };
-            temp_i += (20.0 - temp_i) * (ambient_rate * dt).min(0.2);
-
-            // Heat conduction with neighbors & fire thermal radiation
-            self.grid.for_each_neighbor(pos_i, |j| {
-                if i != j {
-                    let pos_j = self.particles[j].position;
-                    let r2 = (pos_i - pos_j).length_squared();
-                    if r2 < h2 {
-                        let temp_j = self.particles[j].temperature;
-                        let mat_j = self.particles[j].material;
-                        let w = self.kernels.poly6(r2) / w_zero;
-
-                        let conduct_k = if mat_j == MaterialType::Fire {
-                            16.0 // powerful radiative heating from flames!
-                        } else if mat_i == MaterialType::Water && mat_j == MaterialType::Fire {
-                            24.0 // rapid boiling heat absorption!
-                        } else {
-                            2.5  // regular thermal diffusion
-                        };
-
-                        let delta_t = (temp_j - temp_i) * (conduct_k * w * dt).clamp(-0.4, 0.4);
-                        temp_i += delta_t;
-                    }
-                }
-            });
-
-            // Phase changes, Combustion & Boiling
-            match mat_i {
-                MaterialType::Gas => {
-                    // Ignition: Gas exposed to heat or flame ignites violently!
-                    if temp_i >= 220.0 {
-                        mat_i = MaterialType::Fire;
-                        temp_i = 780.0;
-                        life_i = 1.3 + (p.id % 40) as f32 * 0.01;
-                        // Explosive upward / outward blast
-                        let blast_up = 3.5 + (p.id % 20) as f32 * 0.1;
-                        blast_impulses[i] = Vec3::new(0.0, blast_up, 0.0);
-                    }
-                }
-                MaterialType::Water => {
-                    // Boiling: Water heated to >= 100°C boils into Steam!
-                    if temp_i >= 100.0 {
-                        mat_i = MaterialType::Steam;
-                        temp_i = 108.0;
-                        life_i = 3.8 + (p.id % 50) as f32 * 0.02;
-                        blast_impulses[i] = Vec3::new(0.0, 2.5, 0.0);
-                    }
-                }
-                MaterialType::Alcohol => {
-                    // Flammable alcohol ignites into fire when heated
-                    if temp_i >= 240.0 {
-                        mat_i = MaterialType::Fire;
-                        temp_i = 680.0;
-                        life_i = 1.5;
-                        blast_impulses[i] = Vec3::new(0.0, 2.0, 0.0);
-                    }
-                }
-                MaterialType::Fire => {
-                    life_i -= dt;
-                    temp_i = 750.0 * (life_i / 1.3).clamp(0.2, 1.0);
-                    if life_i <= 0.0 {
-                        // Extinguished fire becomes rising smoke
-                        mat_i = MaterialType::Smoke;
-                        temp_i = 110.0;
-                        life_i = 3.0;
-                    }
-                }
-                MaterialType::Steam => {
-                    life_i -= dt;
-                    if life_i <= 0.0 || temp_i < 38.0 {
-                        // Condensation: steam condenses back into liquid water
-                        mat_i = MaterialType::Water;
-                        temp_i = 35.0;
-                    }
-                }
-                MaterialType::Smoke => {
-                    life_i -= dt;
-                }
-                _ => {}
-            }
-
-            new_temps.push(temp_i);
-            new_materials.push(mat_i);
-            new_lifes.push(life_i);
-        }
-
-        for i in 0..n {
-            self.particles[i].temperature = new_temps[i];
-            self.particles[i].material = new_materials[i];
-            self.particles[i].life = new_lifes[i];
-            self.particles[i].velocity += blast_impulses[i];
-        }
-    }
-
-    /// User spark: Instantly ignite all flammable gas and alcohol into roaring flames!
-    pub fn ignite_all_gas(&mut self) {
-        for p in &mut self.particles {
-            if p.material == MaterialType::Gas || p.material == MaterialType::Alcohol {
-                p.material = MaterialType::Fire;
-                p.temperature = 780.0;
-                p.life = 1.4;
-                p.velocity.y += 4.5;
-            }
-        }
-    }
-
-    /// User heat source: Heat water to boil directly into rising steam clouds!
-    pub fn boil_water(&mut self) {
-        for p in &mut self.particles {
-            if p.material == MaterialType::Water {
-                p.material = MaterialType::Steam;
-                p.temperature = 115.0;
-                p.life = 4.0;
-                p.velocity.y += 2.5;
-            }
-        }
-    }
-
-    /// User cooling: Cool all fluid to ambient 20°C and condense all steam
-    pub fn cool_all(&mut self) {
-        for p in &mut self.particles {
-            p.temperature = 20.0;
-            if p.material == MaterialType::Steam || p.material == MaterialType::Fire {
-                p.material = MaterialType::Water;
-            }
-        }
-    }
-
-    /// Torch tool: Apply heat and ignition near cursor ray
-    pub fn apply_torch(&mut self, ray: Option<Ray>, radius: f32) {
-        if let Some(r) = ray {
-            for p in &mut self.particles {
-                let to_p = p.position - r.origin;
-                let proj = to_p.dot(r.direction);
-                if proj > 0.0 {
-                    let closest = r.origin + r.direction * proj;
-                    let dist = (closest - p.position).length();
-                    if dist < radius {
-                        p.temperature = 750.0;
-                        if p.material == MaterialType::Gas || p.material == MaterialType::Alcohol {
-                            p.material = MaterialType::Fire;
-                            p.life = 1.3;
-                            p.velocity.y += 4.0;
-                        } else if p.material == MaterialType::Water {
-                            p.material = MaterialType::Steam;
-                            p.life = 3.5;
-                            p.velocity.y += 2.5;
-                        }
-                    }
-                }
             }
         }
     }

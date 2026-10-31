@@ -22,7 +22,7 @@ impl Collider {
         Self {
             shape: ColliderShape::Sphere { center, radius },
             velocity: Vec3::ZERO,
-            restitution: 0.2,
+            restitution: 0.02,
             friction: 0.95,
             enabled: true,
         }
@@ -34,7 +34,7 @@ impl Collider {
                 aabb: Aabb::new(min, max),
             },
             velocity: Vec3::ZERO,
-            restitution: 0.2,
+            restitution: 0.02,
             friction: 0.95,
             enabled: true,
         }

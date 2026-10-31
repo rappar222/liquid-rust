@@ -14,10 +14,11 @@ pub struct SolverConfig {
     pub rest_density: f32,       // Target rest density rho0
     pub solver_iterations: usize,// PBF solver iterations per substep (typically 3-4)
     pub substeps: usize,         // Number of substeps per frame (typically 2-3)
-    pub viscosity: f32,          // XSPH artificial viscosity coefficient
-    pub surface_tension: f32,    // Cohesion coefficient
+    pub viscosity: f32,          // Normalized XSPH viscosity [0.0, 1.0]
+    pub surface_tension: f32,    // Surface tension cohesion coefficient
+    pub restitution: f32,        // Boundary restitution (0.0 for inelastic water, no bouncing)
+    pub boundary_friction: f32,  // Wall friction
     pub gravity: Vec3,
-    pub boundary_friction: f32,
     pub tensile_k: f32,          // Tensile instability correction coefficient
     pub max_velocity: f32,
 }
@@ -36,12 +37,13 @@ impl Default for SolverConfig {
             rest_density,
             solver_iterations: 3,
             substeps: 2,
-            viscosity: 0.08,
-            surface_tension: 0.02,
+            viscosity: 0.15,
+            surface_tension: 0.05,
+            restitution: 0.02, // Inelastic fluid impact: practically 0 bounce
+            boundary_friction: 0.95,
             gravity: Vec3::new(0.0, -9.81, 0.0),
-            boundary_friction: 0.96,
             tensile_k: 0.001,
-            max_velocity: 15.0,
+            max_velocity: 12.0,
         }
     }
 }
@@ -179,7 +181,7 @@ impl SphSolver {
                 continue;
             }
 
-            // Mouse force calculation
+            // Mouse force
             let mut f_user = Vec3::ZERO;
             if mouse_mode != 0 {
                 if let Some(ray) = mouse_ray {
@@ -203,7 +205,7 @@ impl SphSolver {
             p.velocity += accel * dt;
 
             let mut pred = p.position + p.velocity * dt;
-            // Prevent leaving container before solver
+            // Prevent leaving container
             pred = bounds.clamp_point(pred, radius);
             self.predicted_positions[i] = pred;
         }
@@ -217,9 +219,11 @@ impl SphSolver {
         let h2 = kernels.h2;
         let h = kernels.h;
         let tensile_k = self.config.tensile_k;
+        let surface_tension = self.config.surface_tension;
         let w_q = kernels.poly6((0.15 * h).powi(2)).max(1e-12);
         let inv_rho0 = 1.0 / rho0;
-        let relaxation_epsilon = 600.0;
+        let relaxation_epsilon = 1200.0;
+        let max_displacement = radius * 0.35; // Strict clamping to prevent catapult/trampoline bounce
 
         // 4. PBF Incompressibility Solver Iterations
         for _ in 0..self.config.solver_iterations {
@@ -283,15 +287,27 @@ impl SphSolver {
                                 let r = r2.sqrt();
                                 let lambda_j = lambdas[j];
 
-                                // Tensile instability correction (anti-clustering)
+                                // Tensile instability correction
                                 let w_r = kernels.poly6(r2);
                                 let s_corr = -tensile_k * (w_r / w_q).powi(4);
 
                                 let grad_w = kernels.spiky_gradient(r_vec, r);
                                 delta += grad_w * ((lambda_i + lambda_j + s_corr) * inv_rho0);
+
+                                // Surface tension cohesion: gently pulls nearby droplets together
+                                if surface_tension > 0.0 {
+                                    let cohesion_factor = (w_r * surface_tension * 0.05) / rho0;
+                                    delta -= (r_vec / r) * cohesion_factor;
+                                }
                             }
                         }
                     });
+
+                    // Anti-trampoline: clamp displacement magnitude per iteration
+                    let delta_len = delta.length();
+                    if delta_len > max_displacement {
+                        delta *= max_displacement / delta_len;
+                    }
 
                     *delta_out = delta;
                 });
@@ -316,10 +332,12 @@ impl SphSolver {
             }
         }
 
-        // 5. Update velocities from position displacement
+        // 5. Update velocities from position displacement with INELASTIC boundary response
         let inv_dt = 1.0 / dt;
         let max_vel = self.config.max_velocity;
+        let restitution = self.config.restitution;
         let friction = self.config.boundary_friction;
+        let margin = 1e-3;
 
         for (i, p) in self.particles.iter_mut().enumerate() {
             if p.particle_type == ParticleType::Boundary {
@@ -331,16 +349,52 @@ impl SphSolver {
 
             let mut vel = (new_pos - old_pos) * inv_dt;
 
-            // Apply friction if particle is resting against boundary
-            if new_pos.y <= bounds.min.y + radius + 1e-4 {
+            // Inelastic floor / boundary response: eliminate normal rebound velocity!
+            // Floor Y
+            if new_pos.y <= bounds.min.y + radius + margin {
+                if vel.y < 0.0 {
+                    vel.y = -vel.y * restitution;
+                }
                 vel.x *= friction;
                 vel.z *= friction;
             }
-            if new_pos.x <= bounds.min.x + radius + 1e-4 || new_pos.x >= bounds.max.x - radius - 1e-4 {
+            // Ceiling Y
+            if new_pos.y >= bounds.max.y - radius - margin {
+                if vel.y > 0.0 {
+                    vel.y = -vel.y * restitution;
+                }
+                vel.x *= friction;
+                vel.z *= friction;
+            }
+            // Left X
+            if new_pos.x <= bounds.min.x + radius + margin {
+                if vel.x < 0.0 {
+                    vel.x = -vel.x * restitution;
+                }
                 vel.y *= friction;
                 vel.z *= friction;
             }
-            if new_pos.z <= bounds.min.z + radius + 1e-4 || new_pos.z >= bounds.max.z - radius - 1e-4 {
+            // Right X
+            if new_pos.x >= bounds.max.x - radius - margin {
+                if vel.x > 0.0 {
+                    vel.x = -vel.x * restitution;
+                }
+                vel.y *= friction;
+                vel.z *= friction;
+            }
+            // Back Z
+            if new_pos.z <= bounds.min.z + radius + margin {
+                if vel.z < 0.0 {
+                    vel.z = -vel.z * restitution;
+                }
+                vel.x *= friction;
+                vel.y *= friction;
+            }
+            // Front Z
+            if new_pos.z >= bounds.max.z - radius - margin {
+                if vel.z > 0.0 {
+                    vel.z = -vel.z * restitution;
+                }
                 vel.x *= friction;
                 vel.y *= friction;
             }
@@ -357,11 +411,10 @@ impl SphSolver {
             p.pressure = (self.densities[i] - rho0).max(0.0);
         }
 
-        // 6. XSPH Artificial Viscosity (smoothed relative velocity)
-        let visc_c = (self.config.viscosity * 0.1).clamp(0.0, 0.5);
+        // 6. Normalized XSPH Viscosity (smooth moving average of local velocities)
+        let visc_c = self.config.viscosity.clamp(0.0, 0.95);
         if visc_c > 0.0 {
             let particles_slice = &self.particles;
-            let densities = &self.densities;
 
             self.xsph_velocities
                 .par_iter_mut()
@@ -369,21 +422,24 @@ impl SphSolver {
                 .for_each(|(i, xsph_out)| {
                     let pos_i = particles_slice[i].position;
                     let vel_i = particles_slice[i].velocity;
-                    let mut delta_v = Vec3::ZERO;
+
+                    let mut sum_w = kernels.poly6(0.0);
+                    let mut weighted_v = vel_i * sum_w;
 
                     grid.for_each_neighbor(pos_i, |j| {
                         if i != j {
                             let pos_j = particles_slice[j].position;
                             let r2 = (pos_i - pos_j).length_squared();
                             if r2 < h2 {
-                                let vel_j = particles_slice[j].velocity;
                                 let w = kernels.poly6(r2);
-                                delta_v += (vel_j - vel_i) * (w / densities[j]);
+                                sum_w += w;
+                                weighted_v += particles_slice[j].velocity * w;
                             }
                         }
                     });
 
-                    *xsph_out = vel_i + delta_v * visc_c;
+                    let avg_v = weighted_v / sum_w;
+                    *xsph_out = vel_i.lerp(avg_v, visc_c);
                 });
 
             for (i, p) in self.particles.iter_mut().enumerate() {

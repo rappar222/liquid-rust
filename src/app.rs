@@ -256,8 +256,16 @@ impl eframe::App for LiquidApp {
                     // --- Physics Parameters ---
                     ui.collapsing("⚙ Fluid Physics (PBF)", |ui| {
                         ui.add(
-                            egui::Slider::new(&mut self.solver.config.viscosity, 0.0..=0.3)
-                                .text("Viscosity"),
+                            egui::Slider::new(&mut self.solver.config.viscosity, 0.0..=0.5)
+                                .text("Viscosity (Damping)"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.solver.config.surface_tension, 0.0..=0.2)
+                                .text("Surface Tension"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.solver.config.restitution, 0.0..=0.2)
+                                .text("Restitution (Bounce)"),
                         );
                         ui.add(
                             egui::Slider::new(&mut self.solver.config.solver_iterations, 1..=6)
@@ -277,10 +285,6 @@ impl eframe::App for LiquidApp {
                                 0.5..=1.0,
                             )
                             .text("Wall Friction"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.solver.config.tensile_k, 0.0..=0.005)
-                                .text("Tensile Cohesion"),
                         );
                     });
 

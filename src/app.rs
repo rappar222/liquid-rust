@@ -2,7 +2,7 @@ use crate::export::PlyExporter;
 use crate::gpu::GpuSphSolver;
 use crate::math::{unproject_mouse_ray, Aabb};
 use crate::render::{Camera, ColorMap, ColorMapType, ColorMode, GlRenderer, ParticleVertex};
-use crate::sph::{Collider, ColliderShape, CubeFace, Drain, Faucet, FaucetShape};
+use crate::sph::{ChamberShape, Collider, ColliderShape, CubeFace, Drain, Faucet, FaucetShape};
 use crate::sph::scene::{SceneGenerator, ScenePreset};
 use crate::sph::solver::{compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver};
 use eframe::egui;
@@ -221,6 +221,7 @@ impl eframe::App for LiquidApp {
                     }
                     gpu.step(
                         self.solver.bounds,
+                        &self.solver.chamber,
                         &self.solver.config,
                         &self.solver.colliders,
                         self.solver.mouse_ray,
@@ -280,6 +281,7 @@ impl eframe::App for LiquidApp {
                         if let Some(ref mut gpu) = self.gpu_solver {
                             gpu.step(
                                 self.solver.bounds,
+                                &self.solver.chamber,
                                 &self.solver.config,
                                 &self.solver.colliders,
                                 self.solver.mouse_ray,
@@ -463,7 +465,59 @@ impl eframe::App for LiquidApp {
 
                     ui.separator();
 
-                    // --- Physics Parameters ---
+                    // --- Simulation Chamber & Shape Controls ---
+                    ui.collapsing("🛁 Simulation Chamber & Bounds", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Shape:");
+                            for &s in &ChamberShape::ALL {
+                                if ui.selectable_label(self.solver.chamber.shape == s, s.name()).clicked() {
+                                    self.solver.chamber.shape = s;
+                                    self.solver.bounds = self.solver.chamber.compute_bounds();
+                                    if let Some(ref mut gpu) = self.gpu_solver {
+                                        gpu.init_buffers(self.solver.bounds, &self.solver.config, &self.solver.particles);
+                                    }
+                                }
+                            }
+                        });
+
+                        ui.separator();
+                        ui.label("Chamber Scale:");
+                        let mut scale_changed = false;
+
+                        // Uniform scale
+                        let mut uniform_s = (self.solver.chamber.scale.x + self.solver.chamber.scale.y + self.solver.chamber.scale.z) / 3.0;
+                        if ui.add(egui::Slider::new(&mut uniform_s, 0.4..=3.0).text("Uniform Scale")).changed() {
+                            self.solver.chamber.scale = Vec3::splat(uniform_s);
+                            scale_changed = true;
+                        }
+
+                        // Independent X, Y, Z sliders
+                        scale_changed |= ui.add(egui::Slider::new(&mut self.solver.chamber.scale.x, 0.3..=3.0).text("Scale X (Length)")).changed();
+                        scale_changed |= ui.add(egui::Slider::new(&mut self.solver.chamber.scale.y, 0.3..=3.0).text("Scale Y (Height)")).changed();
+                        scale_changed |= ui.add(egui::Slider::new(&mut self.solver.chamber.scale.z, 0.3..=3.0).text("Scale Z (Width)")).changed();
+
+                        if ui.button("↺ Reset Scale (1.0x)").clicked() {
+                            self.solver.chamber.scale = Vec3::ONE;
+                            scale_changed = true;
+                        }
+
+                        if self.solver.chamber.shape == ChamberShape::Bathtub {
+                            ui.separator();
+                            ui.label("Bathtub Geometry:");
+                            ui.add(egui::Slider::new(&mut self.solver.chamber.tub_slope_ratio, 0.1..=0.45).text("Backrest Slope"));
+                            ui.add(egui::Slider::new(&mut self.solver.chamber.tub_fillet_ratio, 0.05..=0.35).text("Bottom Fillet"));
+                        }
+
+                        if scale_changed {
+                            self.solver.bounds = self.solver.chamber.compute_bounds();
+                            if let Some(ref mut gpu) = self.gpu_solver {
+                                gpu.init_buffers(self.solver.bounds, &self.solver.config, &self.solver.particles);
+                            }
+                        }
+
+                        let sz = self.solver.bounds.size();
+                        ui.label(format!("Chamber Size: {:.2} x {:.2} x {:.2} m", sz.x, sz.y, sz.z));
+                    });
                     ui.collapsing("⚙ Fluid Physics (PBF)", |ui| {
                         ui.add(
                             egui::Slider::new(&mut self.sim_speed, 0.05..=2.0)
@@ -1020,6 +1074,7 @@ impl eframe::App for LiquidApp {
 
             let renderer_arc = self.renderer.clone();
             let bounds = self.solver.bounds;
+            let chamber = self.solver.chamber.clone();
             let colliders = self.solver.colliders.clone();
             let faucets = self.solver.faucets.clone();
             let drains = self.solver.drains.clone();
@@ -1049,6 +1104,7 @@ impl eframe::App for LiquidApp {
                             fov_y,
                             &particles_data,
                             lit_spheres,
+                            &chamber,
                             bounds,
                             &colliders,
                             &faucets,

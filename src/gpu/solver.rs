@@ -31,6 +31,7 @@ pub struct GpuUniforms {
     pub fluid_params: [f32; 4],
     pub counts: [u32; 4],
     pub colliders: [GpuColliderData; 16],
+    pub chamber_info: [f32; 4],
 }
 
 #[repr(C)]
@@ -458,6 +459,7 @@ impl GpuSphSolver {
     pub fn step(
         &mut self,
         bounds: Aabb,
+        chamber: &crate::sph::chamber::Chamber,
         config: &SolverConfig,
         colliders: &[Collider],
         mouse_ray: Option<Ray>,
@@ -582,6 +584,7 @@ impl GpuSphSolver {
                 num_colliders,
             ],
             colliders: gpu_colliders,
+            chamber_info: chamber.gpu_info(&bounds),
         };
 
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));

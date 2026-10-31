@@ -169,6 +169,7 @@ void main() {
         fov_y: f32,
         particles_data: &[ParticleVertex],
         lit_spheres: bool,
+        chamber: &crate::sph::chamber::Chamber,
         bounds: Aabb,
         colliders: &[Collider],
         faucets: &[Faucet],
@@ -181,9 +182,12 @@ void main() {
             gl.disable(glow::BLEND);
             gl.enable(glow::PROGRAM_POINT_SIZE);
 
-            // 1. Draw Bounding Box, Colliders, Faucets, and Drains
+            // 1. Draw Chamber, Colliders, Faucets, and Drains
             let mut line_vertices = Vec::new();
-            Self::generate_box_lines(&bounds, &mut line_vertices);
+            for (p0, p1) in chamber.generate_wireframe_lines(&bounds) {
+                line_vertices.push(LineVertex { pos: p0.to_array() });
+                line_vertices.push(LineVertex { pos: p1.to_array() });
+            }
             for collider in colliders {
                 if collider.enabled {
                     match &collider.shape {

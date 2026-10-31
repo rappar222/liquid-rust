@@ -1,6 +1,6 @@
 [package]
 name = "liquid-rust"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 authors = ["Radu <rappar222>"]
 description = "High-performance 3D SPH Fluid Simulation in Rust with real-time visualization and PLY export"

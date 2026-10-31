@@ -1,3 +1,4 @@
+pub mod chamber;
 pub mod collider;
 pub mod faucet;
 pub mod kernel;
@@ -7,6 +8,7 @@ pub mod scene;
 pub mod solver;
 pub mod spatial;
 
+pub use chamber::{Chamber, ChamberShape};
 pub use collider::{Collider, ColliderShape};
 pub use faucet::{CubeFace, Drain, Faucet, FaucetShape};
 pub use kernel::SphKernels;

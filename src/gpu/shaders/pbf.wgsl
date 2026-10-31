@@ -30,6 +30,7 @@ struct SimulationUniforms {
     // [particle_count, solver_iterations, substeps, num_colliders]
     counts: vec4<u32>,
     colliders: array<GpuCollider, 16>,
+    chamber_info: vec4<f32>,
 };
 
 struct Particle {
@@ -61,6 +62,71 @@ fn spiky_gradient(r_vec: vec3<f32>, r: f32, h: f32, spiky_factor: f32) -> vec3<f
         return r_vec * factor;
     }
     return vec3<f32>(0.0);
+}
+
+fn resolve_chamber_gpu(pos_in: vec3<f32>, radius: f32) -> vec3<f32> {
+    var pos = pos_in;
+    let shape = u32(uniforms.chamber_info.x + 0.5);
+    let b_min = uniforms.bounds_min.xyz;
+    let b_max = uniforms.bounds_max.xyz;
+    
+    if (shape == 1u) {
+        // Sphere Chamber
+        let r_chamber = (b_max.y - b_min.y) * 0.5;
+        let center = vec3<f32>((b_min.x + b_max.x) * 0.5, b_min.y + r_chamber, (b_min.z + b_max.z) * 0.5);
+        let to_p = pos - center;
+        let dist = length(to_p);
+        let max_d = max(r_chamber - radius, 0.01);
+        if (dist > max_d && dist > 1e-6) {
+            pos = center + (to_p / dist) * max_d;
+        }
+    } else if (shape == 2u) {
+        // Bathtub Chamber
+        let b_min_eff = b_min + vec3<f32>(radius);
+        let b_max_eff = b_max - vec3<f32>(radius);
+        let H = max(b_max.y - b_min.y, 1e-4);
+        let slope_offset = uniforms.chamber_info.w;
+        let fillet = uniforms.chamber_info.z;
+        
+        // 1. Floor and ceiling
+        pos.y = clamp(pos.y, b_min_eff.y, b_max_eff.y);
+        
+        // 2. Sloped backrest at -X and front wall at +X
+        let norm_y = clamp((pos.y - b_min.y) / H, 0.0, 1.0);
+        let x_back = b_min_eff.x + (1.0 - norm_y) * slope_offset;
+        let x_front = b_max_eff.x;
+        pos.x = clamp(pos.x, x_back, x_front);
+        
+        // 3. Side walls at Z
+        let half_w = (b_max.z - b_min.z) * 0.5;
+        let cz = (b_min.z + b_max.z) * 0.5;
+        let z_rel = pos.z - cz;
+        let z_clamped = clamp(z_rel, -half_w + radius, half_w - radius);
+        pos.z = cz + z_clamped;
+        
+        // 4. Fillets where floor meets side walls
+        if (fillet > radius) {
+            let eff_fillet = fillet - radius;
+            let dy = (pos.y - b_min.y) - fillet;
+            let abs_z = abs(pos.z - cz);
+            let dz = abs_z - (half_w - fillet);
+            if (dy < 0.0 && dz > 0.0) {
+                let d = sqrt(dy * dy + dz * dz);
+                if (d > eff_fillet && d > 1e-6) {
+                    let factor = eff_fillet / d;
+                    pos.y = b_min.y + fillet + dy * factor;
+                    let new_z = (half_w - fillet) + dz * factor;
+                    pos.z = cz + sign(pos.z - cz) * new_z;
+                }
+            }
+        }
+    } else {
+        // Box Chamber
+        let b_min_eff = b_min + vec3<f32>(radius);
+        let b_max_eff = b_max - vec3<f32>(radius);
+        pos = clamp(pos, b_min_eff, b_max_eff);
+    }
+    return pos;
 }
 
 // 1. Predict positions with gravity & user interaction
@@ -109,9 +175,7 @@ fn predict_positions(@builtin(global_invocation_id) id: vec3<u32>) {
     var pred = p_pos + vel * dt;
     
     let radius = uniforms.bounds_max.w;
-    let b_min = uniforms.bounds_min.xyz + vec3<f32>(radius);
-    let b_max = uniforms.bounds_max.xyz - vec3<f32>(radius);
-    pred = clamp(pred, b_min, b_max);
+    pred = resolve_chamber_gpu(pred, radius);
     
     predicted_positions[i] = vec4<f32>(pred, 0.0);
     particles[i].vel_dens = vec4<f32>(vel, particles[i].vel_dens.w);
@@ -329,10 +393,8 @@ fn apply_delta_and_collide(@builtin(global_invocation_id) id: vec3<u32>) {
     var pos = predicted_positions[i].xyz + delta_positions[i].xyz;
     let radius = uniforms.bounds_max.w;
     
-    // Box bounds
-    let b_min = uniforms.bounds_min.xyz + vec3<f32>(radius);
-    let b_max = uniforms.bounds_max.xyz - vec3<f32>(radius);
-    pos = clamp(pos, b_min, b_max);
+    // Chamber bounds collision
+    pos = resolve_chamber_gpu(pos, radius);
     
     // Dynamic Obstacles Collision Resolution (Spheres, Boxes, Cylinders)
     let num_colliders = min(uniforms.counts.w, 16u);
@@ -430,38 +492,94 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
     let b_min = uniforms.bounds_min.xyz;
     let b_max = uniforms.bounds_max.xyz;
     
-    // Inelastic floor / ceiling / wall velocity response
-    if (new_pos.y <= b_min.y + radius + margin && vel.y < 0.0) {
-        vel.y = -vel.y * restitution;
-        vel.x *= friction;
-        vel.z *= friction;
+    // Chamber velocity response
+    let shape = u32(uniforms.chamber_info.x + 0.5);
+    if (shape == 1u) {
+        let r_chamber = (b_max.y - b_min.y) * 0.5;
+        let center = vec3<f32>((b_min.x + b_max.x) * 0.5, b_min.y + r_chamber, (b_min.z + b_max.z) * 0.5);
+        let to_p = new_pos - center;
+        let dist = length(to_p);
+        if (dist >= r_chamber - radius - margin && dist > 1e-6) {
+            let n = to_p / dist;
+            let vn = dot(vel, n);
+            if (vn > 0.0) {
+                let n_vel = n * vn;
+                let t_vel = vel - n_vel;
+                vel = t_vel * friction - n_vel * restitution;
+            }
+        }
+    } else if (shape == 2u) {
+        let H = max(b_max.y - b_min.y, 1e-4);
+        let slope_offset = uniforms.chamber_info.w;
+        let norm_y = clamp((new_pos.y - b_min.y) / H, 0.0, 1.0);
+        let x_back = b_min.x + (1.0 - norm_y) * slope_offset;
+        let back_dist = abs(new_pos.x - x_back);
+        if (back_dist <= radius + margin) {
+            let back_normal = normalize(vec3<f32>(H, slope_offset, 0.0));
+            let vn = dot(vel, -back_normal);
+            if (vn < 0.0) {
+                let n_v = -back_normal * vn;
+                let t_v = vel - n_v;
+                vel = t_v * friction - n_v * restitution;
+            }
+        }
+        if (new_pos.y <= b_min.y + radius + margin && vel.y < 0.0) {
+            vel.y = -vel.y * restitution;
+            vel.x *= friction;
+            vel.z *= friction;
+        }
+        if (new_pos.y >= b_max.y - radius - margin && vel.y > 0.0) {
+            vel.y = -vel.y * restitution;
+            vel.x *= friction;
+            vel.z *= friction;
+        }
+        if (new_pos.x >= b_max.x - radius - margin && vel.x > 0.0) {
+            vel.x = -vel.x * restitution;
+            vel.y *= friction;
+            vel.z *= friction;
+        }
+        if (new_pos.z <= b_min.z + radius + margin && vel.z < 0.0) {
+            vel.z = -vel.z * restitution;
+            vel.x *= friction;
+            vel.y *= friction;
+        }
+        if (new_pos.z >= b_max.z - radius - margin && vel.z > 0.0) {
+            vel.z = -vel.z * restitution;
+            vel.x *= friction;
+            vel.z *= friction;
+        }
+    } else {
+        if (new_pos.y <= b_min.y + radius + margin && vel.y < 0.0) {
+            vel.y = -vel.y * restitution;
+            vel.x *= friction;
+            vel.z *= friction;
+        }
+        if (new_pos.y >= b_max.y - radius - margin && vel.y > 0.0) {
+            vel.y = -vel.y * restitution;
+            vel.x *= friction;
+            vel.z *= friction;
+        }
+        if (new_pos.x <= b_min.x + radius + margin && vel.x < 0.0) {
+            vel.x = -vel.x * restitution;
+            vel.y *= friction;
+            vel.z *= friction;
+        }
+        if (new_pos.x >= b_max.x - radius - margin && vel.x > 0.0) {
+            vel.x = -vel.x * restitution;
+            vel.y *= friction;
+            vel.z *= friction;
+        }
+        if (new_pos.z <= b_min.z + radius + margin && vel.z < 0.0) {
+            vel.z = -vel.z * restitution;
+            vel.x *= friction;
+            vel.y *= friction;
+        }
+        if (new_pos.z >= b_max.z - radius - margin && vel.z > 0.0) {
+            vel.z = -vel.z * restitution;
+            vel.x *= friction;
+            vel.z *= friction;
+        }
     }
-    if (new_pos.y >= b_max.y - radius - margin && vel.y > 0.0) {
-        vel.y = -vel.y * restitution;
-        vel.x *= friction;
-        vel.z *= friction;
-    }
-    if (new_pos.x <= b_min.x + radius + margin && vel.x < 0.0) {
-        vel.x = -vel.x * restitution;
-        vel.y *= friction;
-        vel.z *= friction;
-    }
-    if (new_pos.x >= b_max.x - radius - margin && vel.x > 0.0) {
-        vel.x = -vel.x * restitution;
-        vel.y *= friction;
-        vel.z *= friction;
-    }
-    if (new_pos.z <= b_min.z + radius + margin && vel.z < 0.0) {
-        vel.z = -vel.z * restitution;
-        vel.x *= friction;
-        vel.z *= friction;
-    }
-    if (new_pos.z >= b_max.z - radius - margin && vel.z > 0.0) {
-        vel.z = -vel.z * restitution;
-        vel.x *= friction;
-        vel.z *= friction;
-    }
-    
     // XSPH Viscosity
     let viscosity = uniforms.fluid_params.x;
     if (viscosity > 0.0) {

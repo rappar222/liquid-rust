@@ -1,12 +1,12 @@
 use clap::Parser;
 use eframe::egui;
+use glam::Vec3;
 use liquid_rust::export::{Mp4Encoder, PlyExporter, SoftwareRenderer};
 use liquid_rust::gpu::GpuSphSolver;
-use liquid_rust::math::Aabb;
 use liquid_rust::render::{Camera, ColorMapType, ColorMode};
 use liquid_rust::sph::{
-    compute_lattice_rest_density, Collider, ColliderShape, CubeFace, Drain, Faucet,
-    SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver,
+    compute_lattice_rest_density, Chamber, ChamberShape, Collider, ColliderShape, CubeFace, Drain,
+    Faucet, SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver,
 };
 use liquid_rust::LiquidApp;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use std::time::Instant;
 #[command(
     name = "liquid-rust",
     author = "Radu <rappar222>",
-    version = "0.1.3",
+    version = "0.1.5",
     about = "High-performance 3D SPH Fluid Simulator in Rust with Real-time 3D Viewport, MP4 Video & PLY Export"
 )]
 struct Args {
@@ -77,6 +77,18 @@ struct Args {
     /// Add custom drain: 'floor:radius' or 'floor:x,z:radius', '<face>:radius' (floor|ceiling|left|right|back|front), or 'custom:x,y,z:radius'
     #[arg(long = "drain", action = clap::ArgAction::Append)]
     drains: Vec<String>,
+
+    /// Simulation chamber shape: box, sphere, bathtub
+    #[arg(long, default_value = "box")]
+    chamber_shape: String,
+
+    /// Chamber scale factor: uniform (e.g. 1.5) or per-axis (e.g. 1.5,1.2,1.0)
+    #[arg(long)]
+    chamber_scale: Option<String>,
+
+    /// Chamber bounding dimensions: width,height,depth (e.g. 2.0,1.5,1.0)
+    #[arg(long)]
+    chamber_size: Option<String>,
 
     /// Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
     #[arg(long)]
@@ -477,6 +489,50 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
     Ok(d)
 }
 
+fn parse_chamber(args: &Args) -> Chamber {
+    let chamber_shape = match args.chamber_shape.to_lowercase().as_str() {
+        "sphere" | "globe" | "ball" => ChamberShape::Sphere,
+        "bathtub" | "tub" | "bath" => ChamberShape::Bathtub,
+        _ => ChamberShape::Box,
+    };
+    let mut chamber = Chamber::new(chamber_shape);
+
+    if let Some(ref scale_str) = args.chamber_scale {
+        let cleaned = scale_str.replace(['[', ']', '(', ')'], "");
+        let parts: Vec<&str> = cleaned.split(',').collect();
+        if parts.len() == 1 {
+            if let Ok(s) = parts[0].trim().parse::<f32>() {
+                chamber.scale = Vec3::splat(s);
+            }
+        } else if parts.len() == 3 {
+            if let (Ok(x), Ok(y), Ok(z)) = (
+                parts[0].trim().parse::<f32>(),
+                parts[1].trim().parse::<f32>(),
+                parts[2].trim().parse::<f32>(),
+            ) {
+                chamber.scale = Vec3::new(x, y, z);
+            }
+        }
+    }
+
+    if let Some(ref size_str) = args.chamber_size {
+        let cleaned = size_str.replace(['[', ']', '(', ')'], "");
+        let parts: Vec<&str> = cleaned.split(',').collect();
+        if parts.len() == 3 {
+            if let (Ok(w), Ok(h), Ok(d)) = (
+                parts[0].trim().parse::<f32>(),
+                parts[1].trim().parse::<f32>(),
+                parts[2].trim().parse::<f32>(),
+            ) {
+                chamber.base_size = Vec3::new(w, h, d);
+                chamber.scale = Vec3::ONE;
+            }
+        }
+    }
+
+    chamber
+}
+
 fn run_headless(
     args: Args,
     parsed_colliders: Vec<Collider>,
@@ -506,7 +562,8 @@ fn run_headless(
     println!("Total Frames: {} ({:.2}s @ {} fps)", total_frames, total_frames as f32 / fps as f32, fps);
     println!("Time step dt: {:.5}s", dt);
 
-    let bounds = Aabb::new(glam::Vec3::new(-0.8, 0.0, -0.45), glam::Vec3::new(0.8, 1.2, 0.45));
+    let chamber = parse_chamber(&args);
+    let bounds = chamber.compute_bounds();
     let mut config = SolverConfig::default();
     quality.apply(&mut config);
 
@@ -538,7 +595,14 @@ fn run_headless(
     config.rest_density = compute_lattice_rest_density(config.smoothing_length, config.spacing);
 
     let mut solver = SphSolver::new(bounds, config);
+    solver.set_chamber(chamber);
     SceneGenerator::setup_scene(&mut solver, preset);
+
+    let ch_size = solver.bounds.size();
+    println!("Chamber: {} (Scale: ({:.2}, {:.2}, {:.2}), Bounds: {:.2} x {:.2} x {:.2} m)",
+        solver.chamber.shape.name(),
+        solver.chamber.scale.x, solver.chamber.scale.y, solver.chamber.scale.z,
+        ch_size.x, ch_size.y, ch_size.z);
 
     for col in parsed_colliders {
         println!("  + Obstacle: {} (id: {})", col.name, col.id);
@@ -650,6 +714,7 @@ fn run_headless(
             }
             gpu.step(
                 solver.bounds,
+                &solver.chamber,
                 &solver.config,
                 &solver.colliders,
                 solver.mouse_ray,
@@ -684,6 +749,7 @@ fn run_headless(
             rend.render_frame(
                 &solver.particles,
                 solver.config.particle_radius,
+                &solver.chamber,
                 solver.bounds,
                 &camera,
                 ColorMode::Velocity,
@@ -780,6 +846,7 @@ fn run_gui(
     initial_preset: ScenePreset,
     initial_quality: SimulationQuality,
     initial_speed: f32,
+    initial_chamber: Chamber,
     parsed_colliders: Vec<Collider>,
     parsed_faucets: Vec<Faucet>,
     parsed_drains: Vec<Drain>,
@@ -801,6 +868,7 @@ fn run_gui(
             if (initial_speed - 1.0).abs() > 1e-4 {
                 app.sim_speed = initial_speed;
             }
+            app.solver.set_chamber(initial_chamber);
             app.load_preset(initial_preset);
             if initial_quality != SimulationQuality::Medium {
                 app.set_quality(initial_quality);
@@ -859,6 +927,7 @@ fn main() {
     }
 
     let preset = parse_preset(args.preset.as_deref());
+    let chamber = parse_chamber(&args);
 
     if args.headless || args.benchmark || args.export_mp4.is_some() {
         run_headless(args, parsed_colliders, parsed_faucets, parsed_drains);
@@ -869,6 +938,7 @@ fn main() {
             preset,
             initial_quality,
             initial_speed,
+            chamber,
             parsed_colliders,
             parsed_faucets,
             parsed_drains,

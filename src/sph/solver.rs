@@ -1,4 +1,5 @@
 use crate::math::{Aabb, Ray};
+use crate::sph::chamber::Chamber;
 use crate::sph::collider::Collider;
 use crate::sph::kernel::SphKernels;
 use crate::sph::particle::{Particle, ParticleType};
@@ -159,6 +160,7 @@ pub fn compute_lattice_rest_density(h: f32, spacing: f32) -> f32 {
 pub struct SphSolver {
     pub particles: Vec<Particle>,
     pub bounds: Aabb,
+    pub chamber: Chamber,
     pub colliders: Vec<Collider>,
     pub faucets: Vec<crate::sph::faucet::Faucet>,
     pub drains: Vec<crate::sph::faucet::Drain>,
@@ -189,6 +191,7 @@ impl SphSolver {
         Self {
             particles: Vec::new(),
             bounds,
+            chamber: Chamber::default(),
             colliders: Vec::new(),
             faucets: Vec::new(),
             drains: Vec::new(),
@@ -213,6 +216,11 @@ impl SphSolver {
         self.config.rest_density = compute_lattice_rest_density(h, self.config.spacing);
         self.kernels = SphKernels::new(h);
         self.grid = SpatialHashGrid::new(h, self.particles.len().max(1024));
+    }
+
+    pub fn set_chamber(&mut self, chamber: Chamber) {
+        self.bounds = chamber.compute_bounds();
+        self.chamber = chamber;
     }
 
     pub fn apply_quality(&mut self, quality: SimulationQuality) {
@@ -335,7 +343,7 @@ impl SphSolver {
 
             let mut pred = p.position + p.velocity * dt;
             // Prevent leaving container
-            pred = bounds.clamp_point(pred, radius);
+            self.chamber.resolve_collision(&mut pred, radius, &bounds);
             self.predicted_positions[i] = pred;
         }
 
@@ -449,15 +457,14 @@ impl SphSolver {
 
             // 4c. Apply displacements and project collisions onto predicted positions
             let colliders = &self.colliders;
+            let chamber = &self.chamber;
             for i in 0..n {
                 self.predicted_positions[i] += self.delta_positions[i];
 
                 let p_pos = &mut self.predicted_positions[i];
 
-                // Bounding box collision projection
-                p_pos.x = p_pos.x.clamp(bounds.min.x + radius, bounds.max.x - radius);
-                p_pos.y = p_pos.y.clamp(bounds.min.y + radius, bounds.max.y - radius);
-                p_pos.z = p_pos.z.clamp(bounds.min.z + radius, bounds.max.z - radius);
+                // Chamber collision projection
+                chamber.resolve_collision(p_pos, radius, &bounds);
 
                 // Colliders (sphere / box obstacles)
                 let mut dummy_vel = Vec3::ZERO;
@@ -472,7 +479,6 @@ impl SphSolver {
         let max_vel = self.config.max_velocity;
         let restitution = self.config.restitution;
         let friction = self.config.boundary_friction;
-        let margin = 1e-3;
 
         for (i, p) in self.particles.iter_mut().enumerate() {
             if p.particle_type == ParticleType::Boundary {
@@ -484,55 +490,17 @@ impl SphSolver {
 
             let mut vel = (new_pos - old_pos) * inv_dt;
 
-            // Inelastic floor / boundary response: eliminate normal rebound velocity!
-            // Floor Y
-            if new_pos.y <= bounds.min.y + radius + margin {
-                if vel.y < 0.0 {
-                    vel.y = -vel.y * restitution;
-                }
-                vel.x *= friction;
-                vel.z *= friction;
-            }
-            // Ceiling Y
-            if new_pos.y >= bounds.max.y - radius - margin {
-                if vel.y > 0.0 {
-                    vel.y = -vel.y * restitution;
-                }
-                vel.x *= friction;
-                vel.z *= friction;
-            }
-            // Left X
-            if new_pos.x <= bounds.min.x + radius + margin {
-                if vel.x < 0.0 {
-                    vel.x = -vel.x * restitution;
-                }
-                vel.y *= friction;
-                vel.z *= friction;
-            }
-            // Right X
-            if new_pos.x >= bounds.max.x - radius - margin {
-                if vel.x > 0.0 {
-                    vel.x = -vel.x * restitution;
-                }
-                vel.y *= friction;
-                vel.z *= friction;
-            }
-            // Back Z
-            if new_pos.z <= bounds.min.z + radius + margin {
-                if vel.z < 0.0 {
-                    vel.z = -vel.z * restitution;
-                }
-                vel.x *= friction;
-                vel.y *= friction;
-            }
-            // Front Z
-            if new_pos.z >= bounds.max.z - radius - margin {
-                if vel.z > 0.0 {
-                    vel.z = -vel.z * restitution;
-                }
-                vel.x *= friction;
-                vel.y *= friction;
-            }
+            // Inelastic chamber boundary response
+            self.chamber.resolve_velocity(
+                new_pos,
+                old_pos,
+                &mut vel,
+                dt,
+                radius,
+                &bounds,
+                restitution,
+                friction,
+            );
 
             // Obstacle Colliders (Sphere, Box, Cylinder, OBJ Mesh)
             for collider in &self.colliders {

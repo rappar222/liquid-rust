@@ -1,4 +1,5 @@
 use crate::math::Aabb;
+use crate::sph::chamber::ChamberShape;
 use crate::sph::collider::Collider;
 use crate::sph::particle::Particle;
 use crate::sph::solver::{compute_lattice_rest_density, SphSolver};
@@ -279,6 +280,13 @@ impl SceneGenerator {
                 solver.config.gravity = Vec3::new(0.0, -9.81, 0.0);
                 solver.config.viscosity = 0.05;
             }
+        }
+
+        // If the chamber has a custom shape or scale, re-apply the chamber bounds
+        if solver.chamber.shape != ChamberShape::Box || solver.chamber.scale != Vec3::ONE {
+            solver.bounds = solver.chamber.compute_bounds();
+        } else {
+            solver.chamber.base_size = solver.bounds.size();
         }
     }
 }

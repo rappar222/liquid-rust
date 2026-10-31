@@ -68,6 +68,7 @@ impl SoftwareRenderer {
         &mut self,
         particles: &[Particle],
         particle_radius: f32,
+        chamber: &crate::sph::chamber::Chamber,
         bounds: Aabb,
         camera: &Camera,
         color_mode: ColorMode,
@@ -83,8 +84,8 @@ impl SoftwareRenderer {
         let proj = camera.projection_matrix(aspect);
         let view_proj = proj * view;
 
-        // 1. Draw Bounding Box Wireframe
-        self.draw_box_wireframe(&bounds, view_proj);
+        // 1. Draw Chamber Wireframe
+        self.draw_chamber_wireframe(chamber, &bounds, view_proj);
 
         // 2. Parallel projection of visible particles
         let fov_y = camera.fov_y;
@@ -261,13 +262,10 @@ impl SoftwareRenderer {
         ColorMap::sample(color_map, t)
     }
 
-    fn draw_box_wireframe(&mut self, bounds: &Aabb, view_proj: Mat4) {
-        let corners = bounds.corners();
-        let indices = Aabb::edge_indices();
+    fn draw_chamber_wireframe(&mut self, chamber: &crate::sph::chamber::Chamber, bounds: &Aabb, view_proj: Mat4) {
         let color = [80, 140, 210];
-
-        for (i0, i1) in indices {
-            self.draw_3d_line(corners[i0], corners[i1], view_proj, color);
+        for (p0, p1) in chamber.generate_wireframe_lines(bounds) {
+            self.draw_3d_line(p0, p1, view_proj, color);
         }
     }
 

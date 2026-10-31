@@ -1,11 +1,19 @@
 use crate::math::{Aabb, Ray};
-use crate::sph::collider::Collider;
+use crate::sph::collider::{Collider, ColliderShape};
 use crate::sph::particle::{Particle, ParticleType};
 use crate::sph::solver::SolverConfig;
 use glam::Vec3;
 use std::f32::consts::PI;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuColliderData {
+    pub info: [u32; 4],    // x: kind (1: sphere, 2: box, 3: cylinder), y: enabled, zw: pad
+    pub pos_rad: [f32; 4], // xyz: center, w: radius
+    pub extents: [f32; 4], // xyz: half extents, w: height
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -22,6 +30,7 @@ pub struct GpuUniforms {
     pub solver_params: [f32; 4],
     pub fluid_params: [f32; 4],
     pub counts: [u32; 4],
+    pub colliders: [GpuColliderData; 16],
 }
 
 #[repr(C)]
@@ -58,7 +67,7 @@ pub struct GpuSphSolver {
     readback_buf: Option<wgpu::Buffer>,
 
     pub particle_count: usize,
-    particle_capacity: usize,
+    pub particle_capacity: usize,
     pub total_cells: u32,
     pub grid_dim: [u32; 3],
     pub cell_size: f32,
@@ -485,13 +494,51 @@ impl GpuSphSolver {
 
         let mut collider_pos = [0.0; 4];
         let mut collider_enabled = 0.0f32;
-        if let Some(col) = colliders.iter().find(|c| c.enabled) {
-            match col.shape {
-                crate::sph::collider::ColliderShape::Sphere { center, radius } => {
-                    collider_enabled = 1.0;
-                    collider_pos = [center.x, center.y, center.z, radius];
+        let mut gpu_colliders = [GpuColliderData {
+            info: [0; 4],
+            pos_rad: [0.0; 4],
+            extents: [0.0; 4],
+        }; 16];
+        let mut num_colliders = 0u32;
+
+        for col in colliders.iter().filter(|c| c.enabled) {
+            if num_colliders as usize >= 16 {
+                break;
+            }
+            match &col.shape {
+                ColliderShape::Sphere { center, radius } => {
+                    if collider_enabled == 0.0 {
+                        collider_enabled = 1.0;
+                        collider_pos = [center.x, center.y, center.z, *radius];
+                    }
+                    gpu_colliders[num_colliders as usize] = GpuColliderData {
+                        info: [1, 1, 0, 0],
+                        pos_rad: [center.x, center.y, center.z, *radius],
+                        extents: [0.0; 4],
+                    };
+                    num_colliders += 1;
                 }
-                _ => {}
+                ColliderShape::Box { aabb } => {
+                    let center = aabb.center();
+                    let half_size = aabb.size() * 0.5;
+                    gpu_colliders[num_colliders as usize] = GpuColliderData {
+                        info: [2, 1, 0, 0],
+                        pos_rad: [center.x, center.y, center.z, 0.0],
+                        extents: [half_size.x, half_size.y, half_size.z, 0.0],
+                    };
+                    num_colliders += 1;
+                }
+                ColliderShape::Cylinder { center, radius, height } => {
+                    gpu_colliders[num_colliders as usize] = GpuColliderData {
+                        info: [3, 1, 0, 0],
+                        pos_rad: [center.x, center.y, center.z, *radius],
+                        extents: [0.0, 0.0, 0.0, *height],
+                    };
+                    num_colliders += 1;
+                }
+                ColliderShape::Mesh(_) => {
+                    // Triangle meshes are resolved on CPU
+                }
             }
         }
 
@@ -532,8 +579,9 @@ impl GpuSphSolver {
                 self.particle_count as u32,
                 config.solver_iterations as u32,
                 substeps as u32,
-                0,
+                num_colliders,
             ],
+            colliders: gpu_colliders,
         };
 
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));

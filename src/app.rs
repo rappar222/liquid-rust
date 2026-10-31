@@ -2,7 +2,7 @@ use crate::export::PlyExporter;
 use crate::gpu::GpuSphSolver;
 use crate::math::{unproject_mouse_ray, Aabb};
 use crate::render::{Camera, ColorMap, ColorMapType, ColorMode, GlRenderer, ParticleVertex};
-use crate::sph::collider::Collider;
+use crate::sph::{Collider, ColliderShape, CubeFace, Drain, Faucet, FaucetShape};
 use crate::sph::scene::{SceneGenerator, ScenePreset};
 use crate::sph::solver::{compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver};
 use eframe::egui;
@@ -47,6 +47,10 @@ pub struct LiquidApp {
     pub exported_frames_count: usize,
     pub status_message: String,
     pub show_extreme_modal: bool,
+    pub obj_file_path: String,
+    pub next_collider_id: u32,
+    pub next_faucet_id: u32,
+    pub next_drain_id: u32,
 }
 
 impl LiquidApp {
@@ -111,6 +115,10 @@ impl LiquidApp {
             exported_frames_count: 0,
             status_message: "Ready".to_string(),
             show_extreme_modal: false,
+            obj_file_path: "model.obj".to_string(),
+            next_collider_id: 1,
+            next_faucet_id: 1,
+            next_drain_id: 1,
         }
     }
 
@@ -204,8 +212,13 @@ impl eframe::App for LiquidApp {
         if self.is_playing {
             let start = Instant::now();
             let effective_dt = self.fixed_dt * self.sim_speed;
+
             if self.use_gpu && self.gpu_solver.is_some() {
+                self.solver.emit_faucets(effective_dt);
                 if let Some(ref mut gpu) = self.gpu_solver {
+                    if gpu.particle_count != self.solver.particles.len() || self.solver.particles.len() > gpu.particle_capacity {
+                        gpu.init_buffers(self.solver.bounds, &self.solver.config, &self.solver.particles);
+                    }
                     gpu.step(
                         self.solver.bounds,
                         &self.solver.config,
@@ -217,9 +230,27 @@ impl eframe::App for LiquidApp {
                     );
                     gpu.read_particles(&mut self.solver.particles);
                 }
+
+                // Resolve any Mesh (.obj) colliders on readback/particles
+                let radius = self.solver.config.particle_radius;
+                for col in &self.solver.colliders {
+                    if let ColliderShape::Mesh(_) = &col.shape {
+                        for p in &mut self.solver.particles {
+                            col.resolve(&mut p.position, &mut p.velocity, radius);
+                        }
+                    }
+                }
+
+                let drained = self.solver.drain_particles();
+                if drained > 0 {
+                    if let Some(ref mut gpu) = self.gpu_solver {
+                        gpu.init_buffers(self.solver.bounds, &self.solver.config, &self.solver.particles);
+                    }
+                }
             } else {
                 self.solver.step(effective_dt);
             }
+
             self.last_step_time_ms = start.elapsed().as_secs_f32() * 1000.0;
 
             if self.export_sequence {
@@ -474,50 +505,322 @@ impl eframe::App for LiquidApp {
 
                     ui.separator();
 
-                    // --- Obstacle Controls ---
-                    ui.collapsing("🛑 Solid Obstacle", |ui| {
-                        let prev_enabled = self.sphere_obstacle_enabled;
-                        ui.checkbox(&mut self.sphere_obstacle_enabled, "Sphere Obstacle");
+                    // --- 1. Multi-Obstacles & .OBJ Models Controls ---
+                    let obs_title = format!("🪨 Obstacles & .OBJ Models ({})", self.solver.colliders.len());
+                    ui.collapsing(obs_title, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("+ ⚪ Sphere").clicked() {
+                                let id = self.next_collider_id;
+                                self.next_collider_id += 1;
+                                let mut c = Collider::sphere(Vec3::new(0.0, 0.45, 0.0), 0.18);
+                                c.id = id;
+                                c.name = format!("Sphere #{}", id);
+                                self.solver.colliders.push(c);
+                            }
+                            if ui.button("+ 📦 Box").clicked() {
+                                let id = self.next_collider_id;
+                                self.next_collider_id += 1;
+                                let mut c = Collider::box_obstacle(
+                                    Vec3::new(-0.2, 0.05, -0.2),
+                                    Vec3::new(0.2, 0.35, 0.2),
+                                );
+                                c.id = id;
+                                c.name = format!("Box #{}", id);
+                                self.solver.colliders.push(c);
+                            }
+                            if ui.button("+ 🥫 Cylinder").clicked() {
+                                let id = self.next_collider_id;
+                                self.next_collider_id += 1;
+                                let mut c = Collider::cylinder(Vec3::new(0.0, 0.45, 0.0), 0.15, 0.4);
+                                c.id = id;
+                                c.name = format!("Cylinder #{}", id);
+                                self.solver.colliders.push(c);
+                            }
+                        });
 
-                        let mut obstacle_changed = false;
-                        if self.sphere_obstacle_enabled {
-                            obstacle_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut self.sphere_obstacle_pos.x, -0.6..=0.6)
-                                        .text("Pos X"),
-                                )
-                                .changed();
-                            obstacle_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut self.sphere_obstacle_pos.y, 0.05..=1.0)
-                                        .text("Pos Y"),
-                                )
-                                .changed();
-                            obstacle_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut self.sphere_obstacle_pos.z, -0.4..=0.4)
-                                        .text("Pos Z"),
-                                )
-                                .changed();
-                            obstacle_changed |= ui
-                                .add(
-                                    egui::Slider::new(
-                                        &mut self.sphere_obstacle_radius,
-                                        0.08..=0.4,
-                                    )
-                                    .text("Radius"),
-                                )
-                                .changed();
+                        ui.horizontal(|ui| {
+                            ui.label("OBJ:");
+                            ui.text_edit_singleline(&mut self.obj_file_path);
+                            if ui.button("📥 Load .OBJ").clicked() {
+                                let path = self.obj_file_path.trim().to_string();
+                                match Collider::load_obj(&path, Vec3::new(0.0, 0.5, 0.0), 0.4) {
+                                    Ok(mut col) => {
+                                        let id = self.next_collider_id;
+                                        self.next_collider_id += 1;
+                                        col.id = id;
+                                        let tri_count = if let ColliderShape::Mesh(ref m) = col.shape {
+                                            m.triangles.len()
+                                        } else {
+                                            0
+                                        };
+                                        self.status_message = format!("Loaded OBJ: {} ({} tris)", path, tri_count);
+                                        self.solver.colliders.push(col);
+                                    }
+                                    Err(e) => {
+                                        self.status_message = format!("OBJ load error: {}", e);
+                                    }
+                                }
+                            }
+                        });
+
+                        if !self.solver.colliders.is_empty() {
+                            if ui.button("🗑 Clear All Obstacles").clicked() {
+                                self.solver.colliders.clear();
+                            }
                         }
 
-                        if prev_enabled != self.sphere_obstacle_enabled || obstacle_changed {
-                            self.solver.colliders.clear();
-                            if self.sphere_obstacle_enabled {
-                                self.solver.colliders.push(Collider::sphere(
-                                    self.sphere_obstacle_pos,
-                                    self.sphere_obstacle_radius,
-                                ));
+                        let mut to_remove_col: Option<usize> = None;
+                        for (idx, collider) in self.solver.colliders.iter_mut().enumerate() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut collider.enabled, "");
+                                ui.label(egui::RichText::new(&collider.name).strong());
+                                if ui.button("🗑").clicked() {
+                                    to_remove_col = Some(idx);
+                                }
+                            });
+
+                            if collider.enabled {
+                                match &mut collider.shape {
+                                    ColliderShape::Sphere { center, radius } => {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Pos X,Y,Z:");
+                                            ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: "));
+                                            ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: "));
+                                            ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z: "));
+                                        });
+                                        ui.add(egui::Slider::new(radius, 0.02..=0.8).text("Radius"));
+                                    }
+                                    ColliderShape::Box { aabb } => {
+                                        let mut center = aabb.center();
+                                        let mut extents = aabb.size();
+                                        let mut changed = false;
+                                        ui.horizontal(|ui| {
+                                            ui.label("Center:");
+                                            changed |= ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: ")).changed();
+                                            changed |= ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: ")).changed();
+                                            changed |= ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z: ")).changed();
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Size:");
+                                            changed |= ui.add(egui::DragValue::new(&mut extents.x).speed(0.01).prefix("W: ")).changed();
+                                            changed |= ui.add(egui::DragValue::new(&mut extents.y).speed(0.01).prefix("H: ")).changed();
+                                            changed |= ui.add(egui::DragValue::new(&mut extents.z).speed(0.01).prefix("D: ")).changed();
+                                        });
+                                        if changed {
+                                            let h = extents * 0.5;
+                                            *aabb = Aabb::new(center - h, center + h);
+                                        }
+                                    }
+                                    ColliderShape::Cylinder { center, radius, height } => {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Pos X,Y,Z:");
+                                            ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: "));
+                                            ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: "));
+                                            ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z: "));
+                                        });
+                                        ui.add(egui::Slider::new(radius, 0.02..=0.6).text("Radius"));
+                                        ui.add(egui::Slider::new(height, 0.05..=1.2).text("Height"));
+                                    }
+                                    ColliderShape::Mesh(mesh_arc) => {
+                                        if let Some(mesh) = std::sync::Arc::get_mut(mesh_arc) {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Pos X,Y,Z:");
+                                                let mut changed = false;
+                                                changed |= ui.add(egui::DragValue::new(&mut mesh.position.x).speed(0.01).prefix("X: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut mesh.position.y).speed(0.01).prefix("Y: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut mesh.position.z).speed(0.01).prefix("Z: ")).changed();
+                                                if changed {
+                                                    mesh.update_transform();
+                                                }
+                                            });
+                                            if ui.add(egui::Slider::new(&mut mesh.scale, 0.02..=2.5).text("Scale")).changed() {
+                                                mesh.update_transform();
+                                            }
+                                            ui.horizontal(|ui| {
+                                                ui.label("Rot:");
+                                                let mut changed = false;
+                                                changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.x).speed(0.05).prefix("P: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.y).speed(0.05).prefix("Y: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.z).speed(0.05).prefix("R: ")).changed();
+                                                if changed {
+                                                    mesh.update_transform();
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
                             }
+                        }
+                        if let Some(idx) = to_remove_col {
+                            self.solver.colliders.remove(idx);
+                        }
+                    });
+
+                    ui.separator();
+
+                    // --- 2. Faucets & Inflow (Waterfall, Shower, Tap) ---
+                    let faucet_title = format!("🚿 Faucets & Inflow ({})", self.solver.faucets.len());
+                    ui.collapsing(faucet_title, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("+ 🌊 Waterfall").clicked() {
+                                let id = self.next_faucet_id;
+                                self.next_faucet_id += 1;
+                                let mut f = Faucet::new_waterfall(
+                                    format!("Waterfall #{}", id),
+                                    Vec3::new(0.0, 1.1, 0.0),
+                                    0.4,
+                                    0.08,
+                                    600.0,
+                                );
+                                f.id = id;
+                                self.solver.faucets.push(f);
+                            }
+                            if ui.button("+ 🚿 Shower").clicked() {
+                                let id = self.next_faucet_id;
+                                self.next_faucet_id += 1;
+                                let mut f = Faucet::new_shower(
+                                    format!("Shower #{}", id),
+                                    Vec3::new(0.0, 1.1, 0.0),
+                                    0.12,
+                                    500.0,
+                                    0.22,
+                                );
+                                f.id = id;
+                                self.solver.faucets.push(f);
+                            }
+                            if ui.button("+ 🚰 Tap / Pipe").clicked() {
+                                let id = self.next_faucet_id;
+                                self.next_faucet_id += 1;
+                                let mut f = Faucet::new_circle(
+                                    format!("Tap #{}", id),
+                                    Vec3::new(-0.5, 0.9, 0.0),
+                                    Vec3::new(1.8, -1.0, 0.0),
+                                    0.05,
+                                    400.0,
+                                );
+                                f.id = id;
+                                self.solver.faucets.push(f);
+                            }
+                        });
+
+                        if !self.solver.faucets.is_empty() {
+                            if ui.button("🗑 Clear All Faucets").clicked() {
+                                self.solver.faucets.clear();
+                            }
+                        }
+
+                        let mut to_remove_faucet: Option<usize> = None;
+                        for (idx, faucet) in self.solver.faucets.iter_mut().enumerate() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut faucet.enabled, "");
+                                ui.label(egui::RichText::new(&faucet.name).strong());
+                                if ui.button("🗑").clicked() {
+                                    to_remove_faucet = Some(idx);
+                                }
+                            });
+
+                            if faucet.enabled {
+                                ui.horizontal(|ui| {
+                                    ui.label("Pos X,Y,Z:");
+                                    ui.add(egui::DragValue::new(&mut faucet.position.x).speed(0.01).prefix("X: "));
+                                    ui.add(egui::DragValue::new(&mut faucet.position.y).speed(0.01).prefix("Y: "));
+                                    ui.add(egui::DragValue::new(&mut faucet.position.z).speed(0.01).prefix("Z: "));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Velocity:");
+                                    ui.add(egui::DragValue::new(&mut faucet.direction.x).speed(0.05).prefix("Vx: "));
+                                    ui.add(egui::DragValue::new(&mut faucet.direction.y).speed(0.05).prefix("Vy: "));
+                                    ui.add(egui::DragValue::new(&mut faucet.direction.z).speed(0.05).prefix("Vz: "));
+                                });
+                                ui.add(egui::Slider::new(&mut faucet.flow_rate, 50.0..=2500.0).text("Flow Rate (p/s)"));
+
+                                match &mut faucet.shape {
+                                    FaucetShape::Circle { radius } => {
+                                        ui.add(egui::Slider::new(radius, 0.02..=0.35).text("Nozzle Radius"));
+                                        ui.add(egui::Slider::new(&mut faucet.spray_spread, 0.0..=0.5).text("Spray Angle"));
+                                    }
+                                    FaucetShape::Rectangle { width, depth } => {
+                                        ui.add(egui::Slider::new(width, 0.05..=0.8).text("Weir Width"));
+                                        ui.add(egui::Slider::new(depth, 0.02..=0.3).text("Weir Depth"));
+                                    }
+                                    FaucetShape::Point => {}
+                                }
+                            }
+                        }
+                        if let Some(idx) = to_remove_faucet {
+                            self.solver.faucets.remove(idx);
+                        }
+                    });
+
+                    ui.separator();
+
+                    // --- 3. Drains & Sinks ---
+                    let drain_title = format!("🕳️ Drains & Sinks ({})", self.solver.drains.len());
+                    ui.collapsing(drain_title, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("+ 🔘 Floor Drain").clicked() {
+                                let id = self.next_drain_id;
+                                self.next_drain_id += 1;
+                                let d = Drain::new(
+                                    format!("Floor Drain #{}", id),
+                                    CubeFace::Floor,
+                                    Vec3::new(0.0, 0.0, 0.0),
+                                    0.18,
+                                );
+                                self.solver.drains.push(d);
+                            }
+                            if ui.button("+ 🚪 Wall Drain").clicked() {
+                                let id = self.next_drain_id;
+                                self.next_drain_id += 1;
+                                let d = Drain::new(
+                                    format!("Wall Drain #{}", id),
+                                    CubeFace::Left,
+                                    Vec3::new(0.0, 0.2, 0.0),
+                                    0.15,
+                                );
+                                self.solver.drains.push(d);
+                            }
+                        });
+
+                        if !self.solver.drains.is_empty() {
+                            if ui.button("🗑 Clear All Drains").clicked() {
+                                self.solver.drains.clear();
+                            }
+                        }
+
+                        let mut to_remove_drain: Option<usize> = None;
+                        for (idx, drain) in self.solver.drains.iter_mut().enumerate() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut drain.enabled, "");
+                                ui.label(egui::RichText::new(&drain.name).strong());
+                                if ui.button("🗑").clicked() {
+                                    to_remove_drain = Some(idx);
+                                }
+                            });
+
+                            if drain.enabled {
+                                ui.horizontal(|ui| {
+                                    ui.label("Face:");
+                                    for &f in CubeFace::ALL {
+                                        if ui.selectable_label(drain.face == f, f.name()).clicked() {
+                                            drain.face = f;
+                                        }
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Pos X,Y,Z:");
+                                    ui.add(egui::DragValue::new(&mut drain.position.x).speed(0.01).prefix("X: "));
+                                    ui.add(egui::DragValue::new(&mut drain.position.y).speed(0.01).prefix("Y: "));
+                                    ui.add(egui::DragValue::new(&mut drain.position.z).speed(0.01).prefix("Z: "));
+                                });
+                                ui.add(egui::Slider::new(&mut drain.radius, 0.04..=0.5).text("Aperture Radius"));
+                            }
+                        }
+                        if let Some(idx) = to_remove_drain {
+                            self.solver.drains.remove(idx);
                         }
                     });
 
@@ -718,6 +1021,8 @@ impl eframe::App for LiquidApp {
             let renderer_arc = self.renderer.clone();
             let bounds = self.solver.bounds;
             let colliders = self.solver.colliders.clone();
+            let faucets = self.solver.faucets.clone();
+            let drains = self.solver.drains.clone();
             let lit_spheres = self.lit_spheres;
             let particle_radius =
                 self.solver.config.particle_radius * self.display_size_factor;
@@ -746,6 +1051,8 @@ impl eframe::App for LiquidApp {
                             lit_spheres,
                             bounds,
                             &colliders,
+                            &faucets,
+                            &drains,
                         );
                     }
                 }

@@ -1,15 +1,21 @@
 use crate::math::Aabb;
+use crate::sph::mesh::TriangleMesh;
 use glam::Vec3;
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub enum ColliderShape {
     Sphere { center: Vec3, radius: f32 },
     Box { aabb: Aabb },
     Cylinder { center: Vec3, radius: f32, height: f32 },
+    Mesh(Arc<TriangleMesh>),
 }
 
 #[derive(Clone, Debug)]
 pub struct Collider {
+    pub id: u32,
+    pub name: String,
     pub shape: ColliderShape,
     pub velocity: Vec3,
     pub restitution: f32,
@@ -20,6 +26,8 @@ pub struct Collider {
 impl Collider {
     pub fn sphere(center: Vec3, radius: f32) -> Self {
         Self {
+            id: 0,
+            name: "Sphere Obstacle".to_string(),
             shape: ColliderShape::Sphere { center, radius },
             velocity: Vec3::ZERO,
             restitution: 0.02,
@@ -30,6 +38,8 @@ impl Collider {
 
     pub fn box_obstacle(min: Vec3, max: Vec3) -> Self {
         Self {
+            id: 0,
+            name: "Box Obstacle".to_string(),
             shape: ColliderShape::Box {
                 aabb: Aabb::new(min, max),
             },
@@ -40,8 +50,39 @@ impl Collider {
         }
     }
 
+    pub fn cylinder(center: Vec3, radius: f32, height: f32) -> Self {
+        Self {
+            id: 0,
+            name: "Cylinder Obstacle".to_string(),
+            shape: ColliderShape::Cylinder { center, radius, height },
+            velocity: Vec3::ZERO,
+            restitution: 0.02,
+            friction: 0.95,
+            enabled: true,
+        }
+    }
+
+    pub fn mesh(mesh: Arc<TriangleMesh>) -> Self {
+        let name = format!("Model ({})", mesh.name);
+        Self {
+            id: 0,
+            name,
+            shape: ColliderShape::Mesh(mesh),
+            velocity: Vec3::ZERO,
+            restitution: 0.02,
+            friction: 0.95,
+            enabled: true,
+        }
+    }
+
+    pub fn load_obj(path: impl AsRef<Path>, position: Vec3, scale: f32) -> Result<Self, String> {
+        let mut mesh = TriangleMesh::from_obj_file(path)?;
+        mesh.center_origin();
+        mesh.set_transform(position, scale, Vec3::ZERO);
+        Ok(Self::mesh(Arc::new(mesh)))
+    }
+
     /// Resolve collision with particle at `pos` with radius `r` and velocity `vel`.
-    /// Returns (new_pos, new_vel) if collision occurred, or None.
     pub fn resolve(&self, pos: &mut Vec3, vel: &mut Vec3, particle_radius: f32) -> bool {
         if !self.enabled {
             return false;
@@ -65,7 +106,6 @@ impl Collider {
                     if vn < 0.0 {
                         let normal_impulse = -(1.0 + self.restitution) * vn * normal;
                         let mut new_rel = rel_vel + normal_impulse;
-                        // Apply friction to tangential velocity
                         let vt = new_rel - normal * new_rel.dot(normal);
                         new_rel -= vt * (1.0 - self.friction);
                         *vel = self.velocity + new_rel;
@@ -74,7 +114,6 @@ impl Collider {
                 }
             }
             ColliderShape::Box { aabb } => {
-                // Check if inside box inflated by particle radius
                 let inflated_min = aabb.min - Vec3::splat(particle_radius);
                 let inflated_max = aabb.max + Vec3::splat(particle_radius);
 
@@ -85,7 +124,6 @@ impl Collider {
                     && pos.z >= inflated_min.z
                     && pos.z <= inflated_max.z
                 {
-                    // Find closest face
                     let d_left = (pos.x - inflated_min.x).abs();
                     let d_right = (inflated_max.x - pos.x).abs();
                     let d_bottom = (pos.y - inflated_min.y).abs();
@@ -155,10 +193,16 @@ impl Collider {
                     let vn = rel_vel.dot(normal);
                     if vn < 0.0 {
                         let normal_impulse = -(1.0 + self.restitution) * vn * normal;
-                        *vel = self.velocity + rel_vel + normal_impulse;
+                        let mut new_rel = rel_vel + normal_impulse;
+                        let vt = new_rel - normal * new_rel.dot(normal);
+                        new_rel -= vt * (1.0 - self.friction);
+                        *vel = self.velocity + new_rel;
                     }
                     return true;
                 }
+            }
+            ColliderShape::Mesh(mesh) => {
+                return mesh.resolve_collision(pos, vel, particle_radius, self.restitution, self.friction);
             }
         }
         false

@@ -12,6 +12,7 @@ pub enum ScenePreset {
     ObstacleDrop,
     VortexTornado,
     ZeroGravityBlobs,
+    Empty,
 }
 
 impl ScenePreset {
@@ -22,6 +23,7 @@ impl ScenePreset {
         ScenePreset::ObstacleDrop,
         ScenePreset::VortexTornado,
         ScenePreset::ZeroGravityBlobs,
+        ScenePreset::Empty,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -32,6 +34,7 @@ impl ScenePreset {
             ScenePreset::ObstacleDrop => "Fluid onto Obstacle",
             ScenePreset::VortexTornado => "Swirling Vortex / Tornado",
             ScenePreset::ZeroGravityBlobs => "Zero-G Droplet Coalescence",
+            ScenePreset::Empty => "Empty Basin (Faucets / Inflow)",
         }
     }
 }
@@ -270,6 +273,11 @@ impl SceneGenerator {
                 for p in b2 {
                     solver.add_particle(p);
                 }
+            }
+            ScenePreset::Empty => {
+                solver.bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
+                solver.config.gravity = Vec3::new(0.0, -9.81, 0.0);
+                solver.config.viscosity = 0.05;
             }
         }
     }

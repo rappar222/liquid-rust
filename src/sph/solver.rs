@@ -160,6 +160,9 @@ pub struct SphSolver {
     pub particles: Vec<Particle>,
     pub bounds: Aabb,
     pub colliders: Vec<Collider>,
+    pub faucets: Vec<crate::sph::faucet::Faucet>,
+    pub drains: Vec<crate::sph::faucet::Drain>,
+    pub next_particle_id: u32,
     pub config: SolverConfig,
     pub kernels: SphKernels,
     pub grid: SpatialHashGrid,
@@ -187,6 +190,9 @@ impl SphSolver {
             particles: Vec::new(),
             bounds,
             colliders: Vec::new(),
+            faucets: Vec::new(),
+            drains: Vec::new(),
+            next_particle_id: 0,
             config,
             kernels,
             grid,
@@ -221,14 +227,46 @@ impl SphSolver {
 
     pub fn clear_particles(&mut self) {
         self.particles.clear();
+        self.next_particle_id = 0;
     }
 
     pub fn particle_count(&self) -> usize {
         self.particles.len()
     }
 
+    /// Emit new fluid particles from active faucets for dt
+    pub fn emit_faucets(&mut self, dt: f32) -> usize {
+        let mut count = 0;
+        let mut new_particles = Vec::new();
+        for faucet in &mut self.faucets {
+            let spawned = faucet.emit(dt, self.config.spacing, &mut self.next_particle_id);
+            count += spawned.len();
+            new_particles.extend(spawned);
+        }
+        if !new_particles.is_empty() {
+            self.particles.extend(new_particles);
+        }
+        count
+    }
+
+    /// Eliminate particles entering active drains
+    pub fn drain_particles(&mut self) -> usize {
+        if self.drains.is_empty() {
+            return 0;
+        }
+        let bounds = self.bounds;
+        let radius = self.config.particle_radius;
+        let before = self.particles.len();
+        self.particles.retain(|p| {
+            !self.drains.iter().any(|d| d.should_drain(p.position, radius, &bounds))
+        });
+        before - self.particles.len()
+    }
+
     /// Single simulation time step decomposed into substeps
     pub fn step(&mut self, dt: f32) {
+        self.emit_faucets(dt);
+
         if self.particles.is_empty() {
             return;
         }
@@ -239,6 +277,8 @@ impl SphSolver {
         for _ in 0..substeps {
             self.pbf_substep(sub_dt);
         }
+
+        self.drain_particles();
     }
 
     fn pbf_substep(&mut self, dt: f32) {
@@ -439,7 +479,7 @@ impl SphSolver {
                 continue;
             }
 
-            let new_pos = self.predicted_positions[i];
+            let mut new_pos = self.predicted_positions[i];
             let old_pos = self.old_positions[i];
 
             let mut vel = (new_pos - old_pos) * inv_dt;
@@ -492,6 +532,11 @@ impl SphSolver {
                 }
                 vel.x *= friction;
                 vel.y *= friction;
+            }
+
+            // Obstacle Colliders (Sphere, Box, Cylinder, OBJ Mesh)
+            for collider in &self.colliders {
+                collider.resolve(&mut new_pos, &mut vel, radius);
             }
 
             // Velocity clamping

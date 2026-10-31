@@ -345,3 +345,158 @@ fn test_extreme_quality_particle_count() {
         cpu_solver.particles.len()
     );
 }
+
+#[test]
+fn test_triangle_mesh_obj_parser_and_collision() {
+    use liquid_rust::sph::{Collider, TriangleMesh};
+
+    // Simple quad (2 triangles) forming a tilted ramp facing upward (+Y)
+    let obj_data = "\
+v -0.5 0.2 -0.5
+v 0.5 0.2 -0.5
+v 0.5 0.5 0.5
+v -0.5 0.5 0.5
+f 1 3 2
+f 1 4 3
+";
+    let mut mesh = TriangleMesh::from_obj_str(obj_data, "Ramp")
+        .expect("Valid OBJ string should parse cleanly");
+    mesh.position = Vec3::ZERO;
+    mesh.scale = 1.0;
+    mesh.update_transform();
+    assert_eq!(mesh.triangles.len(), 2);
+
+    let collider = Collider::mesh(std::sync::Arc::new(mesh));
+
+    // Test particle penetrating ramp
+    let mut pos = Vec3::new(0.0, 0.34, 0.0);
+    let mut vel = Vec3::new(0.0, -2.0, 0.0);
+    let radius = 0.05;
+
+    let hit = collider.resolve(&mut pos, &mut vel, radius);
+    assert!(hit, "Particle should collide with ramp surface");
+    assert!(pos.y > 0.35, "Particle should be pushed above the ramp surface");
+    assert!(vel.y > -0.2, "Downward velocity should be absorbed on inelastic collision");
+    assert!(vel.z < 0.0, "Fluid particle should slide down the tilted ramp");
+}
+
+#[test]
+fn test_cylinder_collider_response() {
+    use liquid_rust::sph::Collider;
+
+    let cylinder = Collider::cylinder(Vec3::new(0.0, 0.5, 0.0), 0.2, 0.6);
+
+    // Particle inside the cylinder radius
+    let mut pos = Vec3::new(0.05, 0.5, 0.0);
+    let mut vel = Vec3::new(1.0, 0.0, 0.0);
+    let radius = 0.02;
+
+    let hit = cylinder.resolve(&mut pos, &mut vel, radius);
+    assert!(hit, "Particle should collide with cylinder wall");
+    let dist_xz = (pos.x * pos.x + pos.z * pos.z).sqrt();
+    assert!(dist_xz >= 0.2 + radius - 1e-4, "Particle should be pushed outside cylinder radius");
+}
+
+#[test]
+fn test_faucet_particle_emission() {
+    use liquid_rust::sph::{Faucet, FaucetShape};
+
+    let mut id = 100;
+    // Waterfall faucet emitting 1000 p/s
+    let mut waterfall = Faucet::new_waterfall("Waterfall", Vec3::new(0.0, 1.0, 0.0), 0.4, 0.05, 1000.0);
+    let particles = waterfall.emit(0.05, 0.02, &mut id); // 0.05s * 1000 p/s = 50 particles
+    assert_eq!(particles.len(), 50);
+    for p in &particles {
+        assert_eq!(p.position.y, 1.0);
+        assert!(p.position.x >= -0.21 && p.position.x <= 0.21);
+        assert!(p.velocity.y < -1.0, "Velocity should be directed downwards");
+    }
+
+    // Shower faucet with spray spread cone
+    let mut shower = Faucet::new_shower("Shower", Vec3::new(0.0, 1.0, 0.0), 0.1, 500.0, 0.2);
+    let shower_particles = shower.emit(0.1, 0.02, &mut id); // 0.1s * 500 p/s = 50 particles
+    assert_eq!(shower_particles.len(), 50);
+    assert_eq!(shower.shape, FaucetShape::Circle { radius: 0.1 });
+
+    // Point faucet / tap
+    let mut tap = Faucet::new_point("Tap", Vec3::new(0.1, 0.8, 0.2), Vec3::new(1.0, -1.0, 0.0), 200.0);
+    let tap_particles = tap.emit(0.05, 0.02, &mut id); // 10 particles
+    assert_eq!(tap_particles.len(), 10);
+    for p in &tap_particles {
+        assert_eq!(p.position, Vec3::new(0.1, 0.8, 0.2));
+    }
+}
+
+#[test]
+fn test_drain_particle_elimination() {
+    use liquid_rust::sph::{CubeFace, Drain, Particle};
+
+    let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+    let floor_drain = Drain::new("Floor Drain", CubeFace::Floor, Vec3::new(0.0, 0.0, 0.0), 0.25);
+    let wall_drain = Drain::new("Wall Drain", CubeFace::Left, Vec3::new(0.0, 0.3, 0.0), 0.2);
+
+    let radius = 0.02;
+
+    // Particle on the floor inside the drain aperture
+    let p_drain = Particle::new(Vec3::new(0.05, 0.01, 0.05), Vec3::ZERO, 1.0, 1);
+    assert!(floor_drain.should_drain(p_drain.position, radius, &bounds));
+
+    // Particle on the floor OUTSIDE the drain aperture
+    let p_safe = Particle::new(Vec3::new(0.5, 0.01, 0.5), Vec3::ZERO, 1.0, 2);
+    assert!(!floor_drain.should_drain(p_safe.position, radius, &bounds));
+
+    // Particle high in the air above drain (should not drain until it touches floor)
+    let p_air = Particle::new(Vec3::new(0.0, 0.5, 0.0), Vec3::ZERO, 1.0, 3);
+    assert!(!floor_drain.should_drain(p_air.position, radius, &bounds));
+
+    // Particle touching left wall inside wall drain
+    let p_wall = Particle::new(Vec3::new(-0.99, 0.32, 0.05), Vec3::ZERO, 1.0, 4);
+    assert!(wall_drain.should_drain(p_wall.position, radius, &bounds));
+}
+
+#[test]
+fn test_solver_faucets_and_drains_cycle() {
+    use liquid_rust::sph::{CubeFace, Drain, Faucet};
+
+    let bounds = Aabb::new(Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5));
+    let config = SolverConfig::default();
+    let mut solver = SphSolver::new(bounds, config);
+
+    // Start with empty particles
+    assert_eq!(solver.particle_count(), 0);
+
+    // Add faucet at top
+    solver.faucets.push(Faucet::new_waterfall(
+        "Top Faucet",
+        Vec3::new(0.0, 0.9, 0.0),
+        0.2,
+        0.05,
+        500.0,
+    ));
+
+    // Add drain at bottom
+    solver.drains.push(Drain::new(
+        "Floor Drain",
+        CubeFace::Floor,
+        Vec3::new(0.0, 0.0, 0.0),
+        0.15,
+    ));
+
+    // Run steps: faucet should inject particles into solver
+    for _ in 0..10 {
+        solver.step(0.016);
+    }
+    assert!(solver.particle_count() > 0, "Faucet should have emitted particles into solver");
+
+    // Clear particles and test drain removing fallen particles
+    solver.clear_particles();
+    solver.particles.push(liquid_rust::sph::Particle::new(
+        Vec3::new(0.02, 0.01, 0.02),
+        Vec3::ZERO,
+        1.0,
+        1,
+    ));
+    assert_eq!(solver.particle_count(), 1);
+    solver.drain_particles();
+    assert_eq!(solver.particle_count(), 0, "Drain should eliminate particles over the aperture");
+}

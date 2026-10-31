@@ -1,6 +1,12 @@
 // Position-Based Fluids (PBF) Compute Shader for Liquid-Rust
 // Implements Macklin & Müller (2013) with tensile instability correction and XSPH viscosity
 
+struct GpuCollider {
+    info: vec4<u32>,        // x: kind (1: sphere, 2: box, 3: cylinder), y: enabled, zw: pad
+    pos_rad: vec4<f32>,     // xyz: center, w: radius
+    extents: vec4<f32>,     // xyz: half extents, w: height
+};
+
 struct SimulationUniforms {
     bounds_min: vec4<f32>,       // xyz = min, w = cell_size
     bounds_max: vec4<f32>,       // xyz = max, w = particle_radius
@@ -21,8 +27,9 @@ struct SimulationUniforms {
     // [viscosity, surface_tension, max_velocity, collider_enabled]
     fluid_params: vec4<f32>,
     
-    // [particle_count, solver_iterations, substeps, padding]
+    // [particle_count, solver_iterations, substeps, num_colliders]
     counts: vec4<u32>,
+    colliders: array<GpuCollider, 16>,
 };
 
 struct Particle {
@@ -327,8 +334,63 @@ fn apply_delta_and_collide(@builtin(global_invocation_id) id: vec3<u32>) {
     let b_max = uniforms.bounds_max.xyz - vec3<f32>(radius);
     pos = clamp(pos, b_min, b_max);
     
-    // Dynamic Obstacle (Sphere collider)
-    if (uniforms.fluid_params.w > 0.5) {
+    // Dynamic Obstacles Collision Resolution (Spheres, Boxes, Cylinders)
+    let num_colliders = min(uniforms.counts.w, 16u);
+    for (var c = 0u; c < num_colliders; c++) {
+        let col = uniforms.colliders[c];
+        if (col.info.y == 0u) { continue; }
+        let kind = col.info.x;
+        if (kind == 1u) {
+            // Sphere
+            let c_pos = col.pos_rad.xyz;
+            let c_rad = col.pos_rad.w;
+            let to_p = pos - c_pos;
+            let dist = length(to_p);
+            let min_d = c_rad + radius;
+            if (dist < min_d && dist > 1e-5) {
+                pos = c_pos + (to_p / dist) * min_d;
+            }
+        } else if (kind == 2u) {
+            // Box
+            let c_center = col.pos_rad.xyz;
+            let h_size = col.extents.xyz + vec3<f32>(radius);
+            let box_min = c_center - h_size;
+            let box_max = c_center + h_size;
+            if (pos.x >= box_min.x && pos.x <= box_max.x &&
+                pos.y >= box_min.y && pos.y <= box_max.y &&
+                pos.z >= box_min.z && pos.z <= box_max.z) {
+                let d_left = abs(pos.x - box_min.x);
+                let d_right = abs(box_max.x - pos.x);
+                let d_bottom = abs(pos.y - box_min.y);
+                let d_top = abs(box_max.y - pos.y);
+                let d_back = abs(pos.z - box_min.z);
+                let d_front = abs(box_max.z - pos.z);
+                let m = min(min(min(d_left, d_right), min(d_bottom, d_top)), min(d_back, d_front));
+                if (m == d_left) { pos.x = box_min.x; }
+                else if (m == d_right) { pos.x = box_max.x; }
+                else if (m == d_bottom) { pos.y = box_min.y; }
+                else if (m == d_top) { pos.y = box_max.y; }
+                else if (m == d_back) { pos.z = box_min.z; }
+                else { pos.z = box_max.z; }
+            }
+        } else if (kind == 3u) {
+            // Cylinder
+            let c_center = col.pos_rad.xyz;
+            let c_rad = col.pos_rad.w + radius;
+            let half_h = col.extents.w * 0.5 + radius;
+            let dx = pos.x - c_center.x;
+            let dz = pos.z - c_center.z;
+            let r2 = dx * dx + dz * dz;
+            if (r2 < c_rad * c_rad && pos.y >= c_center.y - half_h && pos.y <= c_center.y + half_h) {
+                let r = max(sqrt(r2), 1e-5);
+                pos.x = c_center.x + (dx / r) * c_rad;
+                pos.z = c_center.z + (dz / r) * c_rad;
+            }
+        }
+    }
+    
+    // Legacy single collider fallback if num_colliders is 0
+    if (num_colliders == 0u && uniforms.fluid_params.w > 0.5) {
         let obs_pos = uniforms.collider_pos.xyz;
         let obs_rad = uniforms.collider_pos.w;
         let to_p = pos - obs_pos;

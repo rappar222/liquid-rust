@@ -5,8 +5,8 @@ use liquid_rust::gpu::GpuSphSolver;
 use liquid_rust::math::Aabb;
 use liquid_rust::render::{Camera, ColorMapType, ColorMode};
 use liquid_rust::sph::{
-    compute_lattice_rest_density, SceneGenerator, ScenePreset, SimulationQuality, SolverConfig,
-    SphSolver,
+    compute_lattice_rest_density, Collider, ColliderShape, CubeFace, Drain, Faucet,
+    SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver,
 };
 use liquid_rust::LiquidApp;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ struct Args {
     #[arg(long)]
     headless: bool,
 
-    /// Scene preset to simulate: dam-break, double-dam, splash, obstacle, tornado, zero-g
+    /// Scene preset to simulate: dam-break, double-dam, splash, obstacle, tornado, zero-g, empty
     #[arg(long, default_value = "dam-break")]
     preset: String,
 
@@ -65,6 +65,18 @@ struct Args {
     /// Custom time step dt per frame in seconds (defaults to 1.0 / fps * speed)
     #[arg(long)]
     dt: Option<f32>,
+
+    /// Add custom obstacle: 'sphere:x,y,z:r', 'box:x,y,z:w,h,d', 'cylinder:x,y,z:r,h', or 'obj:path:x,y,z:scale'
+    #[arg(long = "obstacle", action = clap::ArgAction::Append)]
+    obstacles: Vec<String>,
+
+    /// Add custom faucet: 'waterfall:x,y,z:width[:rate]', 'shower:x,y,z:radius[:rate[:spread]]', 'circle:x,y,z:radius[:rate]', 'tap:x,y,z[:rate]', 'stream:x,y,z:vx,vy,vz[:rate[:spread]]'
+    #[arg(long = "faucet", action = clap::ArgAction::Append)]
+    faucets: Vec<String>,
+
+    /// Add custom drain: 'floor:radius' or 'floor:x,z:radius', '<face>:radius' (floor|ceiling|left|right|back|front), or 'custom:x,y,z:radius'
+    #[arg(long = "drain", action = clap::ArgAction::Append)]
+    drains: Vec<String>,
 
     /// Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
     #[arg(long)]
@@ -124,6 +136,7 @@ fn parse_preset(name: &str) -> ScenePreset {
         "obstacle" | "drop" | "obstacledrop" => ScenePreset::ObstacleDrop,
         "tornado" | "vortex" => ScenePreset::VortexTornado,
         "zero-g" | "zerog" | "blobs" => ScenePreset::ZeroGravityBlobs,
+        "empty" | "none" | "basin" | "faucet" => ScenePreset::Empty,
         _ => {
             eprintln!("Unknown preset '{}', defaulting to 'dam-break'", name);
             ScenePreset::DamBreak
@@ -146,7 +159,318 @@ fn parse_quality(name: &str) -> SimulationQuality {
     }
 }
 
-fn run_headless(args: Args) {
+fn parse_vec3(s: &str) -> Result<glam::Vec3, String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!("expected 3 comma-separated floats 'x,y,z', got '{}'", s));
+    }
+    let x = parts[0].trim().parse::<f32>().map_err(|e| format!("invalid float '{}': {}", parts[0], e))?;
+    let y = parts[1].trim().parse::<f32>().map_err(|e| format!("invalid float '{}': {}", parts[1], e))?;
+    let z = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid float '{}': {}", parts[2], e))?;
+    Ok(glam::Vec3::new(x, y, z))
+}
+
+fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.is_empty() {
+        return Err("empty obstacle specification".to_string());
+    }
+    let kind = parts[0].to_lowercase();
+    let name = format!("Obstacle #{} ({})", index + 1, kind);
+
+    match kind.as_str() {
+        "sphere" => {
+            // sphere:x,y,z:radius
+            if parts.len() < 3 {
+                return Err(format!("Invalid sphere spec '{}'. Format: sphere:x,y,z:radius", spec));
+            }
+            let pos = parse_vec3(parts[1])?;
+            let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+            let mut col = Collider::sphere(pos, radius);
+            col.name = name;
+            col.id = (index + 1) as u32;
+            Ok(col)
+        }
+        "box" | "cube" => {
+            // box:x,y,z:w,h,d
+            if parts.len() < 3 {
+                return Err(format!("Invalid box spec '{}'. Format: box:x,y,z:w,h,d", spec));
+            }
+            let pos = parse_vec3(parts[1])?;
+            let size = parse_vec3(parts[2])?;
+            let half = size * 0.5;
+            let mut col = Collider::box_obstacle(pos - half, pos + half);
+            col.name = name;
+            col.id = (index + 1) as u32;
+            Ok(col)
+        }
+        "cylinder" => {
+            // cylinder:x,y,z:radius:height
+            if parts.len() < 4 {
+                return Err(format!("Invalid cylinder spec '{}'. Format: cylinder:x,y,z:radius:height", spec));
+            }
+            let pos = parse_vec3(parts[1])?;
+            let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+            let height = parts[3].trim().parse::<f32>().map_err(|e| format!("invalid height: {}", e))?;
+            let mut col = Collider::cylinder(pos, radius, height);
+            col.name = name;
+            col.id = (index + 1) as u32;
+            Ok(col)
+        }
+        "obj" | "mesh" => {
+            // obj:path:x,y,z:scale
+            if parts.len() < 4 {
+                return Err(format!("Invalid obj spec '{}'. Format: obj:filepath:x,y,z:scale", spec));
+            }
+            let path = parts[1].trim();
+            let pos = parse_vec3(parts[2])?;
+            let scale = parts[3].trim().parse::<f32>().map_err(|e| format!("invalid scale: {}", e))?;
+            let mut col = Collider::load_obj(path, pos, scale).map_err(|e| format!("failed to load OBJ '{}': {}", path, e))?;
+            col.name = format!("OBJ #{} ({})", index + 1, path);
+            col.id = (index + 1) as u32;
+            Ok(col)
+        }
+        _ => Err(format!("Unknown obstacle type '{}'. Expected 'sphere', 'box', 'cylinder', or 'obj'", kind)),
+    }
+}
+
+fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.is_empty() {
+        return Err("empty faucet specification".to_string());
+    }
+    let kind = parts[0].to_lowercase();
+    let name = format!("Faucet #{} ({})", index + 1, kind);
+
+    match kind.as_str() {
+        "waterfall" => {
+            // waterfall:x,y,z:width[:flow_rate]
+            if parts.len() < 3 {
+                return Err(format!("Invalid waterfall spec '{}'. Format: waterfall:x,y,z:width[:flow_rate]", spec));
+            }
+            let pos = parse_vec3(parts[1])?;
+            let width = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid width: {}", e))?;
+            let flow_rate = if parts.len() > 3 {
+                parts[3].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
+            } else {
+                600.0
+            };
+            let mut f = Faucet::new_waterfall(name, pos, width, 0.08, flow_rate);
+            f.id = (index + 1) as u32;
+            Ok(f)
+        }
+        "shower" => {
+            // shower:x,y,z:radius[:flow_rate[:spread]]
+            if parts.len() < 3 {
+                return Err(format!("Invalid shower spec '{}'. Format: shower:x,y,z:radius[:flow_rate[:spread]]", spec));
+            }
+            let pos = parse_vec3(parts[1])?;
+            let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+            let flow_rate = if parts.len() > 3 {
+                parts[3].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
+            } else {
+                500.0
+            };
+            let spread = if parts.len() > 4 {
+                parts[4].trim().parse::<f32>().map_err(|e| format!("invalid spread: {}", e))?
+            } else {
+                0.22
+            };
+            let mut f = Faucet::new_shower(name, pos, radius, flow_rate, spread);
+            f.id = (index + 1) as u32;
+            Ok(f)
+        }
+        "circle" | "pipe" => {
+            // circle:x,y,z:radius[:flow_rate]
+            if parts.len() < 3 {
+                return Err(format!("Invalid circle spec '{}'. Format: circle:x,y,z:radius[:flow_rate]", spec));
+            }
+            let pos = parse_vec3(parts[1])?;
+            let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+            let flow_rate = if parts.len() > 3 {
+                parts[3].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
+            } else {
+                500.0
+            };
+            let mut f = Faucet::new_circle(name, pos, glam::Vec3::new(0.0, -2.5, 0.0), radius, flow_rate);
+            f.id = (index + 1) as u32;
+            Ok(f)
+        }
+        "tap" | "point" => {
+            // tap:x,y,z[:flow_rate]
+            if parts.len() < 2 {
+                return Err(format!("Invalid tap spec '{}'. Format: tap:x,y,z[:flow_rate]", spec));
+            }
+            let pos = parse_vec3(parts[1])?;
+            let flow_rate = if parts.len() > 2 {
+                parts[2].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
+            } else {
+                400.0
+            };
+            let mut f = Faucet::new_point(name, pos, glam::Vec3::new(0.0, -2.0, 0.0), flow_rate);
+            f.id = (index + 1) as u32;
+            Ok(f)
+        }
+        "stream" => {
+            // stream:x,y,z:vx,vy,vz[:flow_rate[:spread]]
+            if parts.len() < 3 {
+                return Err(format!("Invalid stream spec '{}'. Format: stream:x,y,z:vx,vy,vz[:flow_rate[:spread]]", spec));
+            }
+            let pos = parse_vec3(parts[1])?;
+            let vel = parse_vec3(parts[2])?;
+            let flow_rate = if parts.len() > 3 {
+                parts[3].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
+            } else {
+                500.0
+            };
+            let spread = if parts.len() > 4 {
+                parts[4].trim().parse::<f32>().map_err(|e| format!("invalid spread: {}", e))?
+            } else {
+                0.05
+            };
+            let mut f = Faucet::new_circle(name, pos, vel, 0.04, flow_rate);
+            f.spray_spread = spread;
+            f.id = (index + 1) as u32;
+            Ok(f)
+        }
+        _ => Err(format!("Unknown faucet shape '{}'. Expected 'waterfall', 'shower', 'circle', 'tap', or 'stream'", kind)),
+    }
+}
+
+fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.is_empty() {
+        return Err("empty drain specification".to_string());
+    }
+    let kind = parts[0].to_lowercase();
+    let name = format!("Drain #{} ({})", index + 1, kind);
+
+    let (face, pos, radius) = match kind.as_str() {
+        "floor" | "bottom" => {
+            if parts.len() == 2 {
+                let r = parts[1].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Floor, glam::Vec3::ZERO, r)
+            } else if parts.len() >= 3 {
+                let xz: Vec<&str> = parts[1].split(',').collect();
+                if xz.len() != 2 {
+                    return Err(format!("Expected 2 coords (x,z) for floor drain offset, got '{}'", parts[1]));
+                }
+                let x = xz[0].trim().parse::<f32>().map_err(|e| format!("invalid x: {}", e))?;
+                let z = xz[1].trim().parse::<f32>().map_err(|e| format!("invalid z: {}", e))?;
+                let r = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Floor, glam::Vec3::new(x, 0.0, z), r)
+            } else {
+                return Err(format!("Invalid floor drain spec '{}'. Format: floor:radius or floor:x,z:radius", spec));
+            }
+        }
+        "ceiling" | "top" => {
+            if parts.len() == 2 {
+                let r = parts[1].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Ceiling, glam::Vec3::ZERO, r)
+            } else if parts.len() >= 3 {
+                let xz: Vec<&str> = parts[1].split(',').collect();
+                if xz.len() != 2 {
+                    return Err(format!("Expected 2 coords (x,z) for ceiling drain offset, got '{}'", parts[1]));
+                }
+                let x = xz[0].trim().parse::<f32>().map_err(|e| format!("invalid x: {}", e))?;
+                let z = xz[1].trim().parse::<f32>().map_err(|e| format!("invalid z: {}", e))?;
+                let r = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Ceiling, glam::Vec3::new(x, 0.0, z), r)
+            } else {
+                return Err(format!("Invalid ceiling drain spec '{}'. Format: ceiling:radius or ceiling:x,z:radius", spec));
+            }
+        }
+        "left" => {
+            if parts.len() == 2 {
+                let r = parts[1].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Left, glam::Vec3::ZERO, r)
+            } else if parts.len() >= 3 {
+                let yz: Vec<&str> = parts[1].split(',').collect();
+                if yz.len() != 2 {
+                    return Err(format!("Expected 2 coords (y,z) for left wall drain offset, got '{}'", parts[1]));
+                }
+                let y = yz[0].trim().parse::<f32>().map_err(|e| format!("invalid y: {}", e))?;
+                let z = yz[1].trim().parse::<f32>().map_err(|e| format!("invalid z: {}", e))?;
+                let r = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Left, glam::Vec3::new(0.0, y, z), r)
+            } else {
+                return Err(format!("Invalid left drain spec '{}'. Format: left:radius or left:y,z:radius", spec));
+            }
+        }
+        "right" => {
+            if parts.len() == 2 {
+                let r = parts[1].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Right, glam::Vec3::ZERO, r)
+            } else if parts.len() >= 3 {
+                let yz: Vec<&str> = parts[1].split(',').collect();
+                if yz.len() != 2 {
+                    return Err(format!("Expected 2 coords (y,z) for right wall drain offset, got '{}'", parts[1]));
+                }
+                let y = yz[0].trim().parse::<f32>().map_err(|e| format!("invalid y: {}", e))?;
+                let z = yz[1].trim().parse::<f32>().map_err(|e| format!("invalid z: {}", e))?;
+                let r = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Right, glam::Vec3::new(0.0, y, z), r)
+            } else {
+                return Err(format!("Invalid right drain spec '{}'. Format: right:radius or right:y,z:radius", spec));
+            }
+        }
+        "back" => {
+            if parts.len() == 2 {
+                let r = parts[1].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Back, glam::Vec3::ZERO, r)
+            } else if parts.len() >= 3 {
+                let xy: Vec<&str> = parts[1].split(',').collect();
+                if xy.len() != 2 {
+                    return Err(format!("Expected 2 coords (x,y) for back wall drain offset, got '{}'", parts[1]));
+                }
+                let x = xy[0].trim().parse::<f32>().map_err(|e| format!("invalid x: {}", e))?;
+                let y = xy[1].trim().parse::<f32>().map_err(|e| format!("invalid y: {}", e))?;
+                let r = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Back, glam::Vec3::new(x, y, 0.0), r)
+            } else {
+                return Err(format!("Invalid back drain spec '{}'. Format: back:radius or back:x,y:radius", spec));
+            }
+        }
+        "front" => {
+            if parts.len() == 2 {
+                let r = parts[1].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Front, glam::Vec3::ZERO, r)
+            } else if parts.len() >= 3 {
+                let xy: Vec<&str> = parts[1].split(',').collect();
+                if xy.len() != 2 {
+                    return Err(format!("Expected 2 coords (x,y) for front wall drain offset, got '{}'", parts[1]));
+                }
+                let x = xy[0].trim().parse::<f32>().map_err(|e| format!("invalid x: {}", e))?;
+                let y = xy[1].trim().parse::<f32>().map_err(|e| format!("invalid y: {}", e))?;
+                let r = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+                (CubeFace::Front, glam::Vec3::new(x, y, 0.0), r)
+            } else {
+                return Err(format!("Invalid front drain spec '{}'. Format: front:radius or front:x,y:radius", spec));
+            }
+        }
+        "custom" => {
+            // custom:x,y,z:radius
+            if parts.len() < 3 {
+                return Err(format!("Invalid custom drain spec '{}'. Format: custom:x,y,z:radius", spec));
+            }
+            let pos = parse_vec3(parts[1])?;
+            let r = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
+            (CubeFace::Custom, pos, r)
+        }
+        _ => return Err(format!("Unknown drain face '{}'. Expected 'floor', 'ceiling', 'left', 'right', 'back', 'front', or 'custom'", kind)),
+    };
+
+    let mut d = Drain::new(name, face, pos, radius);
+    d.id = (index + 1) as u32;
+    Ok(d)
+}
+
+fn run_headless(
+    args: Args,
+    parsed_colliders: Vec<Collider>,
+    parsed_faucets: Vec<Faucet>,
+    parsed_drains: Vec<Drain>,
+) {
     let preset = parse_preset(&args.preset);
     let quality = parse_quality(&args.quality);
     let fps = args.fps.max(1);
@@ -183,6 +507,7 @@ fn run_headless(args: Args) {
             ScenePreset::ObstacleDrop => 0.38f32,
             ScenePreset::VortexTornado => 0.30f32,
             ScenePreset::ZeroGravityBlobs => 0.25f32,
+            ScenePreset::Empty => 0.40f32,
         };
         let s = (approx_vol / (target_n as f32).max(100.0)).cbrt();
         config.spacing = s;
@@ -202,6 +527,19 @@ fn run_headless(args: Args) {
 
     let mut solver = SphSolver::new(bounds, config);
     SceneGenerator::setup_scene(&mut solver, preset);
+
+    for col in parsed_colliders {
+        println!("  + Obstacle: {} (id: {})", col.name, col.id);
+        solver.colliders.push(col);
+    }
+    for faucet in parsed_faucets {
+        println!("  + Faucet: {} (id: {}, rate: {:.0} p/s)", faucet.name, faucet.id, faucet.flow_rate);
+        solver.faucets.push(faucet);
+    }
+    for drain in parsed_drains {
+        println!("  + Drain: {} (id: {}, face: {}, radius: {:.2})", drain.name, drain.id, drain.face.name(), drain.radius);
+        solver.drains.push(drain);
+    }
 
     let particle_count = solver.particle_count();
     println!("Spawned {} particles (particle radius: {:.4}, spacing: {:.4})",
@@ -283,6 +621,10 @@ fn run_headless(args: Args) {
 
         let t0 = Instant::now();
         if let Some(ref mut gpu) = gpu_solver {
+            solver.emit_faucets(dt);
+            if gpu.particle_count != solver.particles.len() || solver.particles.len() > gpu.particle_capacity {
+                gpu.init_buffers(solver.bounds, &solver.config, &solver.particles);
+            }
             gpu.step(
                 solver.bounds,
                 &solver.config,
@@ -293,6 +635,21 @@ fn run_headless(args: Args) {
                 dt,
             );
             gpu.read_particles(&mut solver.particles);
+
+            // Mesh colliders (.obj) resolution on CPU
+            let radius = solver.config.particle_radius;
+            for col in &solver.colliders {
+                if let ColliderShape::Mesh(_) = &col.shape {
+                    for p in &mut solver.particles {
+                        col.resolve(&mut p.position, &mut p.velocity, radius);
+                    }
+                }
+            }
+
+            let drained = solver.drain_particles();
+            if drained > 0 {
+                gpu.init_buffers(solver.bounds, &solver.config, &solver.particles);
+            }
         } else {
             solver.step(dt);
         }
@@ -396,7 +753,14 @@ fn run_headless(args: Args) {
     println!("Throughput: {:.0} particle-steps/sec", (particle_count * completed_frames) as f64 / total_sim_time.max(1e-5));
 }
 
-fn run_gui(initial_preset: ScenePreset, initial_quality: SimulationQuality, initial_speed: f32) -> Result<(), eframe::Error> {
+fn run_gui(
+    initial_preset: ScenePreset,
+    initial_quality: SimulationQuality,
+    initial_speed: f32,
+    parsed_colliders: Vec<Collider>,
+    parsed_faucets: Vec<Faucet>,
+    parsed_drains: Vec<Drain>,
+) -> Result<(), eframe::Error> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -420,6 +784,18 @@ fn run_gui(initial_preset: ScenePreset, initial_quality: SimulationQuality, init
             if initial_quality != SimulationQuality::Medium {
                 app.set_quality(initial_quality);
             }
+            for c in parsed_colliders {
+                app.next_collider_id = app.next_collider_id.max(c.id + 1);
+                app.solver.colliders.push(c);
+            }
+            for f in parsed_faucets {
+                app.next_faucet_id = app.next_faucet_id.max(f.id + 1);
+                app.solver.faucets.push(f);
+            }
+            for d in parsed_drains {
+                app.next_drain_id = app.next_drain_id.max(d.id + 1);
+                app.solver.drains.push(d);
+            }
             Ok(Box::new(app))
         }),
     )
@@ -428,13 +804,53 @@ fn run_gui(initial_preset: ScenePreset, initial_quality: SimulationQuality, init
 fn main() {
     let args = Args::parse();
 
+    let mut parsed_colliders = Vec::new();
+    for (i, spec) in args.obstacles.iter().enumerate() {
+        match parse_obstacle(spec, i) {
+            Ok(c) => parsed_colliders.push(c),
+            Err(e) => {
+                eprintln!("Error parsing --obstacle '{}': {}", spec, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let mut parsed_faucets = Vec::new();
+    for (i, spec) in args.faucets.iter().enumerate() {
+        match parse_faucet(spec, i) {
+            Ok(f) => parsed_faucets.push(f),
+            Err(e) => {
+                eprintln!("Error parsing --faucet '{}': {}", spec, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let mut parsed_drains = Vec::new();
+    for (i, spec) in args.drains.iter().enumerate() {
+        match parse_drain(spec, i) {
+            Ok(d) => parsed_drains.push(d),
+            Err(e) => {
+                eprintln!("Error parsing --drain '{}': {}", spec, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if args.headless || args.benchmark || args.export_mp4.is_some() {
-        run_headless(args);
+        run_headless(args, parsed_colliders, parsed_faucets, parsed_drains);
     } else {
         let preset = parse_preset(&args.preset);
         let initial_quality = parse_quality(&args.quality);
         let initial_speed = args.speed;
-        if let Err(e) = run_gui(preset, initial_quality, initial_speed) {
+        if let Err(e) = run_gui(
+            preset,
+            initial_quality,
+            initial_speed,
+            parsed_colliders,
+            parsed_faucets,
+            parsed_drains,
+        ) {
             eprintln!("GUI Error: {}", e);
         }
     }

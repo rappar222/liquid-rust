@@ -1,5 +1,6 @@
 use crate::math::Aabb;
 use crate::sph::collider::{Collider, ColliderShape};
+use crate::sph::faucet::{CubeFace, Drain, Faucet, FaucetShape};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use glow::*;
@@ -170,6 +171,8 @@ void main() {
         lit_spheres: bool,
         bounds: Aabb,
         colliders: &[Collider],
+        faucets: &[Faucet],
+        drains: &[Drain],
     ) {
         unsafe {
             gl.enable(glow::DEPTH_TEST);
@@ -178,7 +181,7 @@ void main() {
             gl.disable(glow::BLEND);
             gl.enable(glow::PROGRAM_POINT_SIZE);
 
-            // 1. Draw Bounding Box & Colliders
+            // 1. Draw Bounding Box, Colliders, Faucets, and Drains
             let mut line_vertices = Vec::new();
             Self::generate_box_lines(&bounds, &mut line_vertices);
             for collider in colliders {
@@ -190,8 +193,25 @@ void main() {
                         ColliderShape::Box { aabb } => {
                             Self::generate_box_lines(aabb, &mut line_vertices);
                         }
-                        _ => {}
+                        ColliderShape::Cylinder { center, radius, height } => {
+                            Self::generate_cylinder_lines(*center, *radius, *height, 16, &mut line_vertices);
+                        }
+                        ColliderShape::Mesh(mesh) => {
+                            Self::generate_mesh_lines(mesh, &mut line_vertices);
+                        }
                     }
+                }
+            }
+
+            for faucet in faucets {
+                if faucet.enabled {
+                    Self::generate_faucet_lines(faucet, &mut line_vertices);
+                }
+            }
+
+            for drain in drains {
+                if drain.enabled {
+                    Self::generate_drain_lines(drain, &bounds, &mut line_vertices);
                 }
             }
 
@@ -202,7 +222,7 @@ void main() {
                 let u_col = gl.get_uniform_location(self.line_program, "u_line_color");
 
                 gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
-                gl.uniform_4_f32(u_col.as_ref(), 0.3, 0.55, 0.8, 0.7);
+                gl.uniform_4_f32(u_col.as_ref(), 0.35, 0.65, 0.95, 0.85);
 
                 gl.bind_vertex_array(Some(self.line_vao));
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.line_vbo));
@@ -308,6 +328,193 @@ void main() {
             lines.push(LineVertex {
                 pos: (center + Vec3::new(0.0, t1.cos() * radius, t1.sin() * radius)).to_array(),
             });
+        }
+    }
+
+    fn generate_cylinder_lines(
+        center: Vec3,
+        radius: f32,
+        height: f32,
+        segments: usize,
+        lines: &mut Vec<LineVertex>,
+    ) {
+        let half_h = height * 0.5;
+        let d_theta = std::f32::consts::TAU / segments as f32;
+
+        let top_center = center + Vec3::new(0.0, half_h, 0.0);
+        let bot_center = center - Vec3::new(0.0, half_h, 0.0);
+
+        for i in 0..segments {
+            let t0 = i as f32 * d_theta;
+            let t1 = (i + 1) as f32 * d_theta;
+
+            let p0_top = top_center + Vec3::new(t0.cos() * radius, 0.0, t0.sin() * radius);
+            let p1_top = top_center + Vec3::new(t1.cos() * radius, 0.0, t1.sin() * radius);
+            lines.push(LineVertex { pos: p0_top.to_array() });
+            lines.push(LineVertex { pos: p1_top.to_array() });
+
+            let p0_bot = bot_center + Vec3::new(t0.cos() * radius, 0.0, t0.sin() * radius);
+            let p1_bot = bot_center + Vec3::new(t1.cos() * radius, 0.0, t1.sin() * radius);
+            lines.push(LineVertex { pos: p0_bot.to_array() });
+            lines.push(LineVertex { pos: p1_bot.to_array() });
+
+            if i % (segments / 4).max(1) == 0 {
+                lines.push(LineVertex { pos: p0_top.to_array() });
+                lines.push(LineVertex { pos: p0_bot.to_array() });
+            }
+        }
+    }
+
+    fn generate_mesh_lines(
+        mesh: &crate::sph::mesh::TriangleMesh,
+        lines: &mut Vec<LineVertex>,
+    ) {
+        let rot_mat = glam::Mat3::from_euler(glam::EulerRot::YXZ, mesh.rotation.y, mesh.rotation.x, mesh.rotation.z);
+        let s = mesh.scale;
+        let pos = mesh.position;
+
+        for tri in &mesh.triangles {
+            let v0 = pos + (rot_mat * (tri.a * s));
+            let v1 = pos + (rot_mat * (tri.b * s));
+            let v2 = pos + (rot_mat * (tri.c * s));
+
+            lines.push(LineVertex { pos: v0.to_array() });
+            lines.push(LineVertex { pos: v1.to_array() });
+
+            lines.push(LineVertex { pos: v1.to_array() });
+            lines.push(LineVertex { pos: v2.to_array() });
+
+            lines.push(LineVertex { pos: v2.to_array() });
+            lines.push(LineVertex { pos: v0.to_array() });
+        }
+    }
+
+    fn generate_faucet_lines(
+        faucet: &Faucet,
+        lines: &mut Vec<LineVertex>,
+    ) {
+        let pos = faucet.position;
+        let flow_dir = if faucet.direction.length_squared() > 1e-6 {
+            faucet.direction.normalize()
+        } else {
+            -Vec3::Y
+        };
+
+        // Draw nozzle aperture
+        match faucet.shape {
+            FaucetShape::Circle { radius } => {
+                let segments = 16;
+                let d_theta = std::f32::consts::TAU / segments as f32;
+                let up = if flow_dir.y.abs() < 0.95 { Vec3::Y } else { Vec3::X };
+                let right = flow_dir.cross(up).normalize();
+                let forward = right.cross(flow_dir).normalize();
+
+                for i in 0..segments {
+                    let t0 = i as f32 * d_theta;
+                    let t1 = (i + 1) as f32 * d_theta;
+                    let p0 = pos + right * (t0.cos() * radius) + forward * (t0.sin() * radius);
+                    let p1 = pos + right * (t1.cos() * radius) + forward * (t1.sin() * radius);
+                    lines.push(LineVertex { pos: p0.to_array() });
+                    lines.push(LineVertex { pos: p1.to_array() });
+                }
+            }
+            FaucetShape::Rectangle { width, depth } => {
+                let up = if flow_dir.y.abs() < 0.95 { Vec3::Y } else { Vec3::X };
+                let right = flow_dir.cross(up).normalize() * (width * 0.5);
+                let forward = right.cross(flow_dir).normalize() * (depth * 0.5);
+
+                let c0 = pos - right - forward;
+                let c1 = pos + right - forward;
+                let c2 = pos + right + forward;
+                let c3 = pos - right + forward;
+
+                lines.push(LineVertex { pos: c0.to_array() });
+                lines.push(LineVertex { pos: c1.to_array() });
+                lines.push(LineVertex { pos: c1.to_array() });
+                lines.push(LineVertex { pos: c2.to_array() });
+                lines.push(LineVertex { pos: c2.to_array() });
+                lines.push(LineVertex { pos: c3.to_array() });
+                lines.push(LineVertex { pos: c3.to_array() });
+                lines.push(LineVertex { pos: c0.to_array() });
+            }
+            FaucetShape::Point => {
+                let s = 0.03;
+                lines.push(LineVertex { pos: (pos - Vec3::X * s).to_array() });
+                lines.push(LineVertex { pos: (pos + Vec3::X * s).to_array() });
+                lines.push(LineVertex { pos: (pos - Vec3::Z * s).to_array() });
+                lines.push(LineVertex { pos: (pos + Vec3::Z * s).to_array() });
+            }
+        }
+
+        // Draw directional flow arrow
+        let arrow_len = 0.12;
+        let arrow_tip = pos + flow_dir * arrow_len;
+        lines.push(LineVertex { pos: pos.to_array() });
+        lines.push(LineVertex { pos: arrow_tip.to_array() });
+    }
+
+    fn generate_drain_lines(
+        drain: &Drain,
+        bounds: &Aabb,
+        lines: &mut Vec<LineVertex>,
+    ) {
+        let segments = 20;
+        let d_theta = std::f32::consts::TAU / segments as f32;
+        let radius = drain.radius;
+        let pos = match drain.face {
+            CubeFace::Floor => Vec3::new(drain.position.x, bounds.min.y + 0.001, drain.position.z),
+            CubeFace::Ceiling => Vec3::new(drain.position.x, bounds.max.y - 0.001, drain.position.z),
+            CubeFace::Left => Vec3::new(bounds.min.x + 0.001, drain.position.y, drain.position.z),
+            CubeFace::Right => Vec3::new(bounds.max.x - 0.001, drain.position.y, drain.position.z),
+            CubeFace::Back => Vec3::new(drain.position.x, drain.position.y, bounds.min.z + 0.001),
+            CubeFace::Front => Vec3::new(drain.position.x, drain.position.y, bounds.max.z - 0.001),
+            CubeFace::Custom => drain.position,
+        };
+
+        // Draw ring according to orientation
+        for i in 0..segments {
+            let t0 = i as f32 * d_theta;
+            let t1 = (i + 1) as f32 * d_theta;
+
+            let (p0, p1) = match drain.face {
+                CubeFace::Floor | CubeFace::Ceiling => (
+                    pos + Vec3::new(t0.cos() * radius, 0.0, t0.sin() * radius),
+                    pos + Vec3::new(t1.cos() * radius, 0.0, t1.sin() * radius),
+                ),
+                CubeFace::Left | CubeFace::Right => (
+                    pos + Vec3::new(0.0, t0.cos() * radius, t0.sin() * radius),
+                    pos + Vec3::new(0.0, t1.cos() * radius, t1.sin() * radius),
+                ),
+                CubeFace::Back | CubeFace::Front | CubeFace::Custom => (
+                    pos + Vec3::new(t0.cos() * radius, t0.sin() * radius, 0.0),
+                    pos + Vec3::new(t1.cos() * radius, t1.sin() * radius, 0.0),
+                ),
+            };
+
+            lines.push(LineVertex { pos: p0.to_array() });
+            lines.push(LineVertex { pos: p1.to_array() });
+        }
+
+        // Draw crossbars / grate across the drain
+        match drain.face {
+            CubeFace::Floor | CubeFace::Ceiling => {
+                lines.push(LineVertex { pos: (pos - Vec3::X * radius).to_array() });
+                lines.push(LineVertex { pos: (pos + Vec3::X * radius).to_array() });
+                lines.push(LineVertex { pos: (pos - Vec3::Z * radius).to_array() });
+                lines.push(LineVertex { pos: (pos + Vec3::Z * radius).to_array() });
+            }
+            CubeFace::Left | CubeFace::Right => {
+                lines.push(LineVertex { pos: (pos - Vec3::Y * radius).to_array() });
+                lines.push(LineVertex { pos: (pos + Vec3::Y * radius).to_array() });
+                lines.push(LineVertex { pos: (pos - Vec3::Z * radius).to_array() });
+                lines.push(LineVertex { pos: (pos + Vec3::Z * radius).to_array() });
+            }
+            CubeFace::Back | CubeFace::Front | CubeFace::Custom => {
+                lines.push(LineVertex { pos: (pos - Vec3::X * radius).to_array() });
+                lines.push(LineVertex { pos: (pos + Vec3::X * radius).to_array() });
+                lines.push(LineVertex { pos: (pos - Vec3::Y * radius).to_array() });
+                lines.push(LineVertex { pos: (pos + Vec3::Y * radius).to_array() });
+            }
         }
     }
 

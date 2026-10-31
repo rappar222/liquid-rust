@@ -1,21 +1,47 @@
 # 🌊 LiquidRust
 
-A high-performance, real-time 3D fluid simulation engine written in Rust using Smoothed Particle Hydrodynamics (SPH), hardware-accelerated OpenGL visualization via `eframe` and `glow`, multi-threaded CPU physics with `rayon`, and Stanford PLY sequence export for 3D rendering in Blender.
+A high-performance, real-time 3D fluid simulation engine written in Rust using Position-Based Fluids (PBF), **GPU compute acceleration via Vulkan (`wgpu`)**, hardware-accelerated 3D OpenGL visualization via `eframe` and `glow`, multi-threaded CPU fallback with `rayon`, ASMR slow-motion simulation controls, direct CLI MP4 video rendering, and Stanford PLY sequence export for 3D rendering in Blender.
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org)
+[![Vulkan](https://img.shields.io/badge/Vulkan-1.3%20%7C%201.4-red.svg)](https://www.vulkan.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+---
+
+## ⚡ Quick Install
+
+Install `liquid-rust` (both GUI & CLI) with a single command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rappar222/liquid-rust/main/install.sh | bash
+```
+
+Or download the latest release bundle from [GitHub Releases](https://github.com/rappar222/liquid-rust/releases), extract and run `./install.sh`.
 
 ---
 
 ## ✨ Features
 
-- **Weakly Compressible SPH (WCSPH)**:
-  - Momentum-conserving symmetric pressure gradient.
-  - Tait equation of state (EOS) and linear compressibility models.
-  - Desbrun/Müller spiky smoothing kernels to prevent particle clustering.
-  - Akinci/Morris cohesive surface tension formulation for droplet formation.
-  - Dynamic shear viscosity and artificial dissipation.
-  - Symplectic Euler integration with configurable substepping.
+- **⚡ GPU Acceleration via Vulkan Compute (`wgpu`)**:
+  - Full parallel Position-Based Fluids (PBF) pipeline running on GPU compute shaders.
+  - 3D uniform spatial hashing and neighbor search directly in WGSL compute passes.
+  - Multi-million particle-steps per second on modern GPUs (e.g. AMD Radeon, NVIDIA GeForce, Intel Arc).
+  - Automatic detection and seamless fallback to multi-threaded CPU when GPU is not available.
+
+- **⏱ ASMR Slow-Motion & Speed Control**:
+  - Real-time simulation speed slider (0.05x to 2.0x) with quick presets (`🎬 0.25x ASMR`, `0.5x Smooth`, `1.0x Realtime`).
+  - Enables hypnotic, ultra-smooth fluid splash visualization with high display refresh rates.
+
+- **🛡 Graceful Ctrl+C Video Finalization**:
+  - Hitting `Ctrl+C` during CLI MP4 video generation immediately interrupts cleanly and finalizes the MP4 at current progress.
+  - Never deletes or corrupts your generated frames—the video is immediately saved and playable.
+
+- **Position-Based Fluids (PBF) Physics**:
+  - Momentum-conserving density constraint projection (Macklin & Müller).
+  - Dynamic rest density calibration matching hexagonal close-packed fluid lattice.
+  - Tensile instability correction and cohesive surface tension formulation.
+  - Inelastic wall collisions with normal velocity elimination (no artificial trampoline bounce).
+  - Normalized XSPH artificial viscosity.
 
 - **High Performance & Multi-Threading**:
   - $O(N)$ 3D uniform spatial hashing grid with compact linked-list storage.

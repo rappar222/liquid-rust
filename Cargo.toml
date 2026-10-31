@@ -16,3 +16,6 @@ egui_glow = "0.31"
 glow = "0.16"
 clap = { version = "4.5", features = ["derive"] }
 instant = "0.1"
+wgpu = "24.0"
+pollster = "0.4"
+ctrlc = "3.4"

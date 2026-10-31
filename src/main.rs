@@ -1,6 +1,7 @@
 use clap::Parser;
 use eframe::egui;
 use liquid_rust::export::{Mp4Encoder, PlyExporter, SoftwareRenderer};
+use liquid_rust::gpu::GpuSphSolver;
 use liquid_rust::math::Aabb;
 use liquid_rust::render::{Camera, ColorMapType, ColorMode};
 use liquid_rust::sph::{
@@ -9,6 +10,8 @@ use liquid_rust::sph::{
 };
 use liquid_rust::LiquidApp;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
@@ -70,6 +73,14 @@ struct Args {
     /// Directory to export PLY point cloud frames (optional)
     #[arg(long)]
     export_ply: Option<PathBuf>,
+
+    /// Force CPU multi-threaded solver instead of GPU acceleration
+    #[arg(long)]
+    cpu: bool,
+
+    /// Explicitly enable GPU acceleration (default: auto-detected Vulkan)
+    #[arg(long)]
+    gpu: bool,
 
     /// Print performance benchmark statistics
     #[arg(long)]
@@ -159,6 +170,30 @@ fn run_headless(args: Args) {
     println!("Spawned {} particles (particle radius: {:.4}, spacing: {:.4})",
         particle_count, solver.config.particle_radius, solver.config.spacing);
 
+    // Initialize GPU acceleration (Vulkan) unless --cpu is explicitly requested
+    let mut gpu_solver = if !args.cpu {
+        match GpuSphSolver::new(bounds, &solver.config, &solver.particles) {
+            Ok(g) => {
+                println!("⚡ GPU Acceleration: ACTIVE [{}]", g.device_name);
+                Some(g)
+            }
+            Err(e) => {
+                println!("GPU compute unavailable ({}), using multi-threaded CPU solver", e);
+                None
+            }
+        }
+    } else {
+        println!("Using CPU multi-threaded solver (--cpu flag specified)");
+        None
+    };
+
+    // Setup graceful Ctrl+C interruption handler so video is preserved at current progress
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_clone = Arc::clone(&interrupted);
+    let _ = ctrlc::set_handler(move || {
+        interrupted_clone.store(true, Ordering::SeqCst);
+    });
+
     // Setup MP4 Video Encoder if requested
     let mut mp4_encoder = if let Some(ref path) = args.export_mp4 {
         println!("Encoding MP4 video ({}x{} @ {} fps) to: {}",
@@ -194,10 +229,32 @@ fn run_headless(args: Args) {
     let start_total = Instant::now();
     let mut total_sim_time = 0.0f64;
     let mut last_progress_print = Instant::now();
+    let mut completed_frames = 0;
 
     for frame in 0..total_frames {
+        if interrupted.load(Ordering::SeqCst) {
+            println!(
+                "\n\n[Ctrl+C] Interruption caught! Gracefully finalizing video at current frame ({}/{})...",
+                completed_frames, total_frames
+            );
+            break;
+        }
+
         let t0 = Instant::now();
-        solver.step(dt);
+        if let Some(ref mut gpu) = gpu_solver {
+            gpu.step(
+                solver.bounds,
+                &solver.config,
+                &solver.colliders,
+                solver.mouse_ray,
+                solver.mouse_force_strength,
+                solver.mouse_force_mode,
+                dt,
+            );
+            gpu.read_particles(&mut solver.particles);
+        } else {
+            solver.step(dt);
+        }
         let step_time = t0.elapsed().as_secs_f64();
         total_sim_time += step_time;
 
@@ -237,7 +294,8 @@ fn run_headless(args: Args) {
             }
         }
 
-        let completed = frame + 1;
+        completed_frames = frame + 1;
+        let completed = completed_frames;
         let elapsed = start_total.elapsed().as_secs_f64();
         let should_print = frame == 0
             || completed == total_frames
@@ -279,20 +337,22 @@ fn run_headless(args: Args) {
 
     // Finalize MP4
     if let Some(enc) = mp4_encoder {
-        println!("Finalizing MP4 video encoding...");
+        println!("Finalizing MP4 video encoding (saving {} frames)...", completed_frames);
         match enc.finish() {
-            Ok(_) => println!("MP4 video saved successfully!"),
+            Ok(_) => println!("MP4 video saved successfully at current progress!"),
             Err(e) => eprintln!("Error finalizing MP4 video: {}", e),
         }
     }
 
     let total_elapsed = start_total.elapsed().as_secs_f64();
+    let effective_frames = completed_frames.max(1);
     println!("--------------------------------------------------");
     println!("Simulation finished!");
     println!("Total time: {:.3}s", total_elapsed);
-    println!("Average time per frame: {:.2}ms", (total_sim_time / total_frames as f64) * 1000.0);
-    println!("Effective simulation FPS: {:.1}", total_frames as f64 / total_sim_time);
-    println!("Throughput: {:.0} particle-steps/sec", (particle_count * total_frames) as f64 / total_sim_time);
+    println!("Frames rendered: {} / {}", completed_frames, total_frames);
+    println!("Average time per frame: {:.2}ms", (total_sim_time / effective_frames as f64) * 1000.0);
+    println!("Effective simulation FPS: {:.1}", effective_frames as f64 / total_sim_time.max(1e-5));
+    println!("Throughput: {:.0} particle-steps/sec", (particle_count * completed_frames) as f64 / total_sim_time.max(1e-5));
 }
 
 fn run_gui(initial_quality: SimulationQuality) -> Result<(), eframe::Error> {

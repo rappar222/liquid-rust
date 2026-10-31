@@ -1,4 +1,5 @@
 use crate::export::PlyExporter;
+use crate::gpu::GpuSphSolver;
 use crate::math::{unproject_mouse_ray, Aabb};
 use crate::render::{Camera, ColorMap, ColorMapType, ColorMode, GlRenderer, ParticleVertex};
 use crate::sph::collider::Collider;
@@ -12,9 +13,13 @@ use std::time::Instant;
 
 pub struct LiquidApp {
     pub solver: SphSolver,
+    pub gpu_solver: Option<GpuSphSolver>,
+    pub use_gpu: bool,
+    pub gpu_device_name: String,
     pub camera: Camera,
     pub is_playing: bool,
     pub fixed_dt: f32,
+    pub sim_speed: f32,
     pub current_preset: ScenePreset,
     pub current_quality: SimulationQuality,
 
@@ -62,11 +67,26 @@ impl LiquidApp {
             Arc::new(Mutex::new(None))
         };
 
+        let (gpu_solver, gpu_device_name, use_gpu) = match GpuSphSolver::new(bounds, &solver.config, &solver.particles) {
+            Ok(g) => {
+                let name = g.device_name.clone();
+                (Some(g), name, true)
+            }
+            Err(e) => {
+                eprintln!("GPU solver init for GUI: {}", e);
+                (None, "GPU unavailable".to_string(), false)
+            }
+        };
+
         Self {
             solver,
+            gpu_solver,
+            use_gpu,
+            gpu_device_name,
             camera: Camera::default(),
             is_playing: true,
             fixed_dt: 0.016,
+            sim_speed: 1.0,
             current_preset: preset,
             current_quality: SimulationQuality::Medium,
             renderer,
@@ -93,6 +113,9 @@ impl LiquidApp {
         SceneGenerator::setup_scene(&mut self.solver, preset);
         if preset == ScenePreset::ObstacleDrop {
             self.sphere_obstacle_enabled = true;
+        }
+        if let Some(ref mut gpu) = self.gpu_solver {
+            gpu.init_buffers(self.solver.bounds, &self.solver.config, &self.solver.particles);
         }
         self.status_message = format!("Loaded preset: {}", preset.name());
     }
@@ -174,7 +197,23 @@ impl eframe::App for LiquidApp {
         // Simulation update step
         if self.is_playing {
             let start = Instant::now();
-            self.solver.step(self.fixed_dt);
+            let effective_dt = self.fixed_dt * self.sim_speed;
+            if self.use_gpu && self.gpu_solver.is_some() {
+                if let Some(ref mut gpu) = self.gpu_solver {
+                    gpu.step(
+                        self.solver.bounds,
+                        &self.solver.config,
+                        &self.solver.colliders,
+                        self.solver.mouse_ray,
+                        self.solver.mouse_force_strength,
+                        self.solver.mouse_force_mode,
+                        effective_dt,
+                    );
+                    gpu.read_particles(&mut self.solver.particles);
+                }
+            } else {
+                self.solver.step(effective_dt);
+            }
             self.last_step_time_ms = start.elapsed().as_secs_f32() * 1000.0;
 
             if self.export_sequence {
@@ -199,13 +238,57 @@ impl eframe::App for LiquidApp {
 
                 if ui.button("⏭ Step").clicked() {
                     let start = Instant::now();
-                    self.solver.step(self.fixed_dt);
+                    let effective_dt = self.fixed_dt * self.sim_speed;
+                    if self.use_gpu && self.gpu_solver.is_some() {
+                        if let Some(ref mut gpu) = self.gpu_solver {
+                            gpu.step(
+                                self.solver.bounds,
+                                &self.solver.config,
+                                &self.solver.colliders,
+                                self.solver.mouse_ray,
+                                self.solver.mouse_force_strength,
+                                self.solver.mouse_force_mode,
+                                effective_dt,
+                            );
+                            gpu.read_particles(&mut self.solver.particles);
+                        }
+                    } else {
+                        self.solver.step(effective_dt);
+                    }
                     self.last_step_time_ms = start.elapsed().as_secs_f32() * 1000.0;
                     ctx.request_repaint();
                 }
 
                 if ui.button("🔄 Reset").clicked() {
                     self.load_preset(self.current_preset);
+                }
+
+                ui.separator();
+
+                // ASMR Slow Motion / Speed Controls
+                ui.label("⏱ Speed:");
+                ui.add(
+                    egui::Slider::new(&mut self.sim_speed, 0.05..=2.0)
+                        .show_value(true)
+                        .fixed_decimals(2),
+                );
+                if ui
+                    .selectable_label((self.sim_speed - 0.25).abs() < 0.02, "🎬 0.25x ASMR")
+                    .clicked()
+                {
+                    self.sim_speed = 0.25;
+                }
+                if ui
+                    .selectable_label((self.sim_speed - 0.50).abs() < 0.02, "0.5x")
+                    .clicked()
+                {
+                    self.sim_speed = 0.50;
+                }
+                if ui
+                    .selectable_label((self.sim_speed - 1.00).abs() < 0.02, "1.0x")
+                    .clicked()
+                {
+                    self.sim_speed = 1.00;
                 }
 
                 ui.separator();
@@ -249,6 +332,20 @@ impl eframe::App for LiquidApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add_space(4.0);
+
+                    // --- Compute Backend ---
+                    ui.collapsing("⚡ Compute Acceleration", |ui| {
+                        if self.gpu_solver.is_some() {
+                            ui.checkbox(&mut self.use_gpu, "Enable GPU Acceleration");
+                            ui.label(format!("Device: {}", self.gpu_device_name));
+                            ui.label("Backend: Vulkan Compute");
+                        } else {
+                            ui.label("GPU Compute: Unavailable");
+                            ui.label("Using: Multi-threaded CPU");
+                        }
+                    });
+
+                    ui.separator();
 
                     // --- Presets ---
                     ui.collapsing("📁 Scene Presets", |ui| {
@@ -308,6 +405,11 @@ impl eframe::App for LiquidApp {
 
                     // --- Physics Parameters ---
                     ui.collapsing("⚙ Fluid Physics (PBF)", |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.sim_speed, 0.05..=2.0)
+                                .text("Speed / ASMR Slow-Mo")
+                                .fixed_decimals(2),
+                        );
                         ui.add(
                             egui::Slider::new(&mut self.solver.config.viscosity, 0.0..=0.5)
                                 .text("Viscosity (Damping)"),

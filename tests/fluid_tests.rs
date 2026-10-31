@@ -179,3 +179,43 @@ fn test_color_maps() {
         assert_ne!(c0, c2);
     }
 }
+
+#[test]
+fn test_gpu_sph_solver() {
+    use liquid_rust::gpu::GpuSphSolver;
+
+    let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.6), Vec3::new(1.0, 2.0, 0.6));
+    let mut config = SolverConfig::default();
+    config.spacing = 0.06;
+    config.particle_radius = 0.03;
+    config.smoothing_length = 0.09;
+    config.rest_density = compute_lattice_rest_density(config.smoothing_length, config.spacing);
+
+    let mut cpu_solver = SphSolver::new(bounds, config.clone());
+    SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DamBreak);
+
+    let mut gpu_solver = match GpuSphSolver::new(bounds, &config, &cpu_solver.particles) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Skipping GPU test (no Vulkan adapter available): {}", e);
+            return;
+        }
+    };
+
+    println!("Testing GPU SPH Solver on: {}", gpu_solver.device_name);
+
+    for _ in 0..10 {
+        gpu_solver.step(bounds, &config, &[], None, 0.0, 0, 1.0 / 60.0);
+    }
+
+    let mut readback_particles = Vec::new();
+    gpu_solver.read_particles(&mut readback_particles);
+
+    assert_eq!(readback_particles.len(), cpu_solver.particles.len());
+    for p in &readback_particles {
+        assert!(!p.position.is_nan(), "GPU position should not be NaN");
+        assert!(!p.velocity.is_nan(), "GPU velocity should not be NaN");
+        assert!(p.speed() < 20.0, "GPU fluid should be stable and bounded");
+        assert!(bounds.contains(p.position), "GPU particle inside bounds");
+    }
+}

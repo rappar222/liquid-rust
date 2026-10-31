@@ -347,32 +347,42 @@ impl Mp4Encoder {
             .to_str()
             .ok_or_else(|| "Invalid output path".to_string())?;
 
-        let child = Command::new("ffmpeg")
-            .args([
-                "-y", // Overwrite output file
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgb24",
-                "-s",
-                &format!("{}x{}", width, height),
-                "-r",
-                &fps.to_string(),
-                "-i",
-                "-",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                output_str,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y", // Overwrite output file
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &format!("{}x{}", width, height),
+            "-r",
+            &fps.to_string(),
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            output_str,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
+        let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn ffmpeg: {}. Ensure ffmpeg is installed.", e))?;
 

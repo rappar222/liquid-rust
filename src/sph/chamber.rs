@@ -182,48 +182,47 @@ impl Chamber {
         new_pos: Vec3,
         _old_pos: Vec3,
         vel: &mut Vec3,
-        _dt: f32,
+        dt: f32,
         radius: f32,
         bounds: &Aabb,
         restitution: f32,
         friction: f32,
     ) {
         let margin = 0.002;
+        let slip = (1.0 - (1.0 - friction).max(0.0) * dt * 3.0).clamp(0.98, 1.0);
         match self.shape {
             ChamberShape::Box => {
                 if new_pos.y <= bounds.min.y + radius + margin {
                     if vel.y < 0.0 {
                         vel.y = -vel.y * restitution;
-                    } else if vel.y < 0.15 {
-                        vel.y = 0.0;
                     }
-                    vel.x *= friction;
-                    vel.z *= friction;
+                    vel.x *= slip;
+                    vel.z *= slip;
                 }
                 if new_pos.y >= bounds.max.y - radius - margin && vel.y > 0.0 {
                     vel.y = -vel.y * restitution;
-                    vel.x *= friction;
-                    vel.z *= friction;
+                    vel.x *= slip;
+                    vel.z *= slip;
                 }
                 if new_pos.x <= bounds.min.x + radius + margin && vel.x < 0.0 {
                     vel.x = -vel.x * restitution;
-                    vel.y *= friction;
-                    vel.z *= friction;
+                    vel.y *= slip;
+                    vel.z *= slip;
                 }
                 if new_pos.x >= bounds.max.x - radius - margin && vel.x > 0.0 {
                     vel.x = -vel.x * restitution;
-                    vel.y *= friction;
-                    vel.z *= friction;
+                    vel.y *= slip;
+                    vel.z *= slip;
                 }
                 if new_pos.z <= bounds.min.z + radius + margin && vel.z < 0.0 {
                     vel.z = -vel.z * restitution;
-                    vel.x *= friction;
-                    vel.y *= friction;
+                    vel.x *= slip;
+                    vel.y *= slip;
                 }
                 if new_pos.z >= bounds.max.z - radius - margin && vel.z > 0.0 {
                     vel.z = -vel.z * restitution;
-                    vel.x *= friction;
-                    vel.y *= friction;
+                    vel.x *= slip;
+                    vel.y *= slip;
                 }
             }
             ChamberShape::Sphere => {
@@ -269,28 +268,28 @@ impl Chamber {
                     } else if vel.y < 0.15 {
                         vel.y = 0.0;
                     }
-                    vel.x *= friction;
-                    vel.z *= friction;
+                    vel.x *= slip;
+                    vel.z *= slip;
                 }
                 if new_pos.y >= bounds.max.y - radius - margin && vel.y > 0.0 {
                     vel.y = -vel.y * restitution;
-                    vel.x *= friction;
-                    vel.z *= friction;
+                    vel.x *= slip;
+                    vel.z *= slip;
                 }
                 if new_pos.x >= bounds.max.x - radius - margin && vel.x > 0.0 {
                     vel.x = -vel.x * restitution;
-                    vel.y *= friction;
-                    vel.z *= friction;
+                    vel.y *= slip;
+                    vel.z *= slip;
                 }
                 if new_pos.z <= bounds.min.z + radius + margin && vel.z < 0.0 {
                     vel.z = -vel.z * restitution;
-                    vel.x *= friction;
-                    vel.z *= friction;
+                    vel.x *= slip;
+                    vel.z *= slip;
                 }
                 if new_pos.z >= bounds.max.z - radius - margin && vel.z > 0.0 {
                     vel.z = -vel.z * restitution;
-                    vel.x *= friction;
-                    vel.y *= friction;
+                    vel.x *= slip;
+                    vel.y *= slip;
                 }
             }
         }

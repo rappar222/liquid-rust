@@ -516,7 +516,8 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
             if (vn > 0.0) {
                 let n_vel = n * vn;
                 let t_vel = vel - n_vel;
-                vel = t_vel * friction - n_vel * restitution;
+                let slip = clamp(1.0 - (1.0 - friction) * dt * 3.0, 0.98, 1.0);
+                vel = t_vel * slip - n_vel * restitution;
             }
         }
     } else if (shape == 2u) {
@@ -525,78 +526,76 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
         let norm_y = clamp((new_pos.y - b_min.y) / H, 0.0, 1.0);
         let x_back = b_min.x + (1.0 - norm_y) * slope_offset;
         let back_dist = abs(new_pos.x - x_back);
+        let slip = clamp(1.0 - (1.0 - friction) * dt * 3.0, 0.98, 1.0);
         if (back_dist <= radius + margin) {
             let back_normal = normalize(vec3<f32>(H, slope_offset, 0.0));
             let vn = dot(vel, -back_normal);
             if (vn < 0.0) {
                 let n_v = -back_normal * vn;
                 let t_v = vel - n_v;
-                vel = t_v * friction - n_v * restitution;
+                vel = t_v * slip - n_v * restitution;
             }
         }
         if (new_pos.y <= b_min.y + radius + margin) {
             if (vel.y < 0.0) {
                 vel.y = -vel.y * restitution;
-            } else if (vel.y < 0.15) {
-                vel.y = 0.0;
             }
-            vel.x *= friction;
-            vel.z *= friction;
+            vel.x *= slip;
+            vel.z *= slip;
         }
         if (new_pos.y >= b_max.y - radius - margin && vel.y > 0.0) {
             vel.y = -vel.y * restitution;
-            vel.x *= friction;
-            vel.z *= friction;
+            vel.x *= slip;
+            vel.z *= slip;
         }
         if (new_pos.x >= b_max.x - radius - margin && vel.x > 0.0) {
             vel.x = -vel.x * restitution;
-            vel.y *= friction;
-            vel.z *= friction;
+            vel.y *= slip;
+            vel.z *= slip;
         }
         if (new_pos.z <= b_min.z + radius + margin && vel.z < 0.0) {
             vel.z = -vel.z * restitution;
-            vel.x *= friction;
-            vel.y *= friction;
+            vel.x *= slip;
+            vel.y *= slip;
         }
         if (new_pos.z >= b_max.z - radius - margin && vel.z > 0.0) {
             vel.z = -vel.z * restitution;
-            vel.x *= friction;
-            vel.z *= friction;
+            vel.x *= slip;
+            vel.z *= slip;
         }
     } else {
+        let slip = clamp(1.0 - (1.0 - friction) * dt * 3.0, 0.98, 1.0);
         if (new_pos.y <= b_min.y + radius + margin) {
             if (vel.y < 0.0) {
                 vel.y = -vel.y * restitution;
-            } else if (vel.y < 0.15) {
-                vel.y = 0.0;
             }
-            vel.x *= friction;
-            vel.z *= friction;
+            vel.x *= slip;
+            vel.z *= slip;
         }
         if (new_pos.y >= b_max.y - radius - margin && vel.y > 0.0) {
             vel.y = -vel.y * restitution;
-            vel.x *= friction;
-            vel.z *= friction;
+            vel.x *= slip;
+            vel.z *= slip;
         }
         if (new_pos.x <= b_min.x + radius + margin && vel.x < 0.0) {
             vel.x = -vel.x * restitution;
-            vel.y *= friction;
-            vel.z *= friction;
+            vel.y *= slip;
+            vel.z *= slip;
         }
         if (new_pos.x >= b_max.x - radius - margin && vel.x > 0.0) {
             vel.x = -vel.x * restitution;
-            vel.y *= friction;
-            vel.z *= friction;
+            vel.y *= slip;
+            vel.z *= slip;
         }
         if (new_pos.z <= b_min.z + radius + margin && vel.z < 0.0) {
             vel.z = -vel.z * restitution;
-            vel.x *= friction;
-            vel.y *= friction;
+            vel.x *= slip;
+            vel.y *= slip;
         }
         if (new_pos.z >= b_max.z - radius - margin && vel.z > 0.0) {
             vel.z = -vel.z * restitution;
-            vel.x *= friction;
-            vel.z *= friction;
+            vel.x *= slip;
+            vel.y *= slip;
         }
     }
     // XSPH Viscosity

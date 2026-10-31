@@ -229,7 +229,7 @@ fn test_double_dam_collision_splash() {
     let config = SolverConfig::default();
     let mut cpu_solver = SphSolver::new(bounds, config.clone());
     cpu_solver.set_2d(true);
-    cpu_solver.apply_quality(SimulationQuality::Medium);
+    cpu_solver.apply_quality(SimulationQuality::Draft);
     SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DoubleDamBreak);
 
     let mut gpu = match GpuSphSolver::new(cpu_solver.bounds, &cpu_solver.config, &cpu_solver.particles) {
@@ -553,6 +553,42 @@ fn test_cli_command_generator() {
 }
 
 #[test]
+fn test_cpu_2d_flow() {
+    use liquid_rust::sph::{SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver};
+
+    let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.05), Vec3::new(1.0, 1.2, 0.05));
+    let config = SolverConfig::default();
+    let mut solver = SphSolver::new(bounds, config);
+    solver.set_2d(true);
+    solver.apply_quality(SimulationQuality::Draft);
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DoubleDamBreak);
+
+    eprintln!("\n=== CPU 2D DOUBLE DAM FLOW TEST ===");
+    for frame in 1..=60 {
+        solver.step(1.0 / 60.0);
+        if frame % 10 == 0 {
+            let mut min_x_left = 999.0f32;
+            let mut max_x_left = -999.0f32;
+            let mut min_x_right = 999.0f32;
+            let mut max_x_right = -999.0f32;
+            let mut avg_speed = 0.0f32;
+            for p in &solver.particles {
+                if p.position.x < 0.0 {
+                    min_x_left = min_x_left.min(p.position.x);
+                    max_x_left = max_x_left.max(p.position.x);
+                } else {
+                    min_x_right = min_x_right.min(p.position.x);
+                    max_x_right = max_x_right.max(p.position.x);
+                }
+                avg_speed += p.velocity.length();
+            }
+            avg_speed /= solver.particles.len() as f32;
+            eprintln!("CPU Frame {:02}: Left X [{:.3}, {:.3}], Right X [{:.3}, {:.3}], avg_speed: {:.3}", 
+                frame, min_x_left, max_x_left, min_x_right, max_x_right, avg_speed);
+        }
+    }
+}
+#[test]
 fn test_gpu_2d_collision() {
     use liquid_rust::gpu::GpuSphSolver;
     use liquid_rust::sph::{SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver};
@@ -561,7 +597,7 @@ fn test_gpu_2d_collision() {
     let config = SolverConfig::default();
     let mut cpu_solver = SphSolver::new(bounds, config.clone());
     cpu_solver.set_2d(true);
-    cpu_solver.apply_quality(SimulationQuality::Medium);
+    cpu_solver.apply_quality(SimulationQuality::Draft);
     SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DoubleDamBreak);
 
     let mut gpu = match GpuSphSolver::new(cpu_solver.bounds, &cpu_solver.config, &cpu_solver.particles) {
@@ -570,27 +606,27 @@ fn test_gpu_2d_collision() {
             panic!("GPU failed: {}", e);
         }
     };
-    eprintln!("\n=== GPU grid_dim: {:?}, cell_size: {}, total_cells: {} ===", gpu.grid_dim, gpu.cell_size, gpu.total_cells);
-    eprintln!("Initial particle count: {}", cpu_solver.particles.len());
-
-    gpu.step(cpu_solver.bounds, &cpu_solver.chamber, &cpu_solver.config, &[], None, 0.0, 0, 1.0 / 60.0, false);
-    let mut readback = Vec::new();
-    gpu.read_particles(&mut readback);
-    eprintln!("After 1 step -> p0: pos={:?}, vel={:?}, dens={}", readback[0].position, readback[0].velocity, readback[0].density);
-    eprintln!("Rest density in config: {}", cpu_solver.config.rest_density);
-
-    let mut min_x = 999.0f32;
-    let mut max_x = -999.0f32;
-    let mut min_y = 999.0f32;
-    let mut max_y = -999.0f32;
-    for p in &readback {
-        min_x = min_x.min(p.position.x);
-        max_x = max_x.max(p.position.x);
-        min_y = min_y.min(p.position.y);
-        max_y = max_y.max(p.position.y);
+    eprintln!("\n=== 2D DOUBLE DAM BREAK LONG RUN DIAGNOSTIC ===");
+    for frame in 1..=180 {
+        gpu.step(cpu_solver.bounds, &cpu_solver.chamber, &cpu_solver.config, &[], None, 0.0, 0, 1.0 / 60.0, true);
+        if frame % 30 == 0 {
+            let mut readback = Vec::new();
+            gpu.read_particles(&mut readback);
+            let mut min_x = 999.0f32;
+            let mut max_x = -999.0f32;
+            let mut max_y = -999.0f32;
+            let mut avg_speed = 0.0f32;
+            for p in &readback {
+                min_x = min_x.min(p.position.x);
+                max_x = max_x.max(p.position.x);
+                max_y = max_y.max(p.position.y);
+                avg_speed += p.velocity.length();
+            }
+            avg_speed /= readback.len() as f32;
+            eprintln!("Frame {:03}: X [{:.3}, {:.3}], max_y: {:.3}, avg_speed: {:.3}", 
+                frame, min_x, max_x, max_y, avg_speed);
+        }
     }
-    eprintln!("Double Dam 60 frames -> X range: [{}, {}], Y range: [{}, {}]", min_x, max_x, min_y, max_y);
-    eprintln!("Sample pos[0]: {:?}, pos[1000]: {:?}", readback[0].position, readback[1000].position);
 }
 #[test]
 fn test_2d_simulation_planar_physics() {

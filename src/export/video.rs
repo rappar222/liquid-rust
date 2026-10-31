@@ -26,6 +26,7 @@ pub struct SoftwareRenderer {
     pub height: usize,
     pub rgb_buffer: Vec<u8>,
     pub depth_buffer: Vec<f32>,
+    pub enable_culling: bool,
 }
 
 impl SoftwareRenderer {
@@ -35,6 +36,7 @@ impl SoftwareRenderer {
             height,
             rgb_buffer: vec![0; width * height * 3],
             depth_buffer: vec![f32::INFINITY; width * height],
+            enable_culling: true,
         }
     }
 
@@ -91,6 +93,7 @@ impl SoftwareRenderer {
         let h_f = height as f32;
         let w_i = width as i32;
         let h_i = height as i32;
+        let enable_culling = self.enable_culling;
 
         let projected_particles: Vec<ProjectedParticle> = particles
             .par_iter()
@@ -98,7 +101,7 @@ impl SoftwareRenderer {
                 let p_world = Vec4::new(p.position.x, p.position.y, p.position.z, 1.0);
                 let p_cam = view * p_world;
 
-                if p_cam.z >= -0.1 {
+                if p_cam.z >= -0.05 {
                     return None;
                 }
 
@@ -116,17 +119,17 @@ impl SoftwareRenderer {
                 let py = (1.0 - (ndc_y * 0.5 + 0.5)) * h_f;
 
                 let r_px = (particle_radius / (z_dist * tan_half_fov)) * (h_f * 0.5);
-                if r_px < 0.8 {
+                if enable_culling && r_px < 0.5 {
                     return None;
                 }
 
-                let r_px_ceil = r_px.ceil() as i32;
+                let r_px_ceil = r_px.ceil().max(1.0) as i32;
                 let x_min = (px.floor() as i32 - r_px_ceil).max(0);
                 let x_max = (px.ceil() as i32 + r_px_ceil).min(w_i - 1);
                 let y_min = (py.floor() as i32 - r_px_ceil).max(0);
                 let y_max = (py.ceil() as i32 + r_px_ceil).min(h_i - 1);
 
-                if x_min > x_max || y_min > y_max {
+                if enable_culling && (x_min > x_max || y_min > y_max) {
                     return None;
                 }
 

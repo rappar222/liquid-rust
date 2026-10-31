@@ -86,6 +86,14 @@ struct Args {
     #[arg(long)]
     gpu: bool,
 
+    /// Enable particle frustum and viewport culling during rendering (default: enabled)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    culling: bool,
+
+    /// Disable frustum and viewport particle culling (renders all particles)
+    #[arg(long, alias = "no-cull")]
+    no_culling: bool,
+
     /// Print performance benchmark statistics
     #[arg(long)]
     benchmark: bool,
@@ -229,8 +237,12 @@ fn run_headless(args: Args) {
         None
     };
 
+    let use_culling = args.culling && !args.no_culling;
     let mut software_renderer = if mp4_encoder.is_some() {
-        Some(SoftwareRenderer::new(args.video_width, args.video_height))
+        println!("Particle Culling: {}", if use_culling { "ENABLED (Frustum & Viewport)" } else { "DISABLED (Draw all particles)" });
+        let mut rend = SoftwareRenderer::new(args.video_width, args.video_height);
+        rend.enable_culling = use_culling;
+        Some(rend)
     } else {
         None
     };

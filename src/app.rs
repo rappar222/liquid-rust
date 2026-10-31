@@ -26,6 +26,8 @@ pub struct LiquidApp {
     // Rendering settings
     pub renderer: Arc<Mutex<Option<GlRenderer>>>,
     pub lit_spheres: bool,
+    pub enable_culling: bool,
+    pub drawn_particles_count: usize,
     pub color_mode: ColorMode,
     pub color_map: ColorMapType,
     pub display_size_factor: f32,
@@ -91,6 +93,8 @@ impl LiquidApp {
             current_quality: SimulationQuality::Medium,
             renderer,
             lit_spheres: true,
+            enable_culling: true,
+            drawn_particles_count: 0,
             color_mode: ColorMode::Velocity,
             color_map: ColorMapType::Ocean,
             display_size_factor: 1.0,
@@ -312,7 +316,11 @@ impl eframe::App for LiquidApp {
                     });
 
                 ui.separator();
-                ui.label(format!("Particles: {}", self.solver.particle_count()));
+                if self.enable_culling {
+                    ui.label(format!("Particles: {} (Drawn: {})", self.solver.particle_count(), self.drawn_particles_count));
+                } else {
+                    ui.label(format!("Particles: {}", self.solver.particle_count()));
+                }
                 ui.separator();
                 ui.label(format!("FPS: {:.0}", self.current_fps));
                 ui.separator();
@@ -497,6 +505,7 @@ impl eframe::App for LiquidApp {
                     // --- Visuals & Color ---
                     ui.collapsing("🎨 Rendering & Colors", |ui| {
                         ui.checkbox(&mut self.lit_spheres, "3D Shaded Spheres");
+                        ui.checkbox(&mut self.enable_culling, "View Frustum Culling");
                         ui.add(
                             egui::Slider::new(&mut self.display_size_factor, 0.5..=1.8)
                                 .text("Particle Size"),
@@ -643,11 +652,32 @@ impl eframe::App for LiquidApp {
                 self.solver.mouse_force_mode = 0;
             }
 
-            // Prepare vertex data
+            // Prepare vertex data with optional view frustum culling
+            let enable_culling = self.enable_culling;
             let particles_data: Vec<ParticleVertex> = self
                 .solver
                 .particles
                 .iter()
+                .filter(|p| {
+                    if !enable_culling {
+                        return true;
+                    }
+                    let p_world = glam::Vec4::new(p.position.x, p.position.y, p.position.z, 1.0);
+                    let clip = view_proj * p_world;
+                    if clip.w <= 0.001 {
+                        return false;
+                    }
+                    let ndc_x = clip.x / clip.w;
+                    let ndc_y = clip.y / clip.w;
+                    let ndc_z = clip.z / clip.w;
+                    let margin = 0.2;
+                    ndc_x >= -1.0 - margin
+                        && ndc_x <= 1.0 + margin
+                        && ndc_y >= -1.0 - margin
+                        && ndc_y <= 1.0 + margin
+                        && ndc_z >= -1.0
+                        && ndc_z <= 1.0
+                })
                 .map(|p| {
                     let c = self.compute_particle_color(p);
                     ParticleVertex {
@@ -661,6 +691,8 @@ impl eframe::App for LiquidApp {
                     }
                 })
                 .collect();
+
+            self.drawn_particles_count = particles_data.len();
 
             let renderer_arc = self.renderer.clone();
             let bounds = self.solver.bounds;

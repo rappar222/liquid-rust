@@ -88,7 +88,7 @@ fn test_rest_density_computation() {
 fn test_density_vs_rest_density() {
     use liquid_rust::sph::SimulationQuality;
     let mut config = SolverConfig::default();
-    SimulationQuality::Ultra.apply(&mut config);
+    SimulationQuality::Ultra.apply(&mut config, false);
     let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.45), Vec3::new(1.0, 1.2, 0.45));
     let mut cpu_solver = SphSolver::new(bounds, config.clone());
     SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DoubleDamBreak);
@@ -267,7 +267,7 @@ fn test_gpu_slow_motion_stability() {
 
     let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.45), Vec3::new(1.0, 1.2, 0.45));
     let mut config = SolverConfig::default();
-    SimulationQuality::Ultra.apply(&mut config);
+    SimulationQuality::Ultra.apply(&mut config, false);
 
     let mut cpu_solver = SphSolver::new(bounds, config.clone());
     SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DoubleDamBreak);
@@ -303,7 +303,7 @@ fn test_ultra_quality_gpu_stability() {
 
     let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
     let mut config = SolverConfig::default();
-    SimulationQuality::Ultra.apply(&mut config);
+    SimulationQuality::Ultra.apply(&mut config, false);
 
     let mut cpu_solver = SphSolver::new(bounds, config.clone());
     SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DamBreak);
@@ -333,7 +333,7 @@ fn test_extreme_quality_particle_count() {
 
     let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
     let mut config = SolverConfig::default();
-    SimulationQuality::Extreme.apply(&mut config);
+    SimulationQuality::Extreme.apply(&mut config, false);
 
     let mut cpu_solver = SphSolver::new(bounds, config.clone());
     SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DamBreak);
@@ -586,4 +586,50 @@ fn test_2d_simulation_planar_physics() {
         assert!(!p.position.is_nan());
         assert!(!p.velocity.is_nan());
     }
+}
+
+#[test]
+fn test_2d_mega_resolutions_and_cli() {
+    use liquid_rust::app::LiquidApp;
+    use liquid_rust::sph::SimulationQuality;
+
+    let mut app = LiquidApp::new_headless();
+    app.set_2d(true);
+
+    // In 2D mode, 1M / Extreme should NOT trigger modal warning
+    assert!(!app.show_extreme_modal);
+    app.set_quality(SimulationQuality::Extreme);
+    assert!(!app.show_extreme_modal);
+    assert_eq!(app.current_quality, SimulationQuality::Extreme);
+    assert!(app.generate_cli_command().contains("--quality 1m"));
+
+    // Check 2M - 50M modes
+    app.set_quality(SimulationQuality::TwoMillion);
+    assert_eq!(app.current_quality, SimulationQuality::TwoMillion);
+    assert!(app.generate_cli_command().contains("--quality 2m"));
+
+    app.set_quality(SimulationQuality::FiveMillion);
+    assert_eq!(app.current_quality, SimulationQuality::FiveMillion);
+    assert!(app.generate_cli_command().contains("--quality 5m"));
+
+    app.set_quality(SimulationQuality::TenMillion);
+    assert_eq!(app.current_quality, SimulationQuality::TenMillion);
+    assert!(app.generate_cli_command().contains("--quality 10m"));
+
+    app.set_quality(SimulationQuality::TwentyMillion);
+    assert_eq!(app.current_quality, SimulationQuality::TwentyMillion);
+    assert!(app.generate_cli_command().contains("--quality 20m"));
+
+    app.set_quality(SimulationQuality::FiftyMillion);
+    assert_eq!(app.current_quality, SimulationQuality::FiftyMillion);
+    assert!(app.generate_cli_command().contains("--quality 50m"));
+
+    // Check >10M warnings identification
+    assert!(!SimulationQuality::Draft.is_over_10m());
+    assert!(!SimulationQuality::Extreme.is_over_10m());
+    assert!(!SimulationQuality::TwoMillion.is_over_10m());
+    assert!(!SimulationQuality::FiveMillion.is_over_10m());
+    assert!(!SimulationQuality::TenMillion.is_over_10m());
+    assert!(SimulationQuality::TwentyMillion.is_over_10m());
+    assert!(SimulationQuality::FiftyMillion.is_over_10m());
 }

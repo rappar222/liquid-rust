@@ -322,17 +322,31 @@ impl GpuSphSolver {
     pub fn init_buffers(&mut self, bounds: Aabb, config: &SolverConfig, particles: &[Particle]) {
         let count = particles.len();
         self.particle_count = count;
-        let capacity = (count * 2).max(1024);
+        let is_2d = bounds.size().z < 0.15;
+        let capacity = if count > 1_000_000 {
+            count + (count / 20).max(10_000)
+        } else {
+            (count * 2).max(1024)
+        };
         self.particle_capacity = capacity;
 
-        let h = config.smoothing_length;
-        self.cell_size = h;
+        let mut cell_size = config.smoothing_length.max(1e-5);
         let size = bounds.size();
-        let dim_x = ((size.x / h).ceil() as u32).max(1);
-        let dim_y = ((size.y / h).ceil() as u32).max(1);
-        let dim_z = ((size.z / h).ceil() as u32).max(1);
-        self.grid_dim = [dim_x, dim_y, dim_z];
-        self.total_cells = dim_x * dim_y * dim_z;
+        let max_cells = 8_000_000u64; // Max 32MB grid heads buffer
+        let mut dim_x = ((size.x / cell_size).ceil() as u64).max(1);
+        let mut dim_y = ((size.y / cell_size).ceil() as u64).max(1);
+        let mut dim_z = if is_2d { 1 } else { ((size.z / cell_size).ceil() as u64).max(1) };
+        if dim_x * dim_y * dim_z > max_cells {
+            let exponent = if is_2d { 0.5 } else { 0.3333333 };
+            let scale = ((dim_x * dim_y * dim_z) as f64 / max_cells as f64).powf(exponent);
+            cell_size *= scale as f32;
+            dim_x = ((size.x / cell_size).ceil() as u64).max(1);
+            dim_y = ((size.y / cell_size).ceil() as u64).max(1);
+            dim_z = if is_2d { 1 } else { ((size.z / cell_size).ceil() as u64).max(1) };
+        }
+        self.cell_size = cell_size;
+        self.grid_dim = [dim_x as u32, dim_y as u32, dim_z as u32];
+        self.total_cells = (dim_x * dim_y * dim_z) as u32;
 
         // Convert CPU particles to GPU particles
         let mut gpu_particles: Vec<GpuParticle> = Vec::with_capacity(capacity);
@@ -595,6 +609,13 @@ impl GpuSphSolver {
 
         let workgroups_particles = ((self.particle_count + 255) / 256) as u32;
         let workgroups_cells = ((self.total_cells as usize + 255) / 256) as u32;
+        let (disp_p_x, disp_p_y) = if workgroups_particles <= 65535 {
+            (workgroups_particles, 1)
+        } else {
+            let wg_x = 65535;
+            let wg_y = (workgroups_particles + 65534) / 65535;
+            (wg_x, wg_y)
+        };
 
         let bind_group = self.bind_group.as_ref().unwrap();
 
@@ -611,7 +632,7 @@ impl GpuSphSolver {
                 });
                 cpass.set_bind_group(0, bind_group, &[]);
                 cpass.set_pipeline(&self.pipeline_predict);
-                cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+                cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
             }
 
             // 2. Clear uniform grid
@@ -633,7 +654,7 @@ impl GpuSphSolver {
                 });
                 cpass.set_bind_group(0, bind_group, &[]);
                 cpass.set_pipeline(&self.pipeline_insert_particles);
-                cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+                cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
             }
 
             // 4. PBF Solver Iterations
@@ -646,7 +667,7 @@ impl GpuSphSolver {
                     });
                     cpass.set_bind_group(0, bind_group, &[]);
                     cpass.set_pipeline(&self.pipeline_density_lambda);
-                    cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+                    cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
                 }
 
                 // 4b. Compute displacement delta
@@ -657,7 +678,7 @@ impl GpuSphSolver {
                     });
                     cpass.set_bind_group(0, bind_group, &[]);
                     cpass.set_pipeline(&self.pipeline_delta_positions);
-                    cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+                    cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
                 }
 
                 // 4c. Apply delta & boundary collision
@@ -668,7 +689,7 @@ impl GpuSphSolver {
                     });
                     cpass.set_bind_group(0, bind_group, &[]);
                     cpass.set_pipeline(&self.pipeline_apply_delta);
-                    cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+                    cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
                 }
             }
 
@@ -680,7 +701,7 @@ impl GpuSphSolver {
                 });
                 cpass.set_bind_group(0, bind_group, &[]);
                 cpass.set_pipeline(&self.pipeline_update_velocity);
-                cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+                cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
             }
 
             self.queue.submit(Some(encoder.finish()));

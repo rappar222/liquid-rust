@@ -132,7 +132,7 @@ fn resolve_chamber_gpu(pos_in: vec3<f32>, radius: f32) -> vec3<f32> {
 // 1. Predict positions with gravity & user interaction
 @compute @workgroup_size(256)
 fn predict_positions(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i >= uniforms.counts.x) {
         return;
     }
@@ -199,7 +199,7 @@ fn clear_grid(@builtin(global_invocation_id) id: vec3<u32>) {
 // 3. Insert predicted particle positions into 3D uniform grid
 @compute @workgroup_size(256)
 fn insert_particles(@builtin(global_invocation_id) id: vec3<u32>) {
-    let p_idx = id.x;
+    let p_idx = id.x + id.y * 16776960u;
     if (p_idx >= uniforms.counts.x) {
         return;
     }
@@ -223,7 +223,7 @@ fn insert_particles(@builtin(global_invocation_id) id: vec3<u32>) {
 // 4. Compute density and lambda_i constraint
 @compute @workgroup_size(256)
 fn compute_density_lambda(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i >= uniforms.counts.x) {
         return;
     }
@@ -297,7 +297,7 @@ fn compute_density_lambda(@builtin(global_invocation_id) id: vec3<u32>) {
 // 5. Compute displacement delta_p_i
 @compute @workgroup_size(256)
 fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i >= uniforms.counts.x) {
         return;
     }
@@ -391,7 +391,7 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
 // 6. Apply delta displacement and project boundary collisions
 @compute @workgroup_size(256)
 fn apply_delta_and_collide(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i >= uniforms.counts.x) {
         return;
     }
@@ -481,7 +481,7 @@ fn apply_delta_and_collide(@builtin(global_invocation_id) id: vec3<u32>) {
 // 7. Update velocity and apply XSPH artificial viscosity
 @compute @workgroup_size(256)
 fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i >= uniforms.counts.x) {
         return;
     }

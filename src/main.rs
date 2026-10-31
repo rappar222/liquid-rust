@@ -171,6 +171,11 @@ fn parse_quality(name: &str) -> SimulationQuality {
         "ultra" | "realistic" => SimulationQuality::Ultra,
         "cinematic" | "vfx" => SimulationQuality::Cinematic,
         "extreme" | "1m" | "insane" => SimulationQuality::Extreme,
+        "2m" => SimulationQuality::TwoMillion,
+        "5m" => SimulationQuality::FiveMillion,
+        "10m" => SimulationQuality::TenMillion,
+        "20m" => SimulationQuality::TwentyMillion,
+        "50m" => SimulationQuality::FiftyMillion,
         _ => {
             eprintln!("Unknown quality '{}', defaulting to 'medium'", name);
             SimulationQuality::Medium
@@ -559,7 +564,10 @@ fn run_headless(
 
     println!("=== liquid-rust headless mode ===");
     println!("Preset: {:?}", preset);
-    println!("Quality: {} ({:?})", quality.name(), quality);
+    println!("Quality: {} ({:?})", quality.name_for(args.mode_2d), quality);
+    if quality.is_over_10m() {
+        eprintln!("⚠️  WARNING: Quality '{}' creates >10 million particles. High GPU VRAM and compute capacity required!", quality.slug());
+    }
     if args.speed != 1.0 {
         println!("Speed multiplier: {:.2}x", args.speed);
     }
@@ -569,7 +577,7 @@ fn run_headless(
     let chamber = parse_chamber(&args);
     let bounds = chamber.compute_bounds();
     let mut config = SolverConfig::default();
-    quality.apply(&mut config);
+    quality.apply(&mut config, args.mode_2d);
 
     // Apply target particle count if requested
     if let Some(target_n) = args.particles {
@@ -641,7 +649,7 @@ fn run_headless(
 
     // Initialize GPU acceleration (Vulkan) unless --cpu is explicitly requested
     let mut gpu_solver = if !args.cpu {
-        match GpuSphSolver::new(bounds, &solver.config, &solver.particles) {
+        match GpuSphSolver::new(solver.bounds, &solver.config, &solver.particles) {
             Ok(g) => {
                 println!("⚡ GPU Acceleration: ACTIVE [{}]", g.device_name);
                 Some(g)

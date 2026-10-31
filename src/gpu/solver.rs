@@ -554,8 +554,11 @@ impl GpuSphSolver {
             ([0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
         };
 
-        let dt_factor = (sub_dt / 0.016).clamp(0.001, 1.0);
-        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2);
+        let dt_ref = 1.0 / 60.0;
+        let dt_ratio = (dt_ref / sub_dt.max(1e-5)).max(1.0);
+        let cfm_scale = dt_ratio * dt_ratio;
+        let dt_factor = (sub_dt / dt_ref).clamp(0.0001, 1.0);
+        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
         let max_displacement = config.particle_radius * 0.35 * dt_factor;
 
         let uniforms = GpuUniforms {
@@ -567,7 +570,7 @@ impl GpuSphSolver {
             mouse_dir: m_dir,
             collider_pos,
             kernel_params: [h, h2, inv_rho0, rho0],
-            kernel_factors: [poly6_factor, spiky_factor, w_q, config.tensile_k],
+            kernel_factors: [poly6_factor, spiky_factor, w_q, config.tensile_k / cfm_scale],
             solver_params: [
                 relaxation_epsilon,
                 max_displacement,
@@ -576,7 +579,7 @@ impl GpuSphSolver {
             ],
             fluid_params: [
                 config.viscosity,
-                config.surface_tension,
+                config.surface_tension / cfm_scale,
                 config.max_velocity,
                 collider_enabled,
             ],

@@ -18,7 +18,7 @@ use std::time::Instant;
 #[command(
     name = "liquid-rust",
     author = "Radu <rappar222>",
-    version = "0.1.6",
+    version = "0.1.7",
     about = "High-performance 3D SPH Fluid Simulator in Rust with Real-time 3D Viewport, MP4 Video & PLY Export"
 )]
 struct Args {
@@ -29,6 +29,10 @@ struct Args {
     /// Scene preset to simulate: dam-break, double-dam, splash, obstacle, tornado, zero-g, empty. If omitted, no preset is added.
     #[arg(long)]
     preset: Option<String>,
+
+    /// Liquid substance preset: water, honey, milk, oil, alcohol, gas, fire, steam, smoke
+    #[arg(long, alias = "material")]
+    liquid: Option<String>,
 
     /// Particle quality / resolution: draft, medium, high, ultra, cinematic, extreme (1M+)
     #[arg(long, short = 'q', default_value = "medium")]
@@ -618,6 +622,22 @@ fn run_headless(
     let mut solver = SphSolver::new(bounds, config);
     solver.set_chamber(chamber);
     SceneGenerator::setup_scene(&mut solver, preset);
+
+    if let Some(ref liquid_name) = args.liquid {
+        if let Some(mat) = MaterialType::parse(liquid_name) {
+            solver.config.viscosity = mat.viscosity();
+            for p in &mut solver.particles {
+                p.material = mat;
+                p.temperature = mat.initial_temperature();
+                p.life = mat.initial_life();
+                p.density = 1000.0 * mat.density_factor();
+                p.mass = mat.density_factor();
+            }
+            println!("  + Liquid preset: {}", mat.name());
+        } else {
+            eprintln!("Unknown liquid material '{}', defaulting to water", liquid_name);
+        }
+    }
 
     let ch_size = solver.bounds.size();
     println!("Chamber: {} (Scale: ({:.2}, {:.2}, {:.2}), Bounds: {:.2} x {:.2} x {:.2} m)",

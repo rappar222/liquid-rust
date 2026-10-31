@@ -371,7 +371,7 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
                             if (lambda_sum < -1e-6) {
                                 let w_r = poly6(r2, h2, poly6_factor);
                                 let ratio = w_r / w_q;
-                                s_corr = -tensile_k * (ratio * ratio * ratio * ratio) * (h * h) * dt_factor;
+                                s_corr = -tensile_k * (ratio * ratio * ratio * ratio) * (h * h);
                             }
                             
                             let grad_w = spiky_gradient(r_vec, r, h, spiky_factor);
@@ -379,7 +379,7 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
                             
                             if (surface_tension > 0.0) {
                                 let w_r = poly6(r2, h2, poly6_factor);
-                                let cohesion = (w_r * surface_tension * 0.05 * dt_factor * dt_factor) / rho0;
+                                let cohesion = (w_r * surface_tension * 0.05) / rho0;
                                 delta -= (r_vec / r) * cohesion;
                             }
                         }
@@ -538,8 +538,12 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
                 vel = t_v * friction - n_v * restitution;
             }
         }
-        if (new_pos.y <= b_min.y + radius + margin && vel.y < 0.0) {
-            vel.y = -vel.y * restitution;
+        if (new_pos.y <= b_min.y + radius + margin) {
+            if (vel.y < 0.0) {
+                vel.y = -vel.y * restitution;
+            } else if (vel.y < 0.15) {
+                vel.y = 0.0;
+            }
             vel.x *= friction;
             vel.z *= friction;
         }
@@ -564,8 +568,12 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
             vel.z *= friction;
         }
     } else {
-        if (new_pos.y <= b_min.y + radius + margin && vel.y < 0.0) {
-            vel.y = -vel.y * restitution;
+        if (new_pos.y <= b_min.y + radius + margin) {
+            if (vel.y < 0.0) {
+                vel.y = -vel.y * restitution;
+            } else if (vel.y < 0.15) {
+                vel.y = 0.0;
+            }
             vel.x *= friction;
             vel.z *= friction;
         }

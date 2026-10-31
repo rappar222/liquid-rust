@@ -141,6 +141,23 @@ impl LiquidApp {
         self.status_message = format!("Set quality: {}", quality.name());
     }
 
+    /// Transform all fluid particles in current scene into a specified liquid/gas material
+    pub fn apply_liquid_preset(&mut self, material: MaterialType) {
+        self.solver.config.viscosity = material.viscosity();
+        for p in &mut self.solver.particles {
+            p.material = material;
+            p.temperature = material.initial_temperature();
+            p.life = material.initial_life();
+            p.density = 1000.0 * material.density_factor();
+            p.mass = material.density_factor();
+        }
+        self.color_mode = ColorMode::Material;
+        if let Some(ref mut gpu) = self.gpu_solver {
+            gpu.init_buffers(self.solver.bounds, &self.solver.config, &self.solver.particles);
+        }
+        self.status_message = format!("Switched fluid substance to: {}", material.name());
+    }
+
     pub fn export_current_frame(&mut self) {
         let dir = std::path::Path::new(&self.export_path);
         if let Err(e) = std::fs::create_dir_all(dir) {
@@ -417,6 +434,21 @@ impl eframe::App for LiquidApp {
                                 self.load_preset(preset);
                             }
                         }
+                    });
+
+                    ui.separator();
+
+                    // --- Liquid & Substance Presets ---
+                    ui.collapsing("🧪 Liquid & Substance Presets", |ui| {
+                        ui.label("Transform fluid into a different substance:");
+                        ui.horizontal_wrapped(|ui| {
+                            for &mat in MaterialType::ALL {
+                                if ui.button(mat.name()).clicked() {
+                                    self.apply_liquid_preset(mat);
+                                }
+                            }
+                        });
+                        ui.label("Instantly sets viscosity, density factor, and natural colors.");
                     });
 
                     ui.separator();

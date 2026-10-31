@@ -191,8 +191,12 @@ impl Chamber {
         let margin = 0.002;
         match self.shape {
             ChamberShape::Box => {
-                if new_pos.y <= bounds.min.y + radius + margin && vel.y < 0.0 {
-                    vel.y = -vel.y * restitution;
+                if new_pos.y <= bounds.min.y + radius + margin {
+                    if vel.y < 0.0 {
+                        vel.y = -vel.y * restitution;
+                    } else if vel.y < 0.15 {
+                        vel.y = 0.0;
+                    }
                     vel.x *= friction;
                     vel.z *= friction;
                 }
@@ -259,8 +263,12 @@ impl Chamber {
                     }
                 }
 
-                if new_pos.y <= bounds.min.y + radius + margin && vel.y < 0.0 {
-                    vel.y = -vel.y * restitution;
+                if new_pos.y <= bounds.min.y + radius + margin {
+                    if vel.y < 0.0 {
+                        vel.y = -vel.y * restitution;
+                    } else if vel.y < 0.15 {
+                        vel.y = 0.0;
+                    }
                     vel.x *= friction;
                     vel.z *= friction;
                 }

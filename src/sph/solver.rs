@@ -370,8 +370,11 @@ impl SphSolver {
         let surface_tension = self.config.surface_tension;
         let w_q = kernels.poly6((0.15 * h).powi(2)).max(1e-12);
         let inv_rho0 = 1.0 / rho0;
-        let dt_factor = (dt / 0.016).clamp(0.001, 1.0);
-        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2);
+        let dt_ref = 1.0 / 60.0;
+        let dt_ratio = (dt_ref / dt.max(1e-5)).max(1.0);
+        let cfm_scale = dt_ratio * dt_ratio;
+        let dt_factor = (dt / dt_ref).clamp(0.0001, 1.0);
+        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
         let max_displacement = radius * 0.35 * dt_factor; // Scales with time step to prevent slow-mo explosions
 
         // 4. PBF Incompressibility Solver Iterations
@@ -440,7 +443,7 @@ impl SphSolver {
                                 // Tensile instability correction (only active during compression)
                                 let w_r = kernels.poly6(r2);
                                 let s_corr = if lambda_sum < -1e-6 {
-                                    -tensile_k * (w_r / w_q).powi(4) * (h * h) * dt_factor
+                                    (-tensile_k * (w_r / w_q).powi(4) * (h * h)) / cfm_scale
                                 } else {
                                     0.0
                                 };
@@ -448,9 +451,9 @@ impl SphSolver {
                                 let grad_w = kernels.spiky_gradient(r_vec, r);
                                 delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
 
-                                // Surface tension cohesion: scales with dt^2 so slow-motion doesn't over-amplify it into cubes
+                                // Surface tension cohesion: scales with CFM to maintain perfect physical balance
                                 if surface_tension > 0.0 {
-                                    let cohesion_factor = (w_r * surface_tension * 0.05 * dt_factor * dt_factor) / rho0;
+                                    let cohesion_factor = (w_r * surface_tension * 0.05) / (rho0 * cfm_scale);
                                     delta -= (r_vec / r) * cohesion_factor;
                                 }
                             }

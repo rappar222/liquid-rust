@@ -58,7 +58,11 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     fps: u32,
 
-    /// Custom time step dt per frame in seconds (defaults to 1.0 / fps)
+    /// Simulation speed multiplier (e.g. 0.5 for 2x slow-mo, 0.2 for 5x slow-mo ASMR, 2.0 for fast)
+    #[arg(long, alias = "sim-speed", default_value_t = 1.0)]
+    speed: f32,
+
+    /// Custom time step dt per frame in seconds (defaults to 1.0 / fps * speed)
     #[arg(long)]
     dt: Option<f32>,
 
@@ -149,16 +153,20 @@ fn run_headless(args: Args) {
 
     let (total_frames, dt) = if let Some(t) = args.time {
         let f = (t * fps as f32).round().max(1.0) as usize;
-        let delta_t = 1.0 / fps as f32;
+        let delta_t = (1.0 / fps as f32) * args.speed;
         (f, delta_t)
     } else {
-        let delta_t = args.dt.unwrap_or(1.0 / fps as f32);
+        let base_dt = args.dt.unwrap_or(1.0 / fps as f32);
+        let delta_t = base_dt * args.speed;
         (args.frames, delta_t)
     };
 
     println!("=== liquid-rust headless mode ===");
     println!("Preset: {:?}", preset);
     println!("Quality: {} ({:?})", quality.name(), quality);
+    if args.speed != 1.0 {
+        println!("Speed multiplier: {:.2}x", args.speed);
+    }
     println!("Total Frames: {} ({:.2}s @ {} fps)", total_frames, total_frames as f32 / fps as f32, fps);
     println!("Time step dt: {:.5}s", dt);
 
@@ -388,7 +396,7 @@ fn run_headless(args: Args) {
     println!("Throughput: {:.0} particle-steps/sec", (particle_count * completed_frames) as f64 / total_sim_time.max(1e-5));
 }
 
-fn run_gui(initial_quality: SimulationQuality) -> Result<(), eframe::Error> {
+fn run_gui(initial_preset: ScenePreset, initial_quality: SimulationQuality, initial_speed: f32) -> Result<(), eframe::Error> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -403,6 +411,12 @@ fn run_gui(initial_quality: SimulationQuality) -> Result<(), eframe::Error> {
         native_options,
         Box::new(move |cc| {
             let mut app = LiquidApp::new(cc);
+            if (initial_speed - 1.0).abs() > 1e-4 {
+                app.sim_speed = initial_speed;
+            }
+            if initial_preset != ScenePreset::DamBreak {
+                app.load_preset(initial_preset);
+            }
             if initial_quality != SimulationQuality::Medium {
                 app.set_quality(initial_quality);
             }
@@ -417,8 +431,10 @@ fn main() {
     if args.headless || args.benchmark || args.export_mp4.is_some() {
         run_headless(args);
     } else {
+        let preset = parse_preset(&args.preset);
         let initial_quality = parse_quality(&args.quality);
-        if let Err(e) = run_gui(initial_quality) {
+        let initial_speed = args.speed;
+        if let Err(e) = run_gui(preset, initial_quality, initial_speed) {
             eprintln!("GUI Error: {}", e);
         }
     }

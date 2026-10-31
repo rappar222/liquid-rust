@@ -26,9 +26,9 @@ struct Args {
     #[arg(long)]
     headless: bool,
 
-    /// Scene preset to simulate: dam-break, double-dam, splash, obstacle, tornado, zero-g, empty
-    #[arg(long, default_value = "dam-break")]
-    preset: String,
+    /// Scene preset to simulate: dam-break, double-dam, splash, obstacle, tornado, zero-g, empty. If omitted, no preset is added.
+    #[arg(long)]
+    preset: Option<String>,
 
     /// Particle quality / resolution: draft, medium, high, ultra, cinematic, extreme (1M+)
     #[arg(long, short = 'q', default_value = "medium")]
@@ -126,21 +126,24 @@ fn format_time(seconds: f64) -> String {
     }
 }
 
-fn parse_preset(name: &str) -> ScenePreset {
-    match name.to_lowercase().as_str() {
-        "dam-break" | "dambreak" | "dam" => ScenePreset::DamBreak,
-        "double-dam" | "doubledam" | "double" | "double-dam-break" | "doubledambreak" => {
-            ScenePreset::DoubleDamBreak
-        }
-        "splash" | "droplet" | "dropletsplash" => ScenePreset::DropletSplash,
-        "obstacle" | "drop" | "obstacledrop" => ScenePreset::ObstacleDrop,
-        "tornado" | "vortex" => ScenePreset::VortexTornado,
-        "zero-g" | "zerog" | "blobs" => ScenePreset::ZeroGravityBlobs,
-        "empty" | "none" | "basin" | "faucet" => ScenePreset::Empty,
-        _ => {
-            eprintln!("Unknown preset '{}', defaulting to 'dam-break'", name);
-            ScenePreset::DamBreak
-        }
+fn parse_preset(name: Option<&str>) -> ScenePreset {
+    match name {
+        Some(s) => match s.to_lowercase().as_str() {
+            "dam-break" | "dambreak" | "dam" => ScenePreset::DamBreak,
+            "double-dam" | "doubledam" | "double" | "double-dam-break" | "doubledambreak" => {
+                ScenePreset::DoubleDamBreak
+            }
+            "splash" | "droplet" | "dropletsplash" => ScenePreset::DropletSplash,
+            "obstacle" | "drop" | "obstacledrop" => ScenePreset::ObstacleDrop,
+            "tornado" | "vortex" => ScenePreset::VortexTornado,
+            "zero-g" | "zerog" | "blobs" => ScenePreset::ZeroGravityBlobs,
+            "empty" | "none" | "basin" | "faucet" => ScenePreset::Empty,
+            _ => {
+                eprintln!("Unknown preset '{}', defaulting to empty", s);
+                ScenePreset::Empty
+            }
+        },
+        None => ScenePreset::Empty,
     }
 }
 
@@ -159,8 +162,17 @@ fn parse_quality(name: &str) -> SimulationQuality {
     }
 }
 
+fn clean_spec(spec: &str) -> Vec<String> {
+    let s = spec.replace("[:", ":").replace('[', "").replace(']', "");
+    s.split(':')
+        .map(|part| part.trim().trim_matches(|c| c == '(' || c == ')' || c == '{' || c == '}').trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
 fn parse_vec3(s: &str) -> Result<glam::Vec3, String> {
-    let parts: Vec<&str> = s.split(',').collect();
+    let clean = s.trim().trim_matches(|c| c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}');
+    let parts: Vec<&str> = clean.split(',').collect();
     if parts.len() != 3 {
         return Err(format!("expected 3 comma-separated floats 'x,y,z', got '{}'", s));
     }
@@ -171,7 +183,7 @@ fn parse_vec3(s: &str) -> Result<glam::Vec3, String> {
 }
 
 fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
-    let parts: Vec<&str> = spec.split(':').collect();
+    let parts = clean_spec(spec);
     if parts.is_empty() {
         return Err("empty obstacle specification".to_string());
     }
@@ -184,7 +196,7 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
             if parts.len() < 3 {
                 return Err(format!("Invalid sphere spec '{}'. Format: sphere:x,y,z:radius", spec));
             }
-            let pos = parse_vec3(parts[1])?;
+            let pos = parse_vec3(&parts[1])?;
             let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
             let mut col = Collider::sphere(pos, radius);
             col.name = name;
@@ -196,8 +208,8 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
             if parts.len() < 3 {
                 return Err(format!("Invalid box spec '{}'. Format: box:x,y,z:w,h,d", spec));
             }
-            let pos = parse_vec3(parts[1])?;
-            let size = parse_vec3(parts[2])?;
+            let pos = parse_vec3(&parts[1])?;
+            let size = parse_vec3(&parts[2])?;
             let half = size * 0.5;
             let mut col = Collider::box_obstacle(pos - half, pos + half);
             col.name = name;
@@ -209,7 +221,7 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
             if parts.len() < 4 {
                 return Err(format!("Invalid cylinder spec '{}'. Format: cylinder:x,y,z:radius:height", spec));
             }
-            let pos = parse_vec3(parts[1])?;
+            let pos = parse_vec3(&parts[1])?;
             let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
             let height = parts[3].trim().parse::<f32>().map_err(|e| format!("invalid height: {}", e))?;
             let mut col = Collider::cylinder(pos, radius, height);
@@ -223,7 +235,7 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
                 return Err(format!("Invalid obj spec '{}'. Format: obj:filepath:x,y,z:scale", spec));
             }
             let path = parts[1].trim();
-            let pos = parse_vec3(parts[2])?;
+            let pos = parse_vec3(&parts[2])?;
             let scale = parts[3].trim().parse::<f32>().map_err(|e| format!("invalid scale: {}", e))?;
             let mut col = Collider::load_obj(path, pos, scale).map_err(|e| format!("failed to load OBJ '{}': {}", path, e))?;
             col.name = format!("OBJ #{} ({})", index + 1, path);
@@ -235,7 +247,7 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
 }
 
 fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
-    let parts: Vec<&str> = spec.split(':').collect();
+    let parts = clean_spec(spec);
     if parts.is_empty() {
         return Err("empty faucet specification".to_string());
     }
@@ -248,7 +260,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
             if parts.len() < 3 {
                 return Err(format!("Invalid waterfall spec '{}'. Format: waterfall:x,y,z:width[:flow_rate]", spec));
             }
-            let pos = parse_vec3(parts[1])?;
+            let pos = parse_vec3(&parts[1])?;
             let width = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid width: {}", e))?;
             let flow_rate = if parts.len() > 3 {
                 parts[3].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
@@ -264,7 +276,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
             if parts.len() < 3 {
                 return Err(format!("Invalid shower spec '{}'. Format: shower:x,y,z:radius[:flow_rate[:spread]]", spec));
             }
-            let pos = parse_vec3(parts[1])?;
+            let pos = parse_vec3(&parts[1])?;
             let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
             let flow_rate = if parts.len() > 3 {
                 parts[3].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
@@ -285,7 +297,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
             if parts.len() < 3 {
                 return Err(format!("Invalid circle spec '{}'. Format: circle:x,y,z:radius[:flow_rate]", spec));
             }
-            let pos = parse_vec3(parts[1])?;
+            let pos = parse_vec3(&parts[1])?;
             let radius = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
             let flow_rate = if parts.len() > 3 {
                 parts[3].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
@@ -301,7 +313,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
             if parts.len() < 2 {
                 return Err(format!("Invalid tap spec '{}'. Format: tap:x,y,z[:flow_rate]", spec));
             }
-            let pos = parse_vec3(parts[1])?;
+            let pos = parse_vec3(&parts[1])?;
             let flow_rate = if parts.len() > 2 {
                 parts[2].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
             } else {
@@ -316,8 +328,8 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
             if parts.len() < 3 {
                 return Err(format!("Invalid stream spec '{}'. Format: stream:x,y,z:vx,vy,vz[:flow_rate[:spread]]", spec));
             }
-            let pos = parse_vec3(parts[1])?;
-            let vel = parse_vec3(parts[2])?;
+            let pos = parse_vec3(&parts[1])?;
+            let vel = parse_vec3(&parts[2])?;
             let flow_rate = if parts.len() > 3 {
                 parts[3].trim().parse::<f32>().map_err(|e| format!("invalid flow_rate: {}", e))?
             } else {
@@ -338,7 +350,7 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
 }
 
 fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
-    let parts: Vec<&str> = spec.split(':').collect();
+    let parts = clean_spec(spec);
     if parts.is_empty() {
         return Err("empty drain specification".to_string());
     }
@@ -453,7 +465,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
             if parts.len() < 3 {
                 return Err(format!("Invalid custom drain spec '{}'. Format: custom:x,y,z:radius", spec));
             }
-            let pos = parse_vec3(parts[1])?;
+            let pos = parse_vec3(&parts[1])?;
             let r = parts[2].trim().parse::<f32>().map_err(|e| format!("invalid radius: {}", e))?;
             (CubeFace::Custom, pos, r)
         }
@@ -471,7 +483,7 @@ fn run_headless(
     parsed_faucets: Vec<Faucet>,
     parsed_drains: Vec<Drain>,
 ) {
-    let preset = parse_preset(&args.preset);
+    let preset = parse_preset(args.preset.as_deref());
     let quality = parse_quality(&args.quality);
     let fps = args.fps.max(1);
 
@@ -533,7 +545,18 @@ fn run_headless(
         solver.colliders.push(col);
     }
     for faucet in parsed_faucets {
-        println!("  + Faucet: {} (id: {}, rate: {:.0} p/s)", faucet.name, faucet.id, faucet.flow_rate);
+        println!("  + Faucet: {} (id: {}, rate: {:.0} p/s, pos: ({:.2}, {:.2}, {:.2}))",
+            faucet.name, faucet.id, faucet.flow_rate, faucet.position.x, faucet.position.y, faucet.position.z);
+        if faucet.position.x < solver.bounds.min.x - 0.2 || faucet.position.x > solver.bounds.max.x + 0.2
+            || faucet.position.y < solver.bounds.min.y - 0.2 || faucet.position.y > solver.bounds.max.y + 0.8
+            || faucet.position.z < solver.bounds.min.z - 0.2 || faucet.position.z > solver.bounds.max.z + 0.2
+        {
+            eprintln!("  ⚠️ Note: Faucet position ({:.1}, {:.1}, {:.1}) is outside the fluid basin boundaries ({:.2}..{:.2}, {:.2}..{:.2}, {:.2}..{:.2}). Particles will fall outside the container!",
+                faucet.position.x, faucet.position.y, faucet.position.z,
+                solver.bounds.min.x, solver.bounds.max.x,
+                solver.bounds.min.y, solver.bounds.max.y,
+                solver.bounds.min.z, solver.bounds.max.z);
+        }
         solver.faucets.push(faucet);
     }
     for drain in parsed_drains {
@@ -778,9 +801,7 @@ fn run_gui(
             if (initial_speed - 1.0).abs() > 1e-4 {
                 app.sim_speed = initial_speed;
             }
-            if initial_preset != ScenePreset::DamBreak {
-                app.load_preset(initial_preset);
-            }
+            app.load_preset(initial_preset);
             if initial_quality != SimulationQuality::Medium {
                 app.set_quality(initial_quality);
             }
@@ -837,10 +858,11 @@ fn main() {
         }
     }
 
+    let preset = parse_preset(args.preset.as_deref());
+
     if args.headless || args.benchmark || args.export_mp4.is_some() {
         run_headless(args, parsed_colliders, parsed_faucets, parsed_drains);
     } else {
-        let preset = parse_preset(&args.preset);
         let initial_quality = parse_quality(&args.quality);
         let initial_speed = args.speed;
         if let Err(e) = run_gui(

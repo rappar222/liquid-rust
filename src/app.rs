@@ -274,18 +274,24 @@ impl eframe::App for LiquidApp {
                 // ASMR Slow Motion / Speed Controls
                 ui.label("⏱ Speed:");
                 ui.add(
-                    egui::Slider::new(&mut self.sim_speed, 0.05..=2.0)
+                    egui::Slider::new(&mut self.sim_speed, 0.01..=2.0)
                         .show_value(true)
-                        .fixed_decimals(2),
+                        .fixed_decimals(3),
                 );
                 if ui
-                    .selectable_label((self.sim_speed - 0.25).abs() < 0.02, "🎬 0.25x ASMR")
+                    .selectable_label((self.sim_speed - 0.0625).abs() < 0.005, "🐌 16x Slow")
+                    .clicked()
+                {
+                    self.sim_speed = 0.0625;
+                }
+                if ui
+                    .selectable_label((self.sim_speed - 0.25).abs() < 0.02, "🎬 4x Slow")
                     .clicked()
                 {
                     self.sim_speed = 0.25;
                 }
                 if ui
-                    .selectable_label((self.sim_speed - 0.50).abs() < 0.02, "0.5x")
+                    .selectable_label((self.sim_speed - 0.50).abs() < 0.02, "2x Slow")
                     .clicked()
                 {
                     self.sim_speed = 0.50;

@@ -8,39 +8,67 @@ use rayon::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct SolverConfig {
-    pub rest_density: f32,
-    pub stiffness: f32,          // Bulk modulus k for EOS: P = k * ((rho/rho0)^gamma - 1)
-    pub exponent: f32,           // Tait exponent (typically 7.0 for water, or 1.0 for linear)
-    pub viscosity: f32,          // Dynamic viscosity coefficient mu
-    pub surface_tension: f32,    // Cohesive surface tension coefficient
+    pub particle_radius: f32,    // Physical radius for collisions
+    pub spacing: f32,            // Initial lattice spacing
     pub smoothing_length: f32,   // SPH kernel radius h
-    pub particle_radius: f32,    // Physical radius for particle-particle / particle-wall collision
+    pub rest_density: f32,       // Target rest density rho0
+    pub solver_iterations: usize,// PBF solver iterations per substep (typically 3-4)
+    pub substeps: usize,         // Number of substeps per frame (typically 2-3)
+    pub viscosity: f32,          // XSPH artificial viscosity coefficient
+    pub surface_tension: f32,    // Cohesion coefficient
     pub gravity: Vec3,
-    pub boundary_restitution: f32,
     pub boundary_friction: f32,
+    pub tensile_k: f32,          // Tensile instability correction coefficient
     pub max_velocity: f32,
-    pub substeps: usize,
 }
 
 impl Default for SolverConfig {
     fn default() -> Self {
-        let particle_radius = 0.035;
-        let smoothing_length = particle_radius * 2.2;
+        let particle_radius = 0.024;
+        let spacing = 0.042;
+        let smoothing_length = 0.075;
+        let rest_density = compute_lattice_rest_density(smoothing_length, spacing);
+
         Self {
-            rest_density: 1000.0,
-            stiffness: 1500.0,
-            exponent: 1.0,
-            viscosity: 0.15,
-            surface_tension: 0.05,
-            smoothing_length,
             particle_radius,
+            spacing,
+            smoothing_length,
+            rest_density,
+            solver_iterations: 3,
+            substeps: 2,
+            viscosity: 0.08,
+            surface_tension: 0.02,
             gravity: Vec3::new(0.0, -9.81, 0.0),
-            boundary_restitution: 0.2,
-            boundary_friction: 0.98,
-            max_velocity: 40.0,
-            substeps: 3,
+            boundary_friction: 0.96,
+            tensile_k: 0.001,
+            max_velocity: 15.0,
         }
     }
+}
+
+/// Compute exact rest density on regular cubic lattice with given spacing
+pub fn compute_lattice_rest_density(h: f32, spacing: f32) -> f32 {
+    let kernels = SphKernels::new(h);
+    let mut rho0 = kernels.poly6(0.0);
+    let steps = (h / spacing).ceil() as i32;
+    let h2 = h * h;
+
+    for ix in -steps..=steps {
+        for iy in -steps..=steps {
+            for iz in -steps..=steps {
+                if ix == 0 && iy == 0 && iz == 0 {
+                    continue;
+                }
+                let r2 = (ix as f32 * spacing).powi(2)
+                    + (iy as f32 * spacing).powi(2)
+                    + (iz as f32 * spacing).powi(2);
+                if r2 < h2 {
+                    rho0 += kernels.poly6(r2);
+                }
+            }
+        }
+    }
+    rho0
 }
 
 pub struct SphSolver {
@@ -50,11 +78,15 @@ pub struct SphSolver {
     pub config: SolverConfig,
     pub kernels: SphKernels,
     pub grid: SpatialHashGrid,
-    // Working buffers to avoid per-frame reallocations
-    positions_cache: Vec<Vec3>,
-    densities_cache: Vec<f32>,
-    pressures_cache: Vec<f32>,
-    velocities_cache: Vec<Vec3>,
+
+    // Working buffers for PBF (Position-Based Fluids)
+    predicted_positions: Vec<Vec3>,
+    old_positions: Vec<Vec3>,
+    lambdas: Vec<f32>,
+    delta_positions: Vec<Vec3>,
+    densities: Vec<f32>,
+    xsph_velocities: Vec<Vec3>,
+
     // Mouse interaction
     pub mouse_ray: Option<Ray>,
     pub mouse_force_strength: f32,
@@ -73,18 +105,21 @@ impl SphSolver {
             config,
             kernels,
             grid,
-            positions_cache: Vec::new(),
-            densities_cache: Vec::new(),
-            pressures_cache: Vec::new(),
-            velocities_cache: Vec::new(),
+            predicted_positions: Vec::new(),
+            old_positions: Vec::new(),
+            lambdas: Vec::new(),
+            delta_positions: Vec::new(),
+            densities: Vec::new(),
+            xsph_velocities: Vec::new(),
             mouse_ray: None,
-            mouse_force_strength: 50.0,
+            mouse_force_strength: 60.0,
             mouse_force_mode: 0,
         }
     }
 
     pub fn set_smoothing_length(&mut self, h: f32) {
         self.config.smoothing_length = h;
+        self.config.rest_density = compute_lattice_rest_density(h, self.config.spacing);
         self.kernels = SphKernels::new(h);
         self.grid = SpatialHashGrid::new(h, self.particles.len().max(1024));
     }
@@ -111,251 +146,249 @@ impl SphSolver {
         let sub_dt = dt / substeps as f32;
 
         for _ in 0..substeps {
-            self.substep(sub_dt);
+            self.pbf_substep(sub_dt);
         }
     }
 
-    fn substep(&mut self, dt: f32) {
+    fn pbf_substep(&mut self, dt: f32) {
         let n = self.particles.len();
 
-        // 1. Sync position cache and rebuild spatial grid
-        if self.positions_cache.len() != n {
-            self.positions_cache.resize(n, Vec3::ZERO);
-            self.densities_cache.resize(n, 1000.0);
-            self.pressures_cache.resize(n, 0.0);
-            self.velocities_cache.resize(n, Vec3::ZERO);
+        // 1. Resize working buffers if necessary
+        if self.predicted_positions.len() != n {
+            self.predicted_positions.resize(n, Vec3::ZERO);
+            self.old_positions.resize(n, Vec3::ZERO);
+            self.lambdas.resize(n, 0.0);
+            self.delta_positions.resize(n, Vec3::ZERO);
+            self.densities.resize(n, self.config.rest_density);
+            self.xsph_velocities.resize(n, Vec3::ZERO);
         }
 
-        for (i, p) in self.particles.iter().enumerate() {
-            self.positions_cache[i] = p.position;
-            self.velocities_cache[i] = p.velocity;
-        }
-
-        self.grid.build(&self.positions_cache);
-
-        let positions = &self.positions_cache;
-        let velocities = &self.velocities_cache;
-        let grid = &self.grid;
-        let kernels = &self.kernels;
-        let config = &self.config;
-
-        // 2. Parallel Density and Pressure computation
-        let rho0 = config.rest_density;
-        let k = config.stiffness;
-        let exponent = config.exponent;
-        let h2 = kernels.h2;
-
-        let self_density_term = kernels.poly6(0.0);
-
-        self.densities_cache
-            .par_iter_mut()
-            .zip(self.pressures_cache.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, (density_out, pressure_out))| {
-                let pos_i = positions[i];
-                let mut density = self_density_term; // particle self-contribution
-
-                grid.for_each_neighbor(pos_i, |j| {
-                    if i != j {
-                        let r2 = (pos_i - positions[j]).length_squared();
-                        if r2 < h2 {
-                            density += kernels.poly6(r2);
-                        }
-                    }
-                });
-
-                // Multiply by particle mass (approximated uniform mass)
-                let mass = 1.0;
-                density *= mass;
-
-                // Density should not drop to zero
-                let density = density.max(rho0 * 0.1);
-                *density_out = density;
-
-                // Pressure calculation: Tait EOS or linear EOS
-                let pressure = if (exponent - 1.0).abs() < 1e-3 {
-                    // Linear EOS
-                    (k * (density - rho0)).max(0.0)
-                } else {
-                    // Tait EOS
-                    let ratio = density / rho0;
-                    let p = (k / exponent) * (ratio.powf(exponent) - 1.0);
-                    p.max(0.0)
-                };
-
-                *pressure_out = pressure;
-            });
-
-        let densities = &self.densities_cache;
-        let pressures = &self.pressures_cache;
-
-        // 3. Parallel Force evaluation (Pressure, Viscosity, Surface Tension, Gravity, Mouse)
-        let mu = config.viscosity;
-        let sigma = config.surface_tension;
-        let gravity = config.gravity;
+        let gravity = self.config.gravity;
+        let bounds = self.bounds;
+        let radius = self.config.particle_radius;
         let mouse_ray = self.mouse_ray;
         let mouse_mode = self.mouse_force_mode;
         let mouse_strength = self.mouse_force_strength;
 
-        self.particles
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, p)| {
-                p.density = densities[i];
-                p.pressure = pressures[i];
+        // 2. Predict positions with gravity & mouse interaction
+        for (i, p) in self.particles.iter_mut().enumerate() {
+            self.old_positions[i] = p.position;
 
-                if p.particle_type == ParticleType::Boundary {
-                    p.acceleration = Vec3::ZERO;
-                    return;
-                }
+            if p.particle_type == ParticleType::Boundary {
+                self.predicted_positions[i] = p.position;
+                continue;
+            }
 
-                let pos_i = positions[i];
-                let vel_i = velocities[i];
-                let rho_i = densities[i];
-                let pres_i = pressures[i];
-
-                let mut f_pressure = Vec3::ZERO;
-                let mut f_viscosity = Vec3::ZERO;
-                let mut f_surface = Vec3::ZERO;
-
-                grid.for_each_neighbor(pos_i, |j| {
-                    if i != j {
-                        let pos_j = positions[j];
-                        let r_vec = pos_i - pos_j;
-                        let r2 = r_vec.length_squared();
-
-                        if r2 < h2 && r2 > 1e-12 {
-                            let r = r2.sqrt();
-                            let rho_j = densities[j];
-                            let pres_j = pressures[j];
-                            let vel_j = velocities[j];
-
-                            // Symmetric pressure gradient force
-                            // f_p = - m * (P_i / rho_i^2 + P_j / rho_j^2) * grad_W
-                            let p_factor = pres_i / (rho_i * rho_i) + pres_j / (rho_j * rho_j);
-                            let grad_w = kernels.spiky_gradient(r_vec, r);
-                            f_pressure -= grad_w * (p_factor * rho0);
-
-                            // Viscosity force
-                            // f_v = mu * (v_j - v_i) / rho_j * lap_W
-                            let lap_w = kernels.viscosity_laplacian(r);
-                            f_viscosity += (vel_j - vel_i) * (lap_w / rho_j);
-
-                            // Surface tension / cohesion force (Akinci cohesion kernel)
-                            if sigma > 0.0 {
-                                let cohesion_w = kernels.poly6(r2);
-                                f_surface -= (r_vec / r) * (cohesion_w * sigma * 1000.0);
-                            }
+            // Mouse force calculation
+            let mut f_user = Vec3::ZERO;
+            if mouse_mode != 0 {
+                if let Some(ray) = mouse_ray {
+                    let to_p = p.position - ray.origin;
+                    let proj = to_p.dot(ray.direction);
+                    if proj > 0.0 {
+                        let closest = ray.origin + ray.direction * proj;
+                        let diff = closest - p.position;
+                        let dist = diff.length();
+                        if dist < 0.6 && dist > 1e-4 {
+                            let dir = diff / dist;
+                            let factor = (1.0 - dist / 0.6) * mouse_strength;
+                            f_user = dir * (factor * mouse_mode as f32);
                         }
                     }
+                }
+            }
+
+            // Predict position
+            let accel = gravity + f_user;
+            p.velocity += accel * dt;
+
+            let mut pred = p.position + p.velocity * dt;
+            // Prevent leaving container before solver
+            pred = bounds.clamp_point(pred, radius);
+            self.predicted_positions[i] = pred;
+        }
+
+        // 3. Rebuild spatial grid on predicted positions
+        self.grid.build(&self.predicted_positions);
+
+        let grid = &self.grid;
+        let kernels = &self.kernels;
+        let rho0 = self.config.rest_density;
+        let h2 = kernels.h2;
+        let h = kernels.h;
+        let tensile_k = self.config.tensile_k;
+        let w_q = kernels.poly6((0.15 * h).powi(2)).max(1e-12);
+        let inv_rho0 = 1.0 / rho0;
+        let relaxation_epsilon = 600.0;
+
+        // 4. PBF Incompressibility Solver Iterations
+        for _ in 0..self.config.solver_iterations {
+            let pred_pos = &self.predicted_positions;
+
+            // 4a. Parallel computation of density and constraint lambda_i
+            self.lambdas
+                .par_iter_mut()
+                .zip(self.densities.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, (lambda_out, density_out))| {
+                    let pos_i = pred_pos[i];
+                    let mut density = kernels.poly6(0.0);
+                    let mut grad_ci = Vec3::ZERO;
+                    let mut sum_grad_sq = 0.0f32;
+
+                    grid.for_each_neighbor(pos_i, |j| {
+                        if i != j {
+                            let pos_j = pred_pos[j];
+                            let r_vec = pos_i - pos_j;
+                            let r2 = r_vec.length_squared();
+
+                            if r2 < h2 && r2 > 1e-12 {
+                                let r = r2.sqrt();
+                                density += kernels.poly6(r2);
+
+                                let grad_w = kernels.spiky_gradient(r_vec, r);
+                                let grad_j = grad_w * inv_rho0;
+                                grad_ci += grad_j;
+                                sum_grad_sq += grad_j.length_squared();
+                            }
+                        }
+                    });
+
+                    sum_grad_sq += grad_ci.length_squared();
+                    *density_out = density;
+
+                    // Density constraint C_i = rho / rho0 - 1.0
+                    let c_i = (density * inv_rho0 - 1.0).max(0.0);
+                    *lambda_out = -c_i / (sum_grad_sq + relaxation_epsilon);
                 });
 
-                f_viscosity *= mu;
+            let lambdas = &self.lambdas;
 
-                // User mouse interaction force (attractor or repeller)
-                let mut f_user = Vec3::ZERO;
-                if mouse_mode != 0 {
-                    if let Some(ray) = mouse_ray {
-                        let to_p = pos_i - ray.origin;
-                        let proj = to_p.dot(ray.direction);
-                        if proj > 0.0 {
-                            let closest = ray.origin + ray.direction * proj;
-                            let diff = closest - pos_i;
-                            let dist = diff.length();
-                            if dist < 0.6 && dist > 1e-4 {
-                                let dir = diff / dist;
-                                let force_mag = (1.0 - dist / 0.6) * mouse_strength;
-                                f_user = dir * (force_mag * mouse_mode as f32);
+            // 4b. Parallel computation of position displacement delta_p_i
+            self.delta_positions
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, delta_out)| {
+                    let pos_i = pred_pos[i];
+                    let lambda_i = lambdas[i];
+                    let mut delta = Vec3::ZERO;
+
+                    grid.for_each_neighbor(pos_i, |j| {
+                        if i != j {
+                            let pos_j = pred_pos[j];
+                            let r_vec = pos_i - pos_j;
+                            let r2 = r_vec.length_squared();
+
+                            if r2 < h2 && r2 > 1e-12 {
+                                let r = r2.sqrt();
+                                let lambda_j = lambdas[j];
+
+                                // Tensile instability correction (anti-clustering)
+                                let w_r = kernels.poly6(r2);
+                                let s_corr = -tensile_k * (w_r / w_q).powi(4);
+
+                                let grad_w = kernels.spiky_gradient(r_vec, r);
+                                delta += grad_w * ((lambda_i + lambda_j + s_corr) * inv_rho0);
                             }
                         }
-                    }
+                    });
+
+                    *delta_out = delta;
+                });
+
+            // 4c. Apply displacements and project collisions onto predicted positions
+            let colliders = &self.colliders;
+            for i in 0..n {
+                self.predicted_positions[i] += self.delta_positions[i];
+
+                let p_pos = &mut self.predicted_positions[i];
+
+                // Bounding box collision projection
+                p_pos.x = p_pos.x.clamp(bounds.min.x + radius, bounds.max.x - radius);
+                p_pos.y = p_pos.y.clamp(bounds.min.y + radius, bounds.max.y - radius);
+                p_pos.z = p_pos.z.clamp(bounds.min.z + radius, bounds.max.z - radius);
+
+                // Colliders (sphere / box obstacles)
+                let mut dummy_vel = Vec3::ZERO;
+                for collider in colliders {
+                    collider.resolve(p_pos, &mut dummy_vel, radius);
                 }
+            }
+        }
 
-                // Sum accelerations (f / rho + g + user)
-                let a = (f_pressure + f_viscosity + f_surface) / rho_i + gravity + f_user;
-                p.acceleration = a;
-            });
+        // 5. Update velocities from position displacement
+        let inv_dt = 1.0 / dt;
+        let max_vel = self.config.max_velocity;
+        let friction = self.config.boundary_friction;
 
-        // 4. Parallel Integration & Collision Response
-        let max_vel = config.max_velocity;
-        let bounds = self.bounds;
-        let radius = config.particle_radius;
-        let restitution = config.boundary_restitution;
-        let friction = config.boundary_friction;
-        let colliders = &self.colliders;
-
-        self.particles.par_iter_mut().for_each(|p| {
+        for (i, p) in self.particles.iter_mut().enumerate() {
             if p.particle_type == ParticleType::Boundary {
-                return;
+                continue;
             }
 
-            // Symplectic Euler integration
-            p.velocity += p.acceleration * dt;
+            let new_pos = self.predicted_positions[i];
+            let old_pos = self.old_positions[i];
+
+            let mut vel = (new_pos - old_pos) * inv_dt;
+
+            // Apply friction if particle is resting against boundary
+            if new_pos.y <= bounds.min.y + radius + 1e-4 {
+                vel.x *= friction;
+                vel.z *= friction;
+            }
+            if new_pos.x <= bounds.min.x + radius + 1e-4 || new_pos.x >= bounds.max.x - radius - 1e-4 {
+                vel.y *= friction;
+                vel.z *= friction;
+            }
+            if new_pos.z <= bounds.min.z + radius + 1e-4 || new_pos.z >= bounds.max.z - radius - 1e-4 {
+                vel.x *= friction;
+                vel.y *= friction;
+            }
 
             // Velocity clamping
-            let speed = p.velocity.length();
+            let speed = vel.length();
             if speed > max_vel {
-                p.velocity = (p.velocity / speed) * max_vel;
+                vel = (vel / speed) * max_vel;
             }
 
-            p.position += p.velocity * dt;
+            p.velocity = vel;
+            p.position = new_pos;
+            p.density = self.densities[i];
+            p.pressure = (self.densities[i] - rho0).max(0.0);
+        }
 
-            // 5. Collision with Bounding Box
-            // X min/max
-            if p.position.x < bounds.min.x + radius {
-                p.position.x = bounds.min.x + radius;
-                if p.velocity.x < 0.0 {
-                    p.velocity.x = -p.velocity.x * restitution;
-                    p.velocity.y *= friction;
-                    p.velocity.z *= friction;
-                }
-            } else if p.position.x > bounds.max.x - radius {
-                p.position.x = bounds.max.x - radius;
-                if p.velocity.x > 0.0 {
-                    p.velocity.x = -p.velocity.x * restitution;
-                    p.velocity.y *= friction;
-                    p.velocity.z *= friction;
-                }
-            }
+        // 6. XSPH Artificial Viscosity (smoothed relative velocity)
+        let visc_c = (self.config.viscosity * 0.1).clamp(0.0, 0.5);
+        if visc_c > 0.0 {
+            let particles_slice = &self.particles;
+            let densities = &self.densities;
 
-            // Y min/max (floor & ceiling)
-            if p.position.y < bounds.min.y + radius {
-                p.position.y = bounds.min.y + radius;
-                if p.velocity.y < 0.0 {
-                    p.velocity.y = -p.velocity.y * restitution;
-                    p.velocity.x *= friction;
-                    p.velocity.z *= friction;
-                }
-            } else if p.position.y > bounds.max.y - radius {
-                p.position.y = bounds.max.y - radius;
-                if p.velocity.y > 0.0 {
-                    p.velocity.y = -p.velocity.y * restitution;
-                    p.velocity.x *= friction;
-                    p.velocity.z *= friction;
-                }
-            }
+            self.xsph_velocities
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, xsph_out)| {
+                    let pos_i = particles_slice[i].position;
+                    let vel_i = particles_slice[i].velocity;
+                    let mut delta_v = Vec3::ZERO;
 
-            // Z min/max
-            if p.position.z < bounds.min.z + radius {
-                p.position.z = bounds.min.z + radius;
-                if p.velocity.z < 0.0 {
-                    p.velocity.z = -p.velocity.z * restitution;
-                    p.velocity.x *= friction;
-                    p.velocity.y *= friction;
-                }
-            } else if p.position.z > bounds.max.z - radius {
-                p.position.z = bounds.max.z - radius;
-                if p.velocity.z > 0.0 {
-                    p.velocity.z = -p.velocity.z * restitution;
-                    p.velocity.x *= friction;
-                    p.velocity.y *= friction;
-                }
-            }
+                    grid.for_each_neighbor(pos_i, |j| {
+                        if i != j {
+                            let pos_j = particles_slice[j].position;
+                            let r2 = (pos_i - pos_j).length_squared();
+                            if r2 < h2 {
+                                let vel_j = particles_slice[j].velocity;
+                                let w = kernels.poly6(r2);
+                                delta_v += (vel_j - vel_i) * (w / densities[j]);
+                            }
+                        }
+                    });
 
-            // 6. Collision with active colliders
-            for collider in colliders {
-                collider.resolve(&mut p.position, &mut p.velocity, radius);
+                    *xsph_out = vel_i + delta_v * visc_c;
+                });
+
+            for (i, p) in self.particles.iter_mut().enumerate() {
+                p.velocity = self.xsph_velocities[i];
             }
-        });
+        }
     }
 }

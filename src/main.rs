@@ -62,7 +62,7 @@ fn run_headless(args: Args) {
     println!("Frames to simulate: {}", args.frames);
     println!("Delta t: {}s", args.dt);
 
-    let bounds = Aabb::new(glam::Vec3::new(-1.0, 0.0, -0.6), glam::Vec3::new(1.0, 1.8, 0.6));
+    let bounds = Aabb::new(glam::Vec3::new(-0.8, 0.0, -0.45), glam::Vec3::new(0.8, 1.2, 0.45));
     let config = SolverConfig::default();
     let mut solver = SphSolver::new(bounds, config);
 

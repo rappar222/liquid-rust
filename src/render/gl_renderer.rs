@@ -38,6 +38,7 @@ layout (location = 1) in vec4 a_color;
 uniform mat4 u_view_proj;
 uniform float u_point_radius;
 uniform float u_viewport_height;
+uniform float u_tan_half_fov;
 
 out vec4 v_color;
 
@@ -46,7 +47,8 @@ void main() {
     vec4 clip_pos = u_view_proj * vec4(a_pos, 1.0);
     gl_Position = clip_pos;
     float dist = max(clip_pos.w, 0.001);
-    gl_PointSize = clamp((u_point_radius / dist) * u_viewport_height, 2.0, 128.0);
+    float size_px = (u_point_radius / (dist * u_tan_half_fov)) * u_viewport_height;
+    gl_PointSize = clamp(size_px, 2.0, 128.0);
 }
 "#;
 
@@ -70,10 +72,10 @@ void main() {
 
         float diff = max(dot(normal, u_light_dir), 0.0);
         vec3 half_dir = normalize(u_light_dir + vec3(0.0, 0.0, 1.0));
-        float spec = pow(max(dot(normal, half_dir), 0.0), 32.0);
+        float spec = pow(max(dot(normal, half_dir), 0.0), 24.0);
 
-        vec3 rgb = v_color.rgb * (0.35 + 0.65 * diff) + vec3(0.45) * spec;
-        float rim = pow(1.0 - z, 3.0) * 0.25;
+        vec3 rgb = v_color.rgb * (0.4 + 0.6 * diff) + vec3(0.5) * spec;
+        float rim = pow(1.0 - z, 3.0) * 0.2;
         rgb += vec3(rim);
 
         FragColor = vec4(rgb, v_color.a);
@@ -166,6 +168,7 @@ void main() {
         view_proj: Mat4,
         viewport_size: [f32; 2],
         particle_radius: f32,
+        fov_y: f32,
         particles_data: &[ParticleVertex],
         lit_spheres: bool,
         bounds: Aabb,
@@ -202,7 +205,7 @@ void main() {
                 let u_col = gl.get_uniform_location(self.line_program, "u_line_color");
 
                 gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
-                gl.uniform_4_f32(u_col.as_ref(), 0.4, 0.6, 0.85, 0.85);
+                gl.uniform_4_f32(u_col.as_ref(), 0.3, 0.55, 0.8, 0.7);
 
                 gl.bind_vertex_array(Some(self.line_vao));
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.line_vbo));
@@ -223,14 +226,18 @@ void main() {
                 let u_vp = gl.get_uniform_location(self.particle_program, "u_view_proj");
                 let u_pr = gl.get_uniform_location(self.particle_program, "u_point_radius");
                 let u_vh = gl.get_uniform_location(self.particle_program, "u_viewport_height");
+                let u_tf = gl.get_uniform_location(self.particle_program, "u_tan_half_fov");
                 let u_ld = gl.get_uniform_location(self.particle_program, "u_light_dir");
                 let u_lit = gl.get_uniform_location(self.particle_program, "u_lit_spheres");
 
-                gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
-                gl.uniform_1_f32(u_pr.as_ref(), particle_radius * 1.5);
-                gl.uniform_1_f32(u_vh.as_ref(), viewport_size[1]);
+                let tan_half_fov = (fov_y * 0.5).tan();
 
-                let light_dir = Vec3::new(0.5, 0.8, 0.6).normalize();
+                gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
+                gl.uniform_1_f32(u_pr.as_ref(), particle_radius);
+                gl.uniform_1_f32(u_vh.as_ref(), viewport_size[1]);
+                gl.uniform_1_f32(u_tf.as_ref(), tan_half_fov);
+
+                let light_dir = Vec3::new(0.4, 0.8, 0.5).normalize();
                 gl.uniform_3_f32(u_ld.as_ref(), light_dir.x, light_dir.y, light_dir.z);
                 gl.uniform_1_i32(u_lit.as_ref(), if lit_spheres { 1 } else { 0 });
 

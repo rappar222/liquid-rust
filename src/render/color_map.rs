@@ -62,16 +62,16 @@ impl ColorMap {
     }
 
     fn sample_ocean(t: f32) -> Vec3 {
-        // Deep blue -> cerulean -> bright cyan -> white spray
-        if t < 0.33 {
-            let s = t / 0.33;
-            Vec3::new(0.05, 0.2, 0.6).lerp(Vec3::new(0.1, 0.5, 0.85), s)
-        } else if t < 0.75 {
-            let s = (t - 0.33) / 0.42;
-            Vec3::new(0.1, 0.5, 0.85).lerp(Vec3::new(0.3, 0.85, 0.95), s)
+        // Deep blue (rest) -> cyan/turquoise (flow) -> white (splash)
+        if t < 0.25 {
+            let s = t / 0.25;
+            Vec3::new(0.05, 0.22, 0.65).lerp(Vec3::new(0.08, 0.45, 0.85), s)
+        } else if t < 0.65 {
+            let s = (t - 0.25) / 0.40;
+            Vec3::new(0.08, 0.45, 0.85).lerp(Vec3::new(0.18, 0.80, 0.94), s)
         } else {
-            let s = (t - 0.75) / 0.25;
-            Vec3::new(0.3, 0.85, 0.95).lerp(Vec3::new(0.95, 0.98, 1.0), s)
+            let s = (t - 0.65) / 0.35;
+            Vec3::new(0.18, 0.80, 0.94).lerp(Vec3::new(0.96, 0.98, 1.0), s)
         }
     }
 

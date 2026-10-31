@@ -42,7 +42,7 @@ pub struct LiquidApp {
 
 impl LiquidApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.6), Vec3::new(1.0, 1.8, 0.6));
+        let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
         let config = SolverConfig::default();
         let mut solver = SphSolver::new(bounds, config);
 
@@ -72,8 +72,8 @@ impl LiquidApp {
             color_mode: ColorMode::Velocity,
             color_map: ColorMapType::Ocean,
             display_size_factor: 1.0,
-            sphere_obstacle_pos: Vec3::new(0.0, 0.6, 0.0),
-            sphere_obstacle_radius: 0.28,
+            sphere_obstacle_pos: Vec3::new(0.0, 0.45, 0.0),
+            sphere_obstacle_radius: 0.22,
             sphere_obstacle_enabled: false,
             last_frame_time: Instant::now(),
             frame_counter: 0,
@@ -125,20 +125,27 @@ impl LiquidApp {
 
     fn compute_particle_color(&self, p: &crate::sph::particle::Particle) -> [u8; 3] {
         let t = match self.color_mode {
-            ColorMode::Velocity => (p.speed() / 4.0).clamp(0.0, 1.0),
-            ColorMode::Pressure => (p.pressure / 1500.0).clamp(0.0, 1.0),
+            ColorMode::Velocity => {
+                // Calm resting water: 0..0.4 m/s -> deep oceanic blue
+                // Moving wave: 0.5..1.8 m/s -> azure/turquoise
+                // Splash / impact: > 2.0 m/s -> white foam
+                (p.speed() / 2.4).clamp(0.0, 1.0)
+            }
+            ColorMode::Pressure => {
+                (p.pressure / (self.solver.config.rest_density * 0.4)).clamp(0.0, 1.0)
+            }
             ColorMode::Density => {
                 let dev = (p.density - self.solver.config.rest_density).abs()
                     / self.solver.config.rest_density;
-                (dev * 6.0).clamp(0.0, 1.0)
+                (dev * 4.0).clamp(0.0, 1.0)
             }
             ColorMode::Height => {
                 let y = p.position.y;
                 let b = &self.solver.bounds;
                 ((y - b.min.y) / (b.max.y - b.min.y)).clamp(0.0, 1.0)
             }
-            ColorMode::KineticEnergy => (p.kinetic_energy() / 10.0).clamp(0.0, 1.0),
-            ColorMode::SingleColor => return [50, 150, 230],
+            ColorMode::KineticEnergy => (p.kinetic_energy() / 4.0).clamp(0.0, 1.0),
+            ColorMode::SingleColor => return [30, 140, 225],
         };
         ColorMap::sample(self.color_map, t)
     }
@@ -194,7 +201,7 @@ impl eframe::App for LiquidApp {
 
                 ui.separator();
 
-                // Quick preset buttons
+                // Quick preset selector
                 egui::ComboBox::from_id_salt("preset_combo")
                     .selected_text(self.current_preset.name())
                     .show_ui(ui, |ui| {
@@ -247,33 +254,22 @@ impl eframe::App for LiquidApp {
                     ui.separator();
 
                     // --- Physics Parameters ---
-                    ui.collapsing("⚙ Fluid Physics", |ui| {
+                    ui.collapsing("⚙ Fluid Physics (PBF)", |ui| {
                         ui.add(
-                            egui::Slider::new(&mut self.solver.config.viscosity, 0.005..=1.5)
-                                .text("Viscosity")
-                                .logarithmic(true),
+                            egui::Slider::new(&mut self.solver.config.viscosity, 0.0..=0.3)
+                                .text("Viscosity"),
                         );
                         ui.add(
-                            egui::Slider::new(&mut self.solver.config.stiffness, 200.0..=5000.0)
-                                .text("Stiffness (k)"),
+                            egui::Slider::new(&mut self.solver.config.solver_iterations, 1..=6)
+                                .text("Solver Iterations"),
                         );
                         ui.add(
-                            egui::Slider::new(
-                                &mut self.solver.config.surface_tension,
-                                0.0..=0.3,
-                            )
-                            .text("Surface Tension"),
+                            egui::Slider::new(&mut self.solver.config.substeps, 1..=4)
+                                .text("Substeps"),
                         );
                         ui.add(
                             egui::Slider::new(&mut self.solver.config.gravity.y, -25.0..=5.0)
                                 .text("Gravity Y"),
-                        );
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.solver.config.boundary_restitution,
-                                0.0..=0.9,
-                            )
-                            .text("Wall Restitution"),
                         );
                         ui.add(
                             egui::Slider::new(
@@ -283,8 +279,8 @@ impl eframe::App for LiquidApp {
                             .text("Wall Friction"),
                         );
                         ui.add(
-                            egui::Slider::new(&mut self.solver.config.substeps, 1..=8)
-                                .text("Substeps"),
+                            egui::Slider::new(&mut self.solver.config.tensile_k, 0.0..=0.005)
+                                .text("Tensile Cohesion"),
                         );
                     });
 
@@ -299,19 +295,19 @@ impl eframe::App for LiquidApp {
                         if self.sphere_obstacle_enabled {
                             obstacle_changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut self.sphere_obstacle_pos.x, -0.8..=0.8)
+                                    egui::Slider::new(&mut self.sphere_obstacle_pos.x, -0.6..=0.6)
                                         .text("Pos X"),
                                 )
                                 .changed();
                             obstacle_changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut self.sphere_obstacle_pos.y, 0.1..=1.4)
+                                    egui::Slider::new(&mut self.sphere_obstacle_pos.y, 0.05..=1.0)
                                         .text("Pos Y"),
                                 )
                                 .changed();
                             obstacle_changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut self.sphere_obstacle_pos.z, -0.6..=0.6)
+                                    egui::Slider::new(&mut self.sphere_obstacle_pos.z, -0.4..=0.4)
                                         .text("Pos Z"),
                                 )
                                 .changed();
@@ -319,7 +315,7 @@ impl eframe::App for LiquidApp {
                                 .add(
                                     egui::Slider::new(
                                         &mut self.sphere_obstacle_radius,
-                                        0.08..=0.5,
+                                        0.08..=0.4,
                                     )
                                     .text("Radius"),
                                 )
@@ -343,7 +339,7 @@ impl eframe::App for LiquidApp {
                     ui.collapsing("🎨 Rendering & Colors", |ui| {
                         ui.checkbox(&mut self.lit_spheres, "3D Shaded Spheres");
                         ui.add(
-                            egui::Slider::new(&mut self.display_size_factor, 0.4..=2.5)
+                            egui::Slider::new(&mut self.display_size_factor, 0.5..=1.8)
                                 .text("Particle Size"),
                         );
 
@@ -461,6 +457,7 @@ impl eframe::App for LiquidApp {
             let view = self.camera.view_matrix();
             let proj = self.camera.projection_matrix(aspect);
             let view_proj = proj * view;
+            let fov_y = self.camera.fov_y;
 
             // Handle Fluid Interaction with Shift + Mouse
             if is_shift_held && response.hovered() {
@@ -532,6 +529,7 @@ impl eframe::App for LiquidApp {
                             view_proj,
                             [rect.width() * ppi, rect.height() * ppi],
                             particle_radius,
+                            fov_y,
                             &particles_data,
                             lit_spheres,
                             bounds,

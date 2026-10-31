@@ -76,6 +76,17 @@ struct Args {
     benchmark: bool,
 }
 
+fn format_time(seconds: f64) -> String {
+    let s = seconds.max(0.0).round() as u64;
+    let mins = s / 60;
+    let secs = s % 60;
+    if mins > 0 {
+        format!("{}m {:02}s", mins, secs)
+    } else {
+        format!("{:.1}s", seconds.max(0.0))
+    }
+}
+
 fn parse_preset(name: &str) -> ScenePreset {
     match name.to_lowercase().as_str() {
         "dam-break" | "dambreak" | "dam" => ScenePreset::DamBreak,
@@ -182,6 +193,7 @@ fn run_headless(args: Args) {
 
     let start_total = Instant::now();
     let mut total_sim_time = 0.0f64;
+    let mut last_progress_print = Instant::now();
 
     for frame in 0..total_frames {
         let t0 = Instant::now();
@@ -225,17 +237,45 @@ fn run_headless(args: Args) {
             }
         }
 
-        if frame % 20 == 0 || frame == total_frames - 1 {
-            println!(
-                "Frame {:4}/{} ({:.1}s) | Step time: {:.2}ms | Avg FPS: {:.1}",
-                frame + 1,
-                total_frames,
-                (frame + 1) as f32 / fps as f32,
-                step_time * 1000.0,
-                (frame + 1) as f64 / total_sim_time
+        let completed = frame + 1;
+        let elapsed = start_total.elapsed().as_secs_f64();
+        let should_print = frame == 0
+            || completed == total_frames
+            || last_progress_print.elapsed().as_millis() >= 60;
+
+        if should_print {
+            let avg_time_per_frame = elapsed / completed as f64;
+            let remaining_frames = total_frames - completed;
+            let eta_secs = remaining_frames as f64 * avg_time_per_frame;
+
+            let percent = (completed as f64 / total_frames as f64) * 100.0;
+            let bar_len = 24;
+            let filled =
+                ((completed as f64 / total_frames as f64) * bar_len as f64).round() as usize;
+            let bar = format!(
+                "[{}{}]",
+                "=".repeat(filled.min(bar_len)),
+                " ".repeat(bar_len.saturating_sub(filled))
             );
+
+            let fps_current = completed as f64 / elapsed.max(1e-4);
+
+            use std::io::Write;
+            print!(
+                "\r{} {:5.1}% | Frame {:4}/{} | ETA: {:<7} | Elapsed: {:<6} | {:4.1} fps",
+                bar,
+                percent,
+                completed,
+                total_frames,
+                format_time(eta_secs),
+                format_time(elapsed),
+                fps_current,
+            );
+            let _ = std::io::stdout().flush();
+            last_progress_print = Instant::now();
         }
     }
+    println!();
 
     // Finalize MP4
     if let Some(enc) = mp4_encoder {

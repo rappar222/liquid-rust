@@ -42,6 +42,10 @@ struct Args {
     #[arg(long)]
     spacing: Option<f32>,
 
+    /// Target number of particles to spawn (automatically calculates optimal spacing and radius)
+    #[arg(long, alias = "particle-count")]
+    particles: Option<usize>,
+
     /// Total simulation duration in seconds (e.g. --time 4.0 for a 4-second video). Overrides --frames.
     #[arg(long, short = 't', alias = "duration")]
     time: Option<f32>,
@@ -152,6 +156,22 @@ fn run_headless(args: Args) {
     let bounds = Aabb::new(glam::Vec3::new(-0.8, 0.0, -0.45), glam::Vec3::new(0.8, 1.2, 0.45));
     let mut config = SolverConfig::default();
     quality.apply(&mut config);
+
+    // Apply target particle count if requested
+    if let Some(target_n) = args.particles {
+        let approx_vol = match preset {
+            ScenePreset::DamBreak => 0.415f32,
+            ScenePreset::DoubleDamBreak => 0.694f32,
+            ScenePreset::DropletSplash => 0.35f32,
+            ScenePreset::ObstacleDrop => 0.38f32,
+            ScenePreset::VortexTornado => 0.30f32,
+            ScenePreset::ZeroGravityBlobs => 0.25f32,
+        };
+        let s = (approx_vol / (target_n as f32).max(100.0)).cbrt();
+        config.spacing = s;
+        config.particle_radius = s * 0.58;
+        config.smoothing_length = config.particle_radius * 3.1;
+    }
 
     // Apply custom overrides if given
     if let Some(r) = args.particle_radius {

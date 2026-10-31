@@ -79,7 +79,9 @@ struct Args {
 fn parse_preset(name: &str) -> ScenePreset {
     match name.to_lowercase().as_str() {
         "dam-break" | "dambreak" | "dam" => ScenePreset::DamBreak,
-        "double-dam" | "doubledam" | "double" => ScenePreset::DoubleDamBreak,
+        "double-dam" | "doubledam" | "double" | "double-dam-break" | "doubledambreak" => {
+            ScenePreset::DoubleDamBreak
+        }
         "splash" | "droplet" | "dropletsplash" => ScenePreset::DropletSplash,
         "obstacle" | "drop" | "obstacledrop" => ScenePreset::ObstacleDrop,
         "tornado" | "vortex" => ScenePreset::VortexTornado,

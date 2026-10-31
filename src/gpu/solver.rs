@@ -85,7 +85,7 @@ impl GpuSphSolver {
             &wgpu::DeviceDescriptor {
                 label: Some("SPH Compute Device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: adapter.limits(),
                 memory_hints: Default::default(),
             },
             None,

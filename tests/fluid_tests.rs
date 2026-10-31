@@ -276,3 +276,22 @@ fn test_ultra_quality_gpu_stability() {
         assert!(p.speed() < 15.0, "Ultra quality must be completely stable, got speed {}", p.speed());
     }
 }
+
+#[test]
+fn test_extreme_quality_particle_count() {
+    use liquid_rust::sph::SimulationQuality;
+
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
+    let mut config = SolverConfig::default();
+    SimulationQuality::Extreme.apply(&mut config);
+
+    let mut cpu_solver = SphSolver::new(bounds, config.clone());
+    SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DamBreak);
+
+    // Extreme quality must spawn over 1,000,000 particles
+    assert!(
+        cpu_solver.particles.len() >= 1_000_000,
+        "Extreme quality must spawn at least 1,000,000 particles, got {}",
+        cpu_solver.particles.len()
+    );
+}

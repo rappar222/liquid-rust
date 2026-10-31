@@ -46,6 +46,7 @@ pub struct LiquidApp {
     pub export_sequence: bool,
     pub exported_frames_count: usize,
     pub status_message: String,
+    pub show_extreme_modal: bool,
 }
 
 impl LiquidApp {
@@ -109,6 +110,7 @@ impl LiquidApp {
             export_sequence: false,
             exported_frames_count: 0,
             status_message: "Ready".to_string(),
+            show_extreme_modal: false,
         }
     }
 
@@ -372,8 +374,21 @@ impl eframe::App for LiquidApp {
                         ui.label("Quality Presets (Particle Size):");
                         for &q in SimulationQuality::ALL {
                             let is_current = self.current_quality == q;
-                            if ui.selectable_label(is_current, q.name()).clicked() {
-                                self.set_quality(q);
+                            let btn = if q == SimulationQuality::Extreme {
+                                ui.selectable_label(
+                                    is_current,
+                                    egui::RichText::new(q.name())
+                                        .color(egui::Color32::from_rgb(255, 120, 40)),
+                                )
+                            } else {
+                                ui.selectable_label(is_current, q.name())
+                            };
+                            if btn.clicked() {
+                                if q == SimulationQuality::Extreme && !is_current {
+                                    self.show_extreme_modal = true;
+                                } else {
+                                    self.set_quality(q);
+                                }
                             }
                         }
 
@@ -735,5 +750,56 @@ impl eframe::App for LiquidApp {
                 callback: Arc::new(callback),
             });
         });
+
+        // 4. Extreme Quality Confirmation Modal Pop-up
+        if self.show_extreme_modal {
+            egui::Window::new("⚠️ Warning: Extreme Simulation Quality")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_max_width(450.0);
+                    ui.add_space(4.0);
+                    ui.vertical_centered(|ui| {
+                        ui.heading("⚠️ 1,000,000+ Particles Workload");
+                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        "You are about to switch to the Extreme Quality preset, which spawns over \
+                        1,000,000 physical fluid particles in a dense microscopic lattice."
+                    );
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 120, 40),
+                        "⚡ System Performance & Freeze Warning:",
+                    );
+                    ui.label(
+                        "• Computing over 1M particles places a massive load on your GPU and system RAM.\n\
+                        • Your computer or desktop window compositor may temporarily freeze, stutter, or lag.\n\
+                        • If using CPU fallback, this could take minutes per frame. Vulkan GPU compute is strongly recommended."
+                    );
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("❌ Cancel (Keep Current Quality)").clicked() {
+                            self.show_extreme_modal = false;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let proceed_btn = egui::Button::new(
+                                egui::RichText::new("⚠️ I Agree, Proceed to 1M+")
+                                    .color(egui::Color32::BLACK)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(255, 170, 0));
+
+                            if ui.add(proceed_btn).clicked() {
+                                self.show_extreme_modal = false;
+                                self.set_quality(SimulationQuality::Extreme);
+                            }
+                        });
+                    });
+                });
+        }
     }
 }

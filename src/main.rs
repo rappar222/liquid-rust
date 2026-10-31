@@ -30,7 +30,7 @@ struct Args {
     #[arg(long, default_value = "dam-break")]
     preset: String,
 
-    /// Particle quality / resolution: draft, medium, high, ultra, cinematic
+    /// Particle quality / resolution: draft, medium, high, ultra, cinematic, extreme (1M+)
     #[arg(long, short = 'q', default_value = "medium")]
     quality: String,
 
@@ -133,7 +133,8 @@ fn parse_quality(name: &str) -> SimulationQuality {
         "medium" | "med" | "normal" => SimulationQuality::Medium,
         "high" | "hi" | "smooth" => SimulationQuality::High,
         "ultra" | "realistic" => SimulationQuality::Ultra,
-        "cinematic" | "vfx" | "film" => SimulationQuality::Cinematic,
+        "cinematic" | "vfx" => SimulationQuality::Cinematic,
+        "extreme" | "1m" | "insane" => SimulationQuality::Extreme,
         _ => {
             eprintln!("Unknown quality '{}', defaulting to 'medium'", name);
             SimulationQuality::Medium

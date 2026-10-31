@@ -13,6 +13,7 @@ pub enum SimulationQuality {
     High,
     Ultra,
     Cinematic,
+    Extreme,
     Custom,
 }
 
@@ -23,6 +24,7 @@ impl SimulationQuality {
         SimulationQuality::High,
         SimulationQuality::Ultra,
         SimulationQuality::Cinematic,
+        SimulationQuality::Extreme,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -32,6 +34,7 @@ impl SimulationQuality {
             SimulationQuality::High => "High (Smooth, ~18k particles)",
             SimulationQuality::Ultra => "Ultra (High-Res, ~50k particles)",
             SimulationQuality::Cinematic => "Cinematic (~120k particles)",
+            SimulationQuality::Extreme => "⚠️ Extreme (1,000,000+ particles, Freeze Warning!)",
             SimulationQuality::Custom => "Custom",
         }
     }
@@ -70,6 +73,13 @@ impl SimulationQuality {
                 config.particle_radius = 0.009;
                 config.spacing = 0.015;
                 config.smoothing_length = 0.028;
+                config.substeps = 4;
+                config.solver_iterations = 4;
+            }
+            SimulationQuality::Extreme => {
+                config.particle_radius = 0.0042;
+                config.spacing = 0.0070;
+                config.smoothing_length = 0.014;
                 config.substeps = 4;
                 config.solver_iterations = 4;
             }

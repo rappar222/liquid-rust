@@ -1,0 +1,87 @@
+name: Multi-Platform Release Builds
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libx11-dev libx11-xcb-dev libasound2-dev libudev-dev
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release
+      - name: Package Linux tarball
+        run: |
+          mkdir -p dist
+          cp target/release/liquid-rust dist/
+          cd dist && tar -czvf liquid-rust-linux-x86_64.tar.gz liquid-rust
+      - name: Upload Linux Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/liquid-rust-linux-x86_64.tar.gz
+
+  build-windows:
+    name: Build Windows (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release
+      - name: Package Windows ZIP
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/liquid-rust.exe dist/
+          cd dist && 7z a liquid-rust-windows-x86_64.zip liquid-rust.exe
+      - name: Upload Windows Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/liquid-rust-windows-x86_64.zip
+
+  build-macos:
+    name: Build macOS (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: liquid-rust-macos-arm64.tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: liquid-rust-macos-x86_64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package macOS tarball
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/liquid-rust dist/
+          cd dist && tar -czvf ${{ matrix.artifact }} liquid-rust
+      - name: Upload macOS Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/${{ matrix.artifact }}

@@ -3,7 +3,7 @@ use crate::math::{unproject_mouse_ray, Aabb};
 use crate::render::{Camera, ColorMap, ColorMapType, ColorMode, GlRenderer, ParticleVertex};
 use crate::sph::collider::Collider;
 use crate::sph::scene::{SceneGenerator, ScenePreset};
-use crate::sph::solver::{SolverConfig, SphSolver};
+use crate::sph::solver::{compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver};
 use eframe::egui;
 use glam::Vec3;
 use glow::HasContext as _;
@@ -16,6 +16,7 @@ pub struct LiquidApp {
     pub is_playing: bool,
     pub fixed_dt: f32,
     pub current_preset: ScenePreset,
+    pub current_quality: SimulationQuality,
 
     // Rendering settings
     pub renderer: Arc<Mutex<Option<GlRenderer>>>,
@@ -67,6 +68,7 @@ impl LiquidApp {
             is_playing: true,
             fixed_dt: 0.016,
             current_preset: preset,
+            current_quality: SimulationQuality::Medium,
             renderer,
             lit_spheres: true,
             color_mode: ColorMode::Velocity,
@@ -93,6 +95,13 @@ impl LiquidApp {
             self.sphere_obstacle_enabled = true;
         }
         self.status_message = format!("Loaded preset: {}", preset.name());
+    }
+
+    pub fn set_quality(&mut self, quality: SimulationQuality) {
+        self.current_quality = quality;
+        self.solver.apply_quality(quality);
+        self.load_preset(self.current_preset);
+        self.status_message = format!("Set quality: {}", quality.name());
     }
 
     pub fn export_current_frame(&mut self) {
@@ -248,6 +257,50 @@ impl eframe::App for LiquidApp {
                             if ui.selectable_label(is_current, preset.name()).clicked() {
                                 self.load_preset(preset);
                             }
+                        }
+                    });
+
+                    ui.separator();
+
+                    // --- Particle Quality / Resolution ---
+                    ui.collapsing("💎 Particle Quality & Smoothness", |ui| {
+                        ui.label("Quality Presets (Particle Size):");
+                        for &q in SimulationQuality::ALL {
+                            let is_current = self.current_quality == q;
+                            if ui.selectable_label(is_current, q.name()).clicked() {
+                                self.set_quality(q);
+                            }
+                        }
+
+                        ui.separator();
+                        ui.label("Fine Granularity:");
+                        let mut changed = false;
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.solver.config.particle_radius, 0.010..=0.040)
+                                    .text("Radius (R)"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.solver.config.spacing, 0.018..=0.065)
+                                    .text("Spacing (d)"),
+                            )
+                            .changed();
+
+                        if changed {
+                            self.current_quality = SimulationQuality::Custom;
+                            self.solver.config.smoothing_length = self.solver.config.particle_radius * 3.1;
+                            self.solver.config.rest_density = compute_lattice_rest_density(
+                                self.solver.config.smoothing_length,
+                                self.solver.config.spacing,
+                            );
+                        }
+
+                        if ui.button("⚡ Respawn Particles with Current Size").clicked() {
+                            let h = self.solver.config.smoothing_length;
+                            self.solver.set_smoothing_length(h);
+                            self.load_preset(self.current_preset);
                         }
                     });
 

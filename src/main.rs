@@ -1,8 +1,12 @@
 use clap::Parser;
 use eframe::egui;
-use liquid_rust::export::PlyExporter;
+use liquid_rust::export::{Mp4Encoder, PlyExporter, SoftwareRenderer};
 use liquid_rust::math::Aabb;
-use liquid_rust::sph::{SceneGenerator, ScenePreset, SolverConfig, SphSolver};
+use liquid_rust::render::{Camera, ColorMapType, ColorMode};
+use liquid_rust::sph::{
+    compute_lattice_rest_density, SceneGenerator, ScenePreset, SimulationQuality, SolverConfig,
+    SphSolver,
+};
 use liquid_rust::LiquidApp;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -12,7 +16,7 @@ use std::time::Instant;
     name = "liquid-rust",
     author = "Radu <rappar222>",
     version = "0.1.0",
-    about = "High-performance 3D SPH Fluid Simulator in Rust with Real-time 3D Viewport & PLY Export"
+    about = "High-performance 3D SPH Fluid Simulator in Rust with Real-time 3D Viewport, MP4 Video & PLY Export"
 )]
 struct Args {
     /// Run in headless mode without opening GUI window
@@ -23,13 +27,41 @@ struct Args {
     #[arg(long, default_value = "dam-break")]
     preset: String,
 
-    /// Number of simulation frames to run in headless mode
+    /// Particle quality / resolution: draft, medium, high, ultra
+    #[arg(long, short = 'q', default_value = "medium")]
+    quality: String,
+
+    /// Custom particle radius override (smaller = higher quality & finer fluid)
+    #[arg(long)]
+    particle_radius: Option<f32>,
+
+    /// Custom particle spacing override (smaller = denser fluid lattice)
+    #[arg(long)]
+    spacing: Option<f32>,
+
+    /// Number of simulation frames to run
     #[arg(long, default_value_t = 120)]
     frames: usize,
 
     /// Time step dt per frame in seconds
     #[arg(long, default_value_t = 0.016)]
     dt: f32,
+
+    /// Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
+    #[arg(long)]
+    export_mp4: Option<PathBuf>,
+
+    /// Video export width in pixels
+    #[arg(long, default_value_t = 1280)]
+    video_width: usize,
+
+    /// Video export height in pixels
+    #[arg(long, default_value_t = 720)]
+    video_height: usize,
+
+    /// Video export framerate in FPS
+    #[arg(long, default_value_t = 60)]
+    fps: u32,
 
     /// Directory to export PLY point cloud frames (optional)
     #[arg(long)]
@@ -55,21 +87,74 @@ fn parse_preset(name: &str) -> ScenePreset {
     }
 }
 
+fn parse_quality(name: &str) -> SimulationQuality {
+    match name.to_lowercase().as_str() {
+        "draft" | "low" | "fast" => SimulationQuality::Draft,
+        "medium" | "med" | "normal" => SimulationQuality::Medium,
+        "high" | "hi" | "smooth" => SimulationQuality::High,
+        "ultra" | "film" | "vfx" => SimulationQuality::Ultra,
+        _ => {
+            eprintln!("Unknown quality '{}', defaulting to 'medium'", name);
+            SimulationQuality::Medium
+        }
+    }
+}
+
 fn run_headless(args: Args) {
     let preset = parse_preset(&args.preset);
+    let quality = parse_quality(&args.quality);
+
     println!("=== liquid-rust headless mode ===");
     println!("Preset: {:?}", preset);
+    println!("Quality: {} ({:?})", quality.name(), quality);
     println!("Frames to simulate: {}", args.frames);
     println!("Delta t: {}s", args.dt);
 
     let bounds = Aabb::new(glam::Vec3::new(-0.8, 0.0, -0.45), glam::Vec3::new(0.8, 1.2, 0.45));
-    let config = SolverConfig::default();
+    let mut config = SolverConfig::default();
+    quality.apply(&mut config);
+
+    // Apply custom overrides if given
+    if let Some(r) = args.particle_radius {
+        config.particle_radius = r;
+        config.smoothing_length = r * 3.1;
+    }
+    if let Some(s) = args.spacing {
+        config.spacing = s;
+    }
+    config.rest_density = compute_lattice_rest_density(config.smoothing_length, config.spacing);
+
     let mut solver = SphSolver::new(bounds, config);
-
     SceneGenerator::setup_scene(&mut solver, preset);
-    let particle_count = solver.particle_count();
-    println!("Spawned {} particles", particle_count);
 
+    let particle_count = solver.particle_count();
+    println!("Spawned {} particles (particle radius: {:.4}, spacing: {:.4})",
+        particle_count, solver.config.particle_radius, solver.config.spacing);
+
+    // Setup MP4 Video Encoder if requested
+    let mut mp4_encoder = if let Some(ref path) = args.export_mp4 {
+        println!("Encoding MP4 video ({}x{} @ {} fps) to: {}",
+            args.video_width, args.video_height, args.fps, path.display());
+        match Mp4Encoder::new(path, args.video_width, args.video_height, args.fps) {
+            Ok(enc) => Some(enc),
+            Err(e) => {
+                eprintln!("Error starting MP4 encoder: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut software_renderer = if mp4_encoder.is_some() {
+        Some(SoftwareRenderer::new(args.video_width, args.video_height))
+    } else {
+        None
+    };
+
+    let camera = Camera::default();
+
+    // Setup PLY directory if requested
     if let Some(ref dir) = args.export_ply {
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!("Failed to create export directory {}: {}", dir.display(), e);
@@ -87,17 +172,34 @@ fn run_headless(args: Args) {
         let step_time = t0.elapsed().as_secs_f64();
         total_sim_time += step_time;
 
+        // Render & stream to MP4
+        if let (Some(ref mut enc), Some(ref mut rend)) = (&mut mp4_encoder, &mut software_renderer) {
+            rend.render_frame(
+                &solver.particles,
+                solver.config.particle_radius,
+                solver.bounds,
+                &camera,
+                ColorMode::Velocity,
+                ColorMapType::Ocean,
+                solver.config.rest_density,
+            );
+            if let Err(e) = enc.write_frame(&rend.rgb_buffer) {
+                eprintln!("Error writing video frame {}: {}", frame, e);
+            }
+        }
+
+        // Export PLY frame
         if let Some(ref dir) = args.export_ply {
             let path = dir.join(format!("fluid_{:05}.ply", frame));
             let colors: Vec<[u8; 3]> = solver
                 .particles
                 .iter()
                 .map(|p| {
-                    let speed_ratio = (p.speed() / 4.0).clamp(0.0, 1.0);
+                    let speed_ratio = (p.speed() / 2.4).clamp(0.0, 1.0);
                     [
                         (speed_ratio * 255.0) as u8,
-                        100,
-                        ((1.0 - speed_ratio) * 255.0) as u8,
+                        120,
+                        ((1.0 - speed_ratio * 0.7) * 255.0) as u8,
                     ]
                 })
                 .collect();
@@ -117,6 +219,15 @@ fn run_headless(args: Args) {
         }
     }
 
+    // Finalize MP4
+    if let Some(enc) = mp4_encoder {
+        println!("Finalizing MP4 video encoding...");
+        match enc.finish() {
+            Ok(_) => println!("MP4 video saved successfully!"),
+            Err(e) => eprintln!("Error finalizing MP4 video: {}", e),
+        }
+    }
+
     let total_elapsed = start_total.elapsed().as_secs_f64();
     println!("--------------------------------------------------");
     println!("Simulation finished!");
@@ -126,7 +237,7 @@ fn run_headless(args: Args) {
     println!("Throughput: {:.0} particle-steps/sec", (particle_count * args.frames) as f64 / total_sim_time);
 }
 
-fn run_gui() -> Result<(), eframe::Error> {
+fn run_gui(initial_quality: SimulationQuality) -> Result<(), eframe::Error> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -139,17 +250,24 @@ fn run_gui() -> Result<(), eframe::Error> {
     eframe::run_native(
         "liquid-rust",
         native_options,
-        Box::new(|cc| Ok(Box::new(LiquidApp::new(cc)))),
+        Box::new(move |cc| {
+            let mut app = LiquidApp::new(cc);
+            if initial_quality != SimulationQuality::Medium {
+                app.set_quality(initial_quality);
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
 fn main() {
     let args = Args::parse();
 
-    if args.headless || args.benchmark {
+    if args.headless || args.benchmark || args.export_mp4.is_some() {
         run_headless(args);
     } else {
-        if let Err(e) = run_gui() {
+        let initial_quality = parse_quality(&args.quality);
+        if let Err(e) = run_gui(initial_quality) {
             eprintln!("GUI Error: {}", e);
         }
     }

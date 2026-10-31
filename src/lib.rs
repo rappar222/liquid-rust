@@ -5,7 +5,10 @@ pub mod render;
 pub mod sph;
 
 pub use app::LiquidApp;
-pub use export::PlyExporter;
+pub use export::{Mp4Encoder, PlyExporter, SoftwareRenderer};
 pub use math::{unproject_mouse_ray, Aabb, Ray};
 pub use render::{Camera, ColorMap, ColorMapType, ColorMode, GlRenderer};
-pub use sph::{Collider, ColliderShape, Particle, ParticleType, SceneGenerator, ScenePreset, SolverConfig, SphSolver};
+pub use sph::{
+    compute_lattice_rest_density, Collider, ColliderShape, Particle, ParticleType, SceneGenerator,
+    ScenePreset, SimulationQuality, SolverConfig, SphSolver,
+};

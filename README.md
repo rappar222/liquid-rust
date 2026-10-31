@@ -39,10 +39,19 @@ A high-performance, real-time 3D fluid simulation engine written in Rust using S
   - Hold `Shift` + Right Drag to **repel** fluid.
   - Add and interactively move solid obstacles (spheres, boxes) in real time.
 
-- **Blender / VFX Point Cloud Export**:
+- **Blender / VFX Point Cloud & MP4 Video Export**:
+  - Direct CLI export to **H.264 MP4 videos** (`--export-mp4 simulation.mp4`) via hardware-buffered software rasterizer and FFmpeg pipe.
   - Exports single frames or entire animation sequences in standard binary/ASCII **Stanford PLY format** (`.ply`).
   - Includes positions, velocities, density, pressure, and RGB color fields.
   - Easily importable into **Blender** (Geometry Nodes / Point Cloud), MeshLab, Houdini, or CloudCompare for photorealistic fluid meshing and raytracing.
+
+- **Configurable Particle Quality & Smoothness**:
+  - Dynamically adjust particle size and density in both GUI and CLI:
+    - **Draft**: ~2,500 particles (fastest)
+    - **Medium**: ~5,500 particles (balanced default)
+    - **High**: ~16,000 particles (smooth, fine liquid details)
+    - **Ultra**: ~40,000+ particles (fine film-quality water)
+  - Custom particle radius and lattice spacing sliders for precision control.
 
 - **Headless & Benchmark CLI Modes**:
   - Run simulations in headless server environments without opening a display window.
@@ -105,28 +114,41 @@ Select presets directly from the GUI dropdown or launch them via the CLI:
 `liquid-rust` includes a full CLI powered by `clap`:
 
 ```bash
-# Run headless benchmark on Dam Break preset for 100 frames
-cargo run --release -- --headless --benchmark --frames 100
+# Export simulation video directly to MP4
+cargo run --release -- --export-mp4 water_splash.mp4 --preset splash --frames 180 --quality high
+
+# Run high-resolution simulation with fine, smooth particles
+cargo run --release -- --quality high
+
+# Headless benchmark on Dam Break preset with ultra quality
+cargo run --release -- --headless --benchmark --frames 100 --quality ultra
 
 # Simulate Droplet Splash and export PLY files to a folder
 cargo run --release -- --headless --preset splash --frames 150 --export-ply ./renders
 
-# Run Double Dam Break with custom time step
-cargo run --release -- --headless --preset double-dam --frames 200 --dt 0.01
+# Run with custom particle radius and spacing for ultra-fine liquid
+cargo run --release -- --particle-radius 0.014 --spacing 0.024 --frames 100
 ```
 
 ### Available CLI Flags
 
 ```
 Options:
-      --headless            Run in headless mode without opening GUI window
-      --preset <NAME>       Scene preset: dam-break, double-dam, splash, obstacle, tornado, zero-g [default: dam-break]
-      --frames <FRAMES>     Number of simulation frames to run in headless mode [default: 120]
-      --dt <DT>             Time step dt per frame in seconds [default: 0.016]
-      --export-ply <DIR>    Directory to export PLY point cloud frames
-      --benchmark           Print performance benchmark statistics
-  -h, --help                Print help
-  -V, --version             Print version
+      --headless                Run in headless mode without opening GUI window
+      --preset <NAME>           Scene preset: dam-break, double-dam, splash, obstacle, tornado, zero-g [default: dam-break]
+  -q, --quality <QUALITY>       Particle quality: draft, medium, high, ultra [default: medium]
+      --particle-radius <R>     Custom particle radius override (smaller = finer fluid)
+      --spacing <S>             Custom particle spacing override
+      --frames <FRAMES>         Number of simulation frames to run in headless mode [default: 120]
+      --dt <DT>                 Time step dt per frame in seconds [default: 0.016]
+      --export-mp4 <PATH>       Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
+      --video-width <WIDTH>     Video export width in pixels [default: 1280]
+      --video-height <HEIGHT>   Video export height in pixels [default: 720]
+      --fps <FPS>               Video export framerate in FPS [default: 60]
+      --export-ply <DIR>        Directory to export PLY point cloud frames
+      --benchmark               Print performance benchmark statistics
+  -h, --help                    Print help
+  -V, --version                 Print version
 ```
 
 ---

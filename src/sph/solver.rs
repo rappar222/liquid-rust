@@ -6,6 +6,69 @@ use crate::sph::spatial::SpatialHashGrid;
 use glam::Vec3;
 use rayon::prelude::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimulationQuality {
+    Draft,
+    Medium,
+    High,
+    Ultra,
+    Custom,
+}
+
+impl SimulationQuality {
+    pub const ALL: &'static [SimulationQuality] = &[
+        SimulationQuality::Draft,
+        SimulationQuality::Medium,
+        SimulationQuality::High,
+        SimulationQuality::Ultra,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            SimulationQuality::Draft => "Draft (Fast, ~2.5k particles)",
+            SimulationQuality::Medium => "Medium (Balanced, ~5.5k particles)",
+            SimulationQuality::High => "High (Smooth, ~16k particles)",
+            SimulationQuality::Ultra => "Ultra (Fine Water, ~40k particles)",
+            SimulationQuality::Custom => "Custom",
+        }
+    }
+
+    pub fn apply(&self, config: &mut SolverConfig) {
+        match self {
+            SimulationQuality::Draft => {
+                config.particle_radius = 0.032;
+                config.spacing = 0.054;
+                config.smoothing_length = 0.095;
+                config.substeps = 2;
+                config.solver_iterations = 3;
+            }
+            SimulationQuality::Medium => {
+                config.particle_radius = 0.024;
+                config.spacing = 0.042;
+                config.smoothing_length = 0.075;
+                config.substeps = 2;
+                config.solver_iterations = 3;
+            }
+            SimulationQuality::High => {
+                config.particle_radius = 0.017;
+                config.spacing = 0.030;
+                config.smoothing_length = 0.054;
+                config.substeps = 3;
+                config.solver_iterations = 3;
+            }
+            SimulationQuality::Ultra => {
+                config.particle_radius = 0.012;
+                config.spacing = 0.021;
+                config.smoothing_length = 0.038;
+                config.substeps = 3;
+                config.solver_iterations = 4;
+            }
+            SimulationQuality::Custom => {}
+        }
+        config.rest_density = compute_lattice_rest_density(config.smoothing_length, config.spacing);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SolverConfig {
     pub particle_radius: f32,    // Physical radius for collisions
@@ -124,6 +187,12 @@ impl SphSolver {
         self.config.rest_density = compute_lattice_rest_density(h, self.config.spacing);
         self.kernels = SphKernels::new(h);
         self.grid = SpatialHashGrid::new(h, self.particles.len().max(1024));
+    }
+
+    pub fn apply_quality(&mut self, quality: SimulationQuality) {
+        quality.apply(&mut self.config);
+        self.kernels = SphKernels::new(self.config.smoothing_length);
+        self.grid = SpatialHashGrid::new(self.config.smoothing_length, self.particles.len().max(1024));
     }
 
     pub fn add_particle(&mut self, p: Particle) {

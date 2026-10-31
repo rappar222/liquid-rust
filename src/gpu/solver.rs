@@ -502,7 +502,7 @@ impl GpuSphSolver {
             ([0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
         };
 
-        let dt_factor = (sub_dt / 0.016).clamp(0.05, 1.0);
+        let dt_factor = (sub_dt / 0.016).clamp(0.001, 1.0);
         let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2);
         let max_displacement = config.particle_radius * 0.35 * dt_factor;
 
@@ -548,41 +548,82 @@ impl GpuSphSolver {
                 label: Some("PBF Substep Encoder"),
             });
 
+            // 1. Predict positions
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("PBF Compute Pass"),
+                    label: Some("PBF Predict Pass"),
                     timestamp_writes: None,
                 });
                 cpass.set_bind_group(0, bind_group, &[]);
-
-                // 1. Predict positions
                 cpass.set_pipeline(&self.pipeline_predict);
                 cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+            }
 
-                // 2. Clear uniform grid
+            // 2. Clear uniform grid
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("PBF Clear Grid Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_bind_group(0, bind_group, &[]);
                 cpass.set_pipeline(&self.pipeline_clear_grid);
                 cpass.dispatch_workgroups(workgroups_cells, 1, 1);
+            }
 
-                // 3. Insert particles into grid
+            // 3. Insert particles into grid
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("PBF Insert Grid Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_bind_group(0, bind_group, &[]);
                 cpass.set_pipeline(&self.pipeline_insert_particles);
                 cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+            }
 
-                // 4. PBF Solver Iterations
-                for _ in 0..config.solver_iterations {
-                    // 4a. Compute density & lambda
+            // 4. PBF Solver Iterations
+            for _ in 0..config.solver_iterations {
+                // 4a. Compute density & lambda
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("PBF Density Lambda Pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_bind_group(0, bind_group, &[]);
                     cpass.set_pipeline(&self.pipeline_density_lambda);
-                    cpass.dispatch_workgroups(workgroups_particles, 1, 1);
-
-                    // 4b. Compute displacement delta
-                    cpass.set_pipeline(&self.pipeline_delta_positions);
-                    cpass.dispatch_workgroups(workgroups_particles, 1, 1);
-
-                    // 4c. Apply delta & boundary collision
-                    cpass.set_pipeline(&self.pipeline_apply_delta);
                     cpass.dispatch_workgroups(workgroups_particles, 1, 1);
                 }
 
-                // 5. Update velocity & XSPH viscosity
+                // 4b. Compute displacement delta
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("PBF Delta Positions Pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_bind_group(0, bind_group, &[]);
+                    cpass.set_pipeline(&self.pipeline_delta_positions);
+                    cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+                }
+
+                // 4c. Apply delta & boundary collision
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("PBF Apply Delta Pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_bind_group(0, bind_group, &[]);
+                    cpass.set_pipeline(&self.pipeline_apply_delta);
+                    cpass.dispatch_workgroups(workgroups_particles, 1, 1);
+                }
+            }
+
+            // 5. Update velocity & XSPH viscosity
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("PBF Update Velocity Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_bind_group(0, bind_group, &[]);
                 cpass.set_pipeline(&self.pipeline_update_velocity);
                 cpass.dispatch_workgroups(workgroups_particles, 1, 1);
             }

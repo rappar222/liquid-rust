@@ -278,19 +278,20 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
                             let lambda_j = lambdas[j];
                             let lambda_sum = lambda_i + lambda_j;
                             
+                            let dt = uniforms.gravity.w;
+                            let dt_factor = clamp(dt / 0.016, 0.001, 1.0);
+                            
                             var s_corr = 0.0;
                             if (lambda_sum < -1e-6) {
                                 let w_r = poly6(r2, h2, poly6_factor);
                                 let ratio = w_r / w_q;
-                                s_corr = -tensile_k * (ratio * ratio * ratio * ratio) * (h * h);
+                                s_corr = -tensile_k * (ratio * ratio * ratio * ratio) * (h * h) * dt_factor;
                             }
                             
                             let grad_w = spiky_gradient(r_vec, r, h, spiky_factor);
                             delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
                             
                             if (surface_tension > 0.0) {
-                                let dt = uniforms.gravity.w;
-                                let dt_factor = clamp(dt / 0.016, 0.05, 1.0);
                                 let w_r = poly6(r2, h2, poly6_factor);
                                 let cohesion = (w_r * surface_tension * 0.05 * dt_factor * dt_factor) / rho0;
                                 delta -= (r_vec / r) * cohesion;

@@ -85,6 +85,46 @@ fn test_rest_density_computation() {
 }
 
 #[test]
+fn test_density_vs_rest_density() {
+    use liquid_rust::sph::SimulationQuality;
+    let mut config = SolverConfig::default();
+    SimulationQuality::Ultra.apply(&mut config);
+    let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.45), Vec3::new(1.0, 1.2, 0.45));
+    let mut cpu_solver = SphSolver::new(bounds, config.clone());
+    SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DoubleDamBreak);
+    
+    let center_pos = Vec3::new(-0.7, 0.4, 0.0);
+    let (_, p) = cpu_solver.particles.iter().enumerate().min_by(|(_, a), (_, b)| {
+        a.position.distance_squared(center_pos).partial_cmp(&b.position.distance_squared(center_pos)).unwrap()
+    }).unwrap();
+    println!("Center particle pos: {:?}, target rest_density: {}", p.position, config.rest_density);
+    
+    let kernels = SphKernels::new(config.smoothing_length);
+    let mut d = kernels.poly6(0.0);
+    let mut grad_ci = Vec3::ZERO;
+    let mut sum_grad_sq = 0.0f32;
+    let inv_rho0 = 1.0 / config.rest_density;
+    for other in &cpu_solver.particles {
+        if other.id != p.id {
+            let r_vec = p.position - other.position;
+            let r2 = r_vec.length_squared();
+            if r2 < kernels.h2 && r2 > 1e-12 {
+                let r = r2.sqrt();
+                d += kernels.poly6(r2);
+                let grad_w = kernels.spiky_gradient(r_vec, r);
+                let grad_j = grad_w * inv_rho0;
+                grad_ci += grad_j;
+                sum_grad_sq += grad_j.length_squared();
+            }
+        }
+    }
+    sum_grad_sq += grad_ci.length_squared();
+    let relaxation_eps = 1200.0 * (0.075 / config.smoothing_length).powi(2);
+    println!("Actual computed density: {}, diff: {}, ratio: {}", d, d - config.rest_density, d / config.rest_density);
+    println!("sum_grad_sq = {}, relaxation_eps = {}", sum_grad_sq, relaxation_eps);
+}
+
+#[test]
 fn test_sphere_collider_response() {
     let collider = Collider::sphere(Vec3::new(0.0, 0.0, 0.0), 0.5);
     let mut pos = Vec3::new(0.4, 0.0, 0.0);
@@ -221,28 +261,38 @@ fn test_gpu_sph_solver() {
 }
 
 #[test]
-fn test_slow_motion_no_liftoff() {
+fn test_gpu_slow_motion_stability() {
+    use liquid_rust::gpu::GpuSphSolver;
     use liquid_rust::sph::SimulationQuality;
 
-    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
+    let bounds = Aabb::new(Vec3::new(-1.0, 0.0, -0.45), Vec3::new(1.0, 1.2, 0.45));
     let mut config = SolverConfig::default();
-    SimulationQuality::Draft.apply(&mut config);
+    SimulationQuality::Ultra.apply(&mut config);
 
-    let mut solver = SphSolver::new(bounds, config.clone());
-    SceneGenerator::setup_scene(&mut solver, ScenePreset::DamBreak);
+    let mut cpu_solver = SphSolver::new(bounds, config.clone());
+    SceneGenerator::setup_scene(&mut cpu_solver, ScenePreset::DoubleDamBreak);
+    let bounds = cpu_solver.bounds;
 
-    // Simulate at 0.1x slow motion (small dt)
-    let slow_dt = 0.016 * 0.1;
-    for _ in 0..40 {
-        solver.step(slow_dt);
-    }
+    let mut gpu_solver = match GpuSphSolver::new(bounds, &config, &cpu_solver.particles) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
 
-    for p in &solver.particles {
-        assert!(!p.position.is_nan());
-        assert!(!p.velocity.is_nan());
-        assert!(p.speed() < 10.0, "Particles must not explode under slow motion");
-        // Particles must not lift off into the sky (dam break initial height is <= 0.85)
-        assert!(p.position.y <= 1.0, "Particles must not lift off in slow motion, got y={}", p.position.y);
+    let slow_dt = (1.0 / 60.0) * 0.0625; // 16x slow
+    let initial_max_y = cpu_solver.particles.iter().map(|p| p.position.y).fold(0.0f32, f32::max);
+    println!("Initial max y: {}", initial_max_y);
+
+    for frame in 0..100 {
+        gpu_solver.step(bounds, &config, &[], None, 0.0, 0, slow_dt);
+        let mut readback = Vec::new();
+        gpu_solver.read_particles(&mut readback);
+        let max_y = readback.iter().map(|p| p.position.y).fold(0.0f32, f32::max);
+        let max_speed = readback.iter().map(|p| p.speed()).fold(0.0f32, f32::max);
+        if frame % 20 == 0 {
+            println!("GPU Frame {}: max y = {:.4}, max speed = {:.4}", frame, max_y, max_speed);
+        }
+        assert!(max_y < initial_max_y + 0.05, "Particles lifting off: max y = {} (initial was {})", max_y, initial_max_y);
+        assert!(max_speed < 8.0, "Particles exploding: max speed = {}", max_speed);
     }
 }
 

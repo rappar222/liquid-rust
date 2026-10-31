@@ -311,7 +311,7 @@ impl SphSolver {
         let surface_tension = self.config.surface_tension;
         let w_q = kernels.poly6((0.15 * h).powi(2)).max(1e-12);
         let inv_rho0 = 1.0 / rho0;
-        let dt_factor = (dt / 0.016).clamp(0.05, 1.0);
+        let dt_factor = (dt / 0.016).clamp(0.001, 1.0);
         let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2);
         let max_displacement = radius * 0.35 * dt_factor; // Scales with time step to prevent slow-mo explosions
 
@@ -381,7 +381,7 @@ impl SphSolver {
                                 // Tensile instability correction (only active during compression)
                                 let w_r = kernels.poly6(r2);
                                 let s_corr = if lambda_sum < -1e-6 {
-                                    -tensile_k * (w_r / w_q).powi(4) * (h * h)
+                                    -tensile_k * (w_r / w_q).powi(4) * (h * h) * dt_factor
                                 } else {
                                     0.0
                                 };

@@ -27,7 +27,7 @@ struct Args {
     #[arg(long, default_value = "dam-break")]
     preset: String,
 
-    /// Particle quality / resolution: draft, medium, high, ultra
+    /// Particle quality / resolution: draft, medium, high, ultra, cinematic
     #[arg(long, short = 'q', default_value = "medium")]
     quality: String,
 
@@ -39,13 +39,21 @@ struct Args {
     #[arg(long)]
     spacing: Option<f32>,
 
-    /// Number of simulation frames to run
+    /// Total simulation duration in seconds (e.g. --time 4.0 for a 4-second video). Overrides --frames.
+    #[arg(long, short = 't', alias = "duration")]
+    time: Option<f32>,
+
+    /// Number of simulation frames to run (used if --time is not specified)
     #[arg(long, default_value_t = 120)]
     frames: usize,
 
-    /// Time step dt per frame in seconds
-    #[arg(long, default_value_t = 0.016)]
-    dt: f32,
+    /// Framerate (FPS) for video export and simulation stepping
+    #[arg(long, default_value_t = 60)]
+    fps: u32,
+
+    /// Custom time step dt per frame in seconds (defaults to 1.0 / fps)
+    #[arg(long)]
+    dt: Option<f32>,
 
     /// Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
     #[arg(long)]
@@ -58,10 +66,6 @@ struct Args {
     /// Video export height in pixels
     #[arg(long, default_value_t = 720)]
     video_height: usize,
-
-    /// Video export framerate in FPS
-    #[arg(long, default_value_t = 60)]
-    fps: u32,
 
     /// Directory to export PLY point cloud frames (optional)
     #[arg(long)]
@@ -92,7 +96,8 @@ fn parse_quality(name: &str) -> SimulationQuality {
         "draft" | "low" | "fast" => SimulationQuality::Draft,
         "medium" | "med" | "normal" => SimulationQuality::Medium,
         "high" | "hi" | "smooth" => SimulationQuality::High,
-        "ultra" | "film" | "vfx" => SimulationQuality::Ultra,
+        "ultra" | "realistic" => SimulationQuality::Ultra,
+        "cinematic" | "vfx" | "film" => SimulationQuality::Cinematic,
         _ => {
             eprintln!("Unknown quality '{}', defaulting to 'medium'", name);
             SimulationQuality::Medium
@@ -103,12 +108,22 @@ fn parse_quality(name: &str) -> SimulationQuality {
 fn run_headless(args: Args) {
     let preset = parse_preset(&args.preset);
     let quality = parse_quality(&args.quality);
+    let fps = args.fps.max(1);
+
+    let (total_frames, dt) = if let Some(t) = args.time {
+        let f = (t * fps as f32).round().max(1.0) as usize;
+        let delta_t = 1.0 / fps as f32;
+        (f, delta_t)
+    } else {
+        let delta_t = args.dt.unwrap_or(1.0 / fps as f32);
+        (args.frames, delta_t)
+    };
 
     println!("=== liquid-rust headless mode ===");
     println!("Preset: {:?}", preset);
     println!("Quality: {} ({:?})", quality.name(), quality);
-    println!("Frames to simulate: {}", args.frames);
-    println!("Delta t: {}s", args.dt);
+    println!("Total Frames: {} ({:.2}s @ {} fps)", total_frames, total_frames as f32 / fps as f32, fps);
+    println!("Time step dt: {:.5}s", dt);
 
     let bounds = Aabb::new(glam::Vec3::new(-0.8, 0.0, -0.45), glam::Vec3::new(0.8, 1.2, 0.45));
     let mut config = SolverConfig::default();
@@ -134,8 +149,8 @@ fn run_headless(args: Args) {
     // Setup MP4 Video Encoder if requested
     let mut mp4_encoder = if let Some(ref path) = args.export_mp4 {
         println!("Encoding MP4 video ({}x{} @ {} fps) to: {}",
-            args.video_width, args.video_height, args.fps, path.display());
-        match Mp4Encoder::new(path, args.video_width, args.video_height, args.fps) {
+            args.video_width, args.video_height, fps, path.display());
+        match Mp4Encoder::new(path, args.video_width, args.video_height, fps) {
             Ok(enc) => Some(enc),
             Err(e) => {
                 eprintln!("Error starting MP4 encoder: {}", e);
@@ -166,9 +181,9 @@ fn run_headless(args: Args) {
     let start_total = Instant::now();
     let mut total_sim_time = 0.0f64;
 
-    for frame in 0..args.frames {
+    for frame in 0..total_frames {
         let t0 = Instant::now();
-        solver.step(args.dt);
+        solver.step(dt);
         let step_time = t0.elapsed().as_secs_f64();
         total_sim_time += step_time;
 
@@ -208,11 +223,12 @@ fn run_headless(args: Args) {
             }
         }
 
-        if frame % 20 == 0 || frame == args.frames - 1 {
+        if frame % 20 == 0 || frame == total_frames - 1 {
             println!(
-                "Frame {:4}/{} | Step time: {:.2}ms | Avg FPS: {:.1}",
+                "Frame {:4}/{} ({:.1}s) | Step time: {:.2}ms | Avg FPS: {:.1}",
                 frame + 1,
-                args.frames,
+                total_frames,
+                (frame + 1) as f32 / fps as f32,
                 step_time * 1000.0,
                 (frame + 1) as f64 / total_sim_time
             );
@@ -232,9 +248,9 @@ fn run_headless(args: Args) {
     println!("--------------------------------------------------");
     println!("Simulation finished!");
     println!("Total time: {:.3}s", total_elapsed);
-    println!("Average time per frame: {:.2}ms", (total_sim_time / args.frames as f64) * 1000.0);
-    println!("Effective simulation FPS: {:.1}", args.frames as f64 / total_sim_time);
-    println!("Throughput: {:.0} particle-steps/sec", (particle_count * args.frames) as f64 / total_sim_time);
+    println!("Average time per frame: {:.2}ms", (total_sim_time / total_frames as f64) * 1000.0);
+    println!("Effective simulation FPS: {:.1}", total_frames as f64 / total_sim_time);
+    println!("Throughput: {:.0} particle-steps/sec", (particle_count * total_frames) as f64 / total_sim_time);
 }
 
 fn run_gui(initial_quality: SimulationQuality) -> Result<(), eframe::Error> {

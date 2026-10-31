@@ -3,3 +3,4 @@ Cargo.lock
 exports/
 *.ply
 .DS_Store
+renders/

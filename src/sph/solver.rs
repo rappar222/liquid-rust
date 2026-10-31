@@ -12,6 +12,7 @@ pub enum SimulationQuality {
     Medium,
     High,
     Ultra,
+    Cinematic,
     Custom,
 }
 
@@ -21,14 +22,16 @@ impl SimulationQuality {
         SimulationQuality::Medium,
         SimulationQuality::High,
         SimulationQuality::Ultra,
+        SimulationQuality::Cinematic,
     ];
 
     pub fn name(&self) -> &'static str {
         match self {
             SimulationQuality::Draft => "Draft (Fast, ~2.5k particles)",
             SimulationQuality::Medium => "Medium (Balanced, ~5.5k particles)",
-            SimulationQuality::High => "High (Smooth, ~16k particles)",
-            SimulationQuality::Ultra => "Ultra (Fine Water, ~40k particles)",
+            SimulationQuality::High => "High (Smooth, ~18k particles)",
+            SimulationQuality::Ultra => "Ultra (Hyper-realistic, ~70k particles)",
+            SimulationQuality::Cinematic => "Cinematic (VFX Film, ~160k particles)",
             SimulationQuality::Custom => "Custom",
         }
     }
@@ -50,17 +53,24 @@ impl SimulationQuality {
                 config.solver_iterations = 3;
             }
             SimulationQuality::High => {
-                config.particle_radius = 0.017;
-                config.spacing = 0.030;
-                config.smoothing_length = 0.054;
+                config.particle_radius = 0.016;
+                config.spacing = 0.028;
+                config.smoothing_length = 0.050;
                 config.substeps = 3;
                 config.solver_iterations = 3;
             }
             SimulationQuality::Ultra => {
-                config.particle_radius = 0.012;
-                config.spacing = 0.021;
-                config.smoothing_length = 0.038;
-                config.substeps = 3;
+                config.particle_radius = 0.009;
+                config.spacing = 0.015;
+                config.smoothing_length = 0.028;
+                config.substeps = 4;
+                config.solver_iterations = 4;
+            }
+            SimulationQuality::Cinematic => {
+                config.particle_radius = 0.0065;
+                config.spacing = 0.011;
+                config.smoothing_length = 0.020;
+                config.substeps = 4;
                 config.solver_iterations = 4;
             }
             SimulationQuality::Custom => {}

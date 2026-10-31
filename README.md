@@ -49,8 +49,9 @@ A high-performance, real-time 3D fluid simulation engine written in Rust using S
   - Dynamically adjust particle size and density in both GUI and CLI:
     - **Draft**: ~2,500 particles (fastest)
     - **Medium**: ~5,500 particles (balanced default)
-    - **High**: ~16,000 particles (smooth, fine liquid details)
-    - **Ultra**: ~40,000+ particles (fine film-quality water)
+    - **High**: ~18,000 particles (smooth, fine liquid details)
+    - **Ultra**: ~70,000–120,000 particles (hyper-realistic, fine water)
+    - **Cinematic**: ~160,000+ particles (VFX film quality)
   - Custom particle radius and lattice spacing sliders for precision control.
 
 - **Headless & Benchmark CLI Modes**:
@@ -114,11 +115,14 @@ Select presets directly from the GUI dropdown or launch them via the CLI:
 `liquid-rust` includes a full CLI powered by `clap`:
 
 ```bash
-# Export simulation video directly to MP4
-cargo run --release -- --export-mp4 water_splash.mp4 --preset splash --frames 180 --quality high
+# Export 4 seconds of hyper-realistic Ultra quality fluid at 60 FPS to MP4
+cargo run --release -- --export-mp4 realistic_fluid.mp4 --preset dam-break --time 4.0 --fps 60 --quality ultra
 
-# Run high-resolution simulation with fine, smooth particles
-cargo run --release -- --quality high
+# Export 3 seconds of high-speed splash at 60 FPS
+cargo run --release -- --export-mp4 splash.mp4 --preset splash --time 3.0 --fps 60 --quality high
+
+# Launch interactive 3D GUI directly with Ultra quality
+cargo run --release -- --quality ultra
 
 # Headless benchmark on Dam Break preset with ultra quality
 cargo run --release -- --headless --benchmark --frames 100 --quality ultra
@@ -127,7 +131,7 @@ cargo run --release -- --headless --benchmark --frames 100 --quality ultra
 cargo run --release -- --headless --preset splash --frames 150 --export-ply ./renders
 
 # Run with custom particle radius and spacing for ultra-fine liquid
-cargo run --release -- --particle-radius 0.014 --spacing 0.024 --frames 100
+cargo run --release -- --particle-radius 0.008 --spacing 0.014 --time 2.5 --fps 60
 ```
 
 ### Available CLI Flags
@@ -136,15 +140,16 @@ cargo run --release -- --particle-radius 0.014 --spacing 0.024 --frames 100
 Options:
       --headless                Run in headless mode without opening GUI window
       --preset <NAME>           Scene preset: dam-break, double-dam, splash, obstacle, tornado, zero-g [default: dam-break]
-  -q, --quality <QUALITY>       Particle quality: draft, medium, high, ultra [default: medium]
+  -q, --quality <QUALITY>       Particle quality: draft, medium, high, ultra, cinematic [default: medium]
       --particle-radius <R>     Custom particle radius override (smaller = finer fluid)
       --spacing <S>             Custom particle spacing override
-      --frames <FRAMES>         Number of simulation frames to run in headless mode [default: 120]
-      --dt <DT>                 Time step dt per frame in seconds [default: 0.016]
+  -t, --time <SECONDS>          Total simulation duration in seconds (e.g. --time 4.0). Automatically calculates total frames = time * fps
+      --fps <FPS>               Framerate for video export and simulation stepping [default: 60]
+      --frames <FRAMES>         Number of simulation frames to run if --time is not set [default: 120]
+      --dt <DT>                 Custom time step dt per frame (defaults to 1.0 / fps)
       --export-mp4 <PATH>       Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
       --video-width <WIDTH>     Video export width in pixels [default: 1280]
       --video-height <HEIGHT>   Video export height in pixels [default: 720]
-      --fps <FPS>               Video export framerate in FPS [default: 60]
       --export-ply <DIR>        Directory to export PLY point cloud frames
       --benchmark               Print performance benchmark statistics
   -h, --help                    Print help

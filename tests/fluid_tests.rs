@@ -707,3 +707,22 @@ fn test_2d_mega_resolutions_and_cli() {
     assert!(SimulationQuality::TwentyMillion.is_over_10m());
     assert!(SimulationQuality::FiftyMillion.is_over_10m());
 }
+
+#[test]
+fn test_2d_objects_zero_z() {
+    use liquid_rust::sph::{Collider, ColliderShape, Faucet, Drain, CubeFace};
+
+    let b = Collider::box_obstacle(Vec3::new(-0.2, 0.05, -0.05), Vec3::new(0.2, 0.35, 0.05));
+    if let ColliderShape::Box { aabb } = b.shape {
+        assert_eq!(aabb.center().z, 0.0);
+    } else {
+        panic!("Expected box collider");
+    }
+
+    let f = Faucet::new_circle("Tap".to_string(), Vec3::new(0.1, 0.8, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.05, 100.0);
+    assert_eq!(f.position.z, 0.0);
+    assert_eq!(f.direction.z, 0.0);
+
+    let d = Drain::new("Drain".to_string(), CubeFace::Floor, Vec3::new(0.2, 0.0, 0.0), 0.1);
+    assert_eq!(d.position.z, 0.0);
+}

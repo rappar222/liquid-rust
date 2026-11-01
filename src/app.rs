@@ -855,7 +855,9 @@ impl eframe::App for LiquidApp {
                         // Independent X, Y, Z sliders
                         scale_changed |= ui.add(egui::Slider::new(&mut self.solver.chamber.scale.x, 0.3..=3.0).text("Scale X (Length)")).changed();
                         scale_changed |= ui.add(egui::Slider::new(&mut self.solver.chamber.scale.y, 0.3..=3.0).text("Scale Y (Height)")).changed();
-                        scale_changed |= ui.add(egui::Slider::new(&mut self.solver.chamber.scale.z, 0.3..=3.0).text("Scale Z (Width)")).changed();
+                        if !self.is_2d {
+                            scale_changed |= ui.add(egui::Slider::new(&mut self.solver.chamber.scale.z, 0.3..=3.0).text("Scale Z (Width)")).changed();
+                        }
 
                         if ui.button("↺ Reset Scale (1.0x)").clicked() {
                             self.solver.chamber.scale = Vec3::ONE;
@@ -866,7 +868,9 @@ impl eframe::App for LiquidApp {
                             ui.separator();
                             ui.label("Bathtub Geometry:");
                             ui.add(egui::Slider::new(&mut self.solver.chamber.tub_slope_ratio, 0.1..=0.45).text("Backrest Slope"));
-                            ui.add(egui::Slider::new(&mut self.solver.chamber.tub_fillet_ratio, 0.05..=0.35).text("Bottom Fillet"));
+                            if !self.is_2d {
+                                ui.add(egui::Slider::new(&mut self.solver.chamber.tub_fillet_ratio, 0.05..=0.35).text("Bottom Fillet"));
+                            }
                         }
 
                         if scale_changed {
@@ -877,7 +881,11 @@ impl eframe::App for LiquidApp {
                         }
 
                         let sz = self.solver.bounds.size();
-                        ui.label(format!("Chamber Size: {:.2} x {:.2} x {:.2} m", sz.x, sz.y, sz.z));
+                        if self.is_2d {
+                            ui.label(format!("Chamber Size: {:.2} x {:.2} m", sz.x, sz.y));
+                        } else {
+                            ui.label(format!("Chamber Size: {:.2} x {:.2} x {:.2} m", sz.x, sz.y, sz.z));
+                        }
                     });
                     ui.collapsing("⚙ Fluid Physics (PBF)", |ui| {
                         ui.add(
@@ -935,10 +943,17 @@ impl eframe::App for LiquidApp {
                             if ui.button("+ 📦 Box").clicked() {
                                 let id = self.next_collider_id;
                                 self.next_collider_id += 1;
-                                let mut c = Collider::box_obstacle(
-                                    Vec3::new(-0.2, 0.05, -0.2),
-                                    Vec3::new(0.2, 0.35, 0.2),
-                                );
+                                let mut c = if self.is_2d {
+                                    Collider::box_obstacle(
+                                        Vec3::new(-0.2, 0.05, -0.05),
+                                        Vec3::new(0.2, 0.35, 0.05),
+                                    )
+                                } else {
+                                    Collider::box_obstacle(
+                                        Vec3::new(-0.2, 0.05, -0.2),
+                                        Vec3::new(0.2, 0.35, 0.2),
+                                    )
+                                };
                                 c.id = id;
                                 c.name = format!("Box #{}", id);
                                 self.solver.colliders.push(c);
@@ -999,10 +1014,17 @@ impl eframe::App for LiquidApp {
                                 match &mut collider.shape {
                                     ColliderShape::Sphere { center, radius } => {
                                         ui.horizontal(|ui| {
-                                            ui.label("Pos X,Y,Z:");
-                                            ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: "));
-                                            ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: "));
-                                            ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z: "));
+                                            if self.is_2d {
+                                                center.z = 0.0;
+                                                ui.label("Pos X,Y:");
+                                                ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: "));
+                                                ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: "));
+                                            } else {
+                                                ui.label("Pos X,Y,Z:");
+                                                ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: "));
+                                                ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: "));
+                                                ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z: "));
+                                            }
                                         });
                                         ui.add(egui::Slider::new(radius, 0.02..=0.8).text("Radius"));
                                     }
@@ -1011,16 +1033,30 @@ impl eframe::App for LiquidApp {
                                         let mut extents = aabb.size();
                                         let mut changed = false;
                                         ui.horizontal(|ui| {
-                                            ui.label("Center:");
-                                            changed |= ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: ")).changed();
-                                            changed |= ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: ")).changed();
-                                            changed |= ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z: ")).changed();
+                                            if self.is_2d {
+                                                center.z = 0.0;
+                                                ui.label("Center X,Y:");
+                                                changed |= ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: ")).changed();
+                                            } else {
+                                                ui.label("Center:");
+                                                changed |= ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z: ")).changed();
+                                            }
                                         });
                                         ui.horizontal(|ui| {
-                                            ui.label("Size:");
-                                            changed |= ui.add(egui::DragValue::new(&mut extents.x).speed(0.01).prefix("W: ")).changed();
-                                            changed |= ui.add(egui::DragValue::new(&mut extents.y).speed(0.01).prefix("H: ")).changed();
-                                            changed |= ui.add(egui::DragValue::new(&mut extents.z).speed(0.01).prefix("D: ")).changed();
+                                            if self.is_2d {
+                                                extents.z = 0.2;
+                                                ui.label("Size W,H:");
+                                                changed |= ui.add(egui::DragValue::new(&mut extents.x).speed(0.01).prefix("W: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut extents.y).speed(0.01).prefix("H: ")).changed();
+                                            } else {
+                                                ui.label("Size:");
+                                                changed |= ui.add(egui::DragValue::new(&mut extents.x).speed(0.01).prefix("W: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut extents.y).speed(0.01).prefix("H: ")).changed();
+                                                changed |= ui.add(egui::DragValue::new(&mut extents.z).speed(0.01).prefix("D: ")).changed();
+                                            }
                                         });
                                         if changed {
                                             let h = extents * 0.5;
@@ -1029,22 +1065,38 @@ impl eframe::App for LiquidApp {
                                     }
                                     ColliderShape::Cylinder { center, radius, height } => {
                                         ui.horizontal(|ui| {
-                                            ui.label("Pos X,Y,Z:");
-                                            ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: "));
-                                            ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: "));
-                                            ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z: "));
+                                            if self.is_2d {
+                                                center.z = 0.0;
+                                                ui.label("Pos X,Y:");
+                                                ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: "));
+                                                ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: "));
+                                            } else {
+                                                ui.label("Pos X,Y,Z:");
+                                                ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X: "));
+                                                ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y: "));
+                                                ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z: "));
+                                            }
                                         });
                                         ui.add(egui::Slider::new(radius, 0.02..=0.6).text("Radius"));
-                                        ui.add(egui::Slider::new(height, 0.05..=1.2).text("Height"));
+                                        if !self.is_2d {
+                                            ui.add(egui::Slider::new(height, 0.05..=1.2).text("Height"));
+                                        }
                                     }
                                     ColliderShape::Mesh(mesh_arc) => {
                                         if let Some(mesh) = std::sync::Arc::get_mut(mesh_arc) {
                                             ui.horizontal(|ui| {
-                                                ui.label("Pos X,Y,Z:");
                                                 let mut changed = false;
-                                                changed |= ui.add(egui::DragValue::new(&mut mesh.position.x).speed(0.01).prefix("X: ")).changed();
-                                                changed |= ui.add(egui::DragValue::new(&mut mesh.position.y).speed(0.01).prefix("Y: ")).changed();
-                                                changed |= ui.add(egui::DragValue::new(&mut mesh.position.z).speed(0.01).prefix("Z: ")).changed();
+                                                if self.is_2d {
+                                                    mesh.position.z = 0.0;
+                                                    ui.label("Pos X,Y:");
+                                                    changed |= ui.add(egui::DragValue::new(&mut mesh.position.x).speed(0.01).prefix("X: ")).changed();
+                                                    changed |= ui.add(egui::DragValue::new(&mut mesh.position.y).speed(0.01).prefix("Y: ")).changed();
+                                                } else {
+                                                    ui.label("Pos X,Y,Z:");
+                                                    changed |= ui.add(egui::DragValue::new(&mut mesh.position.x).speed(0.01).prefix("X: ")).changed();
+                                                    changed |= ui.add(egui::DragValue::new(&mut mesh.position.y).speed(0.01).prefix("Y: ")).changed();
+                                                    changed |= ui.add(egui::DragValue::new(&mut mesh.position.z).speed(0.01).prefix("Z: ")).changed();
+                                                }
                                                 if changed {
                                                     mesh.update_transform();
                                                 }
@@ -1053,11 +1105,18 @@ impl eframe::App for LiquidApp {
                                                 mesh.update_transform();
                                             }
                                             ui.horizontal(|ui| {
-                                                ui.label("Rot:");
                                                 let mut changed = false;
-                                                changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.x).speed(0.05).prefix("P: ")).changed();
-                                                changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.y).speed(0.05).prefix("Y: ")).changed();
-                                                changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.z).speed(0.05).prefix("R: ")).changed();
+                                                if self.is_2d {
+                                                    mesh.rotation.x = 0.0;
+                                                    mesh.rotation.y = 0.0;
+                                                    ui.label("Rotation:");
+                                                    changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.z).speed(0.05).prefix("Angle: ")).changed();
+                                                } else {
+                                                    ui.label("Rot:");
+                                                    changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.x).speed(0.05).prefix("P: ")).changed();
+                                                    changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.y).speed(0.05).prefix("Y: ")).changed();
+                                                    changed |= ui.add(egui::DragValue::new(&mut mesh.rotation.z).speed(0.05).prefix("R: ")).changed();
+                                                }
                                                 if changed {
                                                     mesh.update_transform();
                                                 }
@@ -1138,16 +1197,30 @@ impl eframe::App for LiquidApp {
 
                             if faucet.enabled {
                                 ui.horizontal(|ui| {
-                                    ui.label("Pos X,Y,Z:");
-                                    ui.add(egui::DragValue::new(&mut faucet.position.x).speed(0.01).prefix("X: "));
-                                    ui.add(egui::DragValue::new(&mut faucet.position.y).speed(0.01).prefix("Y: "));
-                                    ui.add(egui::DragValue::new(&mut faucet.position.z).speed(0.01).prefix("Z: "));
+                                    if self.is_2d {
+                                        faucet.position.z = 0.0;
+                                        ui.label("Pos X,Y:");
+                                        ui.add(egui::DragValue::new(&mut faucet.position.x).speed(0.01).prefix("X: "));
+                                        ui.add(egui::DragValue::new(&mut faucet.position.y).speed(0.01).prefix("Y: "));
+                                    } else {
+                                        ui.label("Pos X,Y,Z:");
+                                        ui.add(egui::DragValue::new(&mut faucet.position.x).speed(0.01).prefix("X: "));
+                                        ui.add(egui::DragValue::new(&mut faucet.position.y).speed(0.01).prefix("Y: "));
+                                        ui.add(egui::DragValue::new(&mut faucet.position.z).speed(0.01).prefix("Z: "));
+                                    }
                                 });
                                 ui.horizontal(|ui| {
-                                    ui.label("Velocity:");
-                                    ui.add(egui::DragValue::new(&mut faucet.direction.x).speed(0.05).prefix("Vx: "));
-                                    ui.add(egui::DragValue::new(&mut faucet.direction.y).speed(0.05).prefix("Vy: "));
-                                    ui.add(egui::DragValue::new(&mut faucet.direction.z).speed(0.05).prefix("Vz: "));
+                                    if self.is_2d {
+                                        faucet.direction.z = 0.0;
+                                        ui.label("Velocity:");
+                                        ui.add(egui::DragValue::new(&mut faucet.direction.x).speed(0.05).prefix("Vx: "));
+                                        ui.add(egui::DragValue::new(&mut faucet.direction.y).speed(0.05).prefix("Vy: "));
+                                    } else {
+                                        ui.label("Velocity:");
+                                        ui.add(egui::DragValue::new(&mut faucet.direction.x).speed(0.05).prefix("Vx: "));
+                                        ui.add(egui::DragValue::new(&mut faucet.direction.y).speed(0.05).prefix("Vy: "));
+                                        ui.add(egui::DragValue::new(&mut faucet.direction.z).speed(0.05).prefix("Vz: "));
+                                    }
                                 });
                                 ui.add(egui::Slider::new(&mut faucet.flow_rate, 50.0..=2500.0).text("Flow Rate (p/s)"));
 
@@ -1158,7 +1231,9 @@ impl eframe::App for LiquidApp {
                                     }
                                     FaucetShape::Rectangle { width, depth } => {
                                         ui.add(egui::Slider::new(width, 0.05..=0.8).text("Weir Width"));
-                                        ui.add(egui::Slider::new(depth, 0.02..=0.3).text("Weir Depth"));
+                                        if !self.is_2d {
+                                            ui.add(egui::Slider::new(depth, 0.02..=0.3).text("Weir Depth"));
+                                        }
                                     }
                                     FaucetShape::Point => {}
                                 }
@@ -1219,17 +1294,29 @@ impl eframe::App for LiquidApp {
                             if drain.enabled {
                                 ui.horizontal(|ui| {
                                     ui.label("Face:");
-                                    for &f in CubeFace::ALL {
+                                    let available_faces: &[CubeFace] = if self.is_2d {
+                                        &[CubeFace::Floor, CubeFace::Ceiling, CubeFace::Left, CubeFace::Right, CubeFace::Custom]
+                                    } else {
+                                        CubeFace::ALL
+                                    };
+                                    for &f in available_faces {
                                         if ui.selectable_label(drain.face == f, f.name()).clicked() {
                                             drain.face = f;
                                         }
                                     }
                                 });
                                 ui.horizontal(|ui| {
-                                    ui.label("Pos X,Y,Z:");
-                                    ui.add(egui::DragValue::new(&mut drain.position.x).speed(0.01).prefix("X: "));
-                                    ui.add(egui::DragValue::new(&mut drain.position.y).speed(0.01).prefix("Y: "));
-                                    ui.add(egui::DragValue::new(&mut drain.position.z).speed(0.01).prefix("Z: "));
+                                    if self.is_2d {
+                                        drain.position.z = 0.0;
+                                        ui.label("Pos X,Y:");
+                                        ui.add(egui::DragValue::new(&mut drain.position.x).speed(0.01).prefix("X: "));
+                                        ui.add(egui::DragValue::new(&mut drain.position.y).speed(0.01).prefix("Y: "));
+                                    } else {
+                                        ui.label("Pos X,Y,Z:");
+                                        ui.add(egui::DragValue::new(&mut drain.position.x).speed(0.01).prefix("X: "));
+                                        ui.add(egui::DragValue::new(&mut drain.position.y).speed(0.01).prefix("Y: "));
+                                        ui.add(egui::DragValue::new(&mut drain.position.z).speed(0.01).prefix("Z: "));
+                                    }
                                 });
                                 ui.add(egui::Slider::new(&mut drain.radius, 0.04..=0.5).text("Aperture Radius"));
                             }

@@ -48,19 +48,19 @@ impl SimulationQuality {
     pub fn name_for(&self, is_2d: bool) -> &'static str {
         match self {
             SimulationQuality::Draft => {
-                if is_2d { "Draft (~2.5k particles)" } else { "Draft (Fast, ~2.5k particles)" }
+                if is_2d { "Draft (Fast, ~300 particles)" } else { "Draft (Fast, ~2.5k particles)" }
             }
             SimulationQuality::Medium => {
-                if is_2d { "Medium (~5.5k particles)" } else { "Medium (Balanced, ~5.5k particles)" }
+                if is_2d { "Medium (Balanced, ~500 particles)" } else { "Medium (Balanced, ~5.5k particles)" }
             }
             SimulationQuality::High => {
-                if is_2d { "High (~18k particles)" } else { "High (Smooth, ~18k particles)" }
+                if is_2d { "High (Smooth, ~1.5k particles)" } else { "High (Smooth, ~18k particles)" }
             }
             SimulationQuality::Ultra => {
-                if is_2d { "Ultra (~50k particles)" } else { "Ultra (High-Res, ~50k particles)" }
+                if is_2d { "Ultra (High-Res, ~4k particles)" } else { "Ultra (High-Res, ~50k particles)" }
             }
             SimulationQuality::Cinematic => {
-                if is_2d { "Cinematic (~120k particles)" } else { "Cinematic (~120k particles)" }
+                if is_2d { "Cinematic (~10k particles)" } else { "Cinematic (~120k particles)" }
             }
             SimulationQuality::Extreme => {
                 if is_2d { "🚀 1M Particles (~1,000,000)" } else { "⚠️ Extreme (1,000,000+ particles, Freeze Warning!)" }
@@ -96,140 +96,94 @@ impl SimulationQuality {
     }
 
     pub fn apply(&self, config: &mut SolverConfig, is_2d: bool) {
-        if is_2d {
-            match self {
-                SimulationQuality::Draft => {
-                    config.particle_radius = 0.010;
-                    config.spacing = 0.015;
-                    config.smoothing_length = 0.026;
-                    config.substeps = 2;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::Medium => {
-                    config.particle_radius = 0.0068;
-                    config.spacing = 0.010;
-                    config.smoothing_length = 0.018;
-                    config.substeps = 2;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::High => {
-                    config.particle_radius = 0.0037;
-                    config.spacing = 0.0055;
-                    config.smoothing_length = 0.010;
-                    config.substeps = 2;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::Ultra => {
-                    config.particle_radius = 0.0022;
-                    config.spacing = 0.0033;
-                    config.smoothing_length = 0.0060;
-                    config.substeps = 3;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::Cinematic => {
-                    config.particle_radius = 0.0014;
-                    config.spacing = 0.0021;
-                    config.smoothing_length = 0.0038;
-                    config.substeps = 3;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::Extreme => {
-                    // 1M in 2D
-                    config.particle_radius = 0.00045;
-                    config.spacing = 0.00075;
-                    config.smoothing_length = 0.00135;
-                    config.substeps = 2;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::TwoMillion => {
-                    // 2M in 2D
-                    config.particle_radius = 0.00032;
-                    config.spacing = 0.00053;
-                    config.smoothing_length = 0.00095;
-                    config.substeps = 2;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::FiveMillion => {
-                    // 5M in 2D
-                    config.particle_radius = 0.00020;
-                    config.spacing = 0.00033;
-                    config.smoothing_length = 0.00060;
-                    config.substeps = 2;
-                    config.solver_iterations = 2;
-                }
-                SimulationQuality::TenMillion => {
-                    // 10M in 2D
-                    config.particle_radius = 0.00014;
-                    config.spacing = 0.00024;
-                    config.smoothing_length = 0.00042;
-                    config.substeps = 2;
-                    config.solver_iterations = 2;
-                }
-                SimulationQuality::TwentyMillion => {
-                    // 20M in 2D
-                    config.particle_radius = 0.00010;
-                    config.spacing = 0.00017;
-                    config.smoothing_length = 0.00030;
-                    config.substeps = 1;
-                    config.solver_iterations = 2;
-                }
-                SimulationQuality::FiftyMillion => {
-                    // 50M in 2D
-                    config.particle_radius = 0.000063;
-                    config.spacing = 0.000105;
-                    config.smoothing_length = 0.00019;
-                    config.substeps = 1;
-                    config.solver_iterations = 2;
-                }
-                SimulationQuality::Custom => {}
+        match self {
+            SimulationQuality::Draft => {
+                config.particle_radius = 0.032;
+                config.spacing = 0.054;
+                config.smoothing_length = 0.095;
+                config.substeps = 2;
+                config.solver_iterations = 3;
             }
+            SimulationQuality::Medium => {
+                config.particle_radius = 0.024;
+                config.spacing = 0.042;
+                config.smoothing_length = 0.075;
+                config.substeps = 2;
+                config.solver_iterations = 3;
+            }
+            SimulationQuality::High => {
+                config.particle_radius = 0.016;
+                config.spacing = 0.028;
+                config.smoothing_length = 0.050;
+                config.substeps = 3;
+                config.solver_iterations = 3;
+            }
+            SimulationQuality::Ultra => {
+                config.particle_radius = 0.012;
+                config.spacing = 0.020;
+                config.smoothing_length = 0.038;
+                config.substeps = 3;
+                config.solver_iterations = 4;
+            }
+            SimulationQuality::Cinematic => {
+                config.particle_radius = 0.009;
+                config.spacing = 0.015;
+                config.smoothing_length = 0.028;
+                config.substeps = 4;
+                config.solver_iterations = 4;
+            }
+            SimulationQuality::Extreme => {
+                config.particle_radius = 0.0042;
+                config.spacing = 0.0070;
+                config.smoothing_length = 0.014;
+                config.substeps = 4;
+                config.solver_iterations = 4;
+            }
+            SimulationQuality::TwoMillion => {
+                // 2M in 2D
+                config.particle_radius = 0.00032;
+                config.spacing = 0.00053;
+                config.smoothing_length = 0.00095;
+                config.substeps = 2;
+                config.solver_iterations = 3;
+            }
+            SimulationQuality::FiveMillion => {
+                // 5M in 2D
+                config.particle_radius = 0.00020;
+                config.spacing = 0.00033;
+                config.smoothing_length = 0.00060;
+                config.substeps = 2;
+                config.solver_iterations = 2;
+            }
+            SimulationQuality::TenMillion => {
+                // 10M in 2D
+                config.particle_radius = 0.00014;
+                config.spacing = 0.00024;
+                config.smoothing_length = 0.00042;
+                config.substeps = 2;
+                config.solver_iterations = 2;
+            }
+            SimulationQuality::TwentyMillion => {
+                // 20M in 2D
+                config.particle_radius = 0.00010;
+                config.spacing = 0.00017;
+                config.smoothing_length = 0.00030;
+                config.substeps = 1;
+                config.solver_iterations = 2;
+            }
+            SimulationQuality::FiftyMillion => {
+                // 50M in 2D
+                config.particle_radius = 0.000063;
+                config.spacing = 0.000105;
+                config.smoothing_length = 0.00019;
+                config.substeps = 1;
+                config.solver_iterations = 2;
+            }
+            SimulationQuality::Custom => {}
+        }
+        if is_2d {
             config.rest_density = compute_lattice_rest_density_2d(config.smoothing_length, config.spacing);
         } else {
-            match self {
-                SimulationQuality::Draft => {
-                    config.particle_radius = 0.032;
-                    config.spacing = 0.054;
-                    config.smoothing_length = 0.095;
-                    config.substeps = 2;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::Medium => {
-                    config.particle_radius = 0.024;
-                    config.spacing = 0.042;
-                    config.smoothing_length = 0.075;
-                    config.substeps = 2;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::High => {
-                    config.particle_radius = 0.016;
-                    config.spacing = 0.028;
-                    config.smoothing_length = 0.050;
-                    config.substeps = 3;
-                    config.solver_iterations = 3;
-                }
-                SimulationQuality::Ultra => {
-                    config.particle_radius = 0.012;
-                    config.spacing = 0.020;
-                    config.smoothing_length = 0.038;
-                    config.substeps = 3;
-                    config.solver_iterations = 4;
-                }
-                SimulationQuality::Cinematic => {
-                    config.particle_radius = 0.009;
-                    config.spacing = 0.015;
-                    config.smoothing_length = 0.028;
-                    config.substeps = 4;
-                    config.solver_iterations = 4;
-                }
-                SimulationQuality::Extreme => {
-                    config.particle_radius = 0.0042;
-                    config.spacing = 0.0070;
-                    config.smoothing_length = 0.014;
-                    config.substeps = 4;
-                    config.solver_iterations = 4;
-                }
-                _ => {}
-            }
             config.rest_density = compute_lattice_rest_density(config.smoothing_length, config.spacing);
         }
     }
@@ -576,8 +530,8 @@ impl SphSolver {
         let dt_ratio = (dt_ref / dt.max(1e-5)).max(1.0);
         let cfm_scale = dt_ratio * dt_ratio;
         let dt_factor = (dt / dt_ref).clamp(0.0001, 1.0);
-        let relaxation_epsilon = 150.0 * cfm_scale;
-        let max_displacement = (h * 0.5).max(radius * 1.5) * dt_factor;
+        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
+        let max_displacement = (radius * 0.45).max(h * 0.25) * dt_factor;
 
         // 4. PBF Incompressibility Solver Iterations
         for _ in 0..self.config.solver_iterations {

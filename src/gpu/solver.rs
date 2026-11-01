@@ -335,14 +335,14 @@ impl GpuSphSolver {
         let max_cells = 8_000_000u64; // Max 32MB grid heads buffer
         let mut dim_x = ((size.x / cell_size).ceil() as u64).max(1);
         let mut dim_y = ((size.y / cell_size).ceil() as u64).max(1);
-        let mut dim_z = if is_2d { 1 } else { ((size.z / cell_size).ceil() as u64).max(1) };
+        let mut dim_z = ((size.z / cell_size).ceil() as u64).max(1);
         if dim_x * dim_y * dim_z > max_cells {
             let exponent = if is_2d { 0.5 } else { 0.3333333 };
             let scale = ((dim_x * dim_y * dim_z) as f64 / max_cells as f64).powf(exponent);
             cell_size *= scale as f32;
             dim_x = ((size.x / cell_size).ceil() as u64).max(1);
             dim_y = ((size.y / cell_size).ceil() as u64).max(1);
-            dim_z = if is_2d { 1 } else { ((size.z / cell_size).ceil() as u64).max(1) };
+            dim_z = ((size.z / cell_size).ceil() as u64).max(1);
         }
         self.cell_size = cell_size;
         self.grid_dim = [dim_x as u32, dim_y as u32, dim_z as u32];
@@ -570,8 +570,8 @@ impl GpuSphSolver {
         let dt_ratio = (dt_ref / sub_dt.max(1e-5)).max(1.0);
         let cfm_scale = dt_ratio * dt_ratio;
         let dt_factor = (sub_dt / dt_ref).clamp(0.0001, 1.0);
-        let relaxation_epsilon = 300.0 * cfm_scale;
-        let max_displacement = (h * 0.45).max(config.particle_radius * 1.5) * dt_factor;
+        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
+        let max_displacement = (config.particle_radius * 0.45).max(h * 0.25) * dt_factor;
 
         let uniforms = GpuUniforms {
             bounds_min: [bounds.min.x, bounds.min.y, bounds.min.z, self.cell_size],

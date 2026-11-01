@@ -1629,31 +1629,28 @@ impl eframe::App for LiquidApp {
                 if let Ok(mut guard) = renderer_arc.lock() {
                     if let Some(ref mut renderer) = *guard {
                         let gl = painter.gl();
-                        let ppi = info.pixels_per_point;
-                        let vp_x = (rect.min.x * ppi) as i32;
-                        let vp_y = (info.screen_size_px[1] as f32 - rect.max.y * ppi) as i32;
-                        let vp_w = (rect.width() * ppi) as i32;
-                        let vp_h = (rect.height() * ppi) as i32;
+                        let vp = info.viewport_in_pixels();
+                        if vp.width_px > 0 && vp.height_px > 0 {
+                            unsafe {
+                                gl.viewport(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
+                            }
 
-                        unsafe {
-                            gl.viewport(vp_x, vp_y, vp_w, vp_h);
+                            renderer.render(
+                                gl,
+                                view_proj,
+                                [vp.width_px as f32, vp.height_px as f32],
+                                particle_radius,
+                                fov_y,
+                                &particles_data,
+                                lit_spheres,
+                                &chamber,
+                                bounds,
+                                &colliders,
+                                &faucets,
+                                &drains,
+                                is_2d,
+                            );
                         }
-
-                        renderer.render(
-                            gl,
-                            view_proj,
-                            [rect.width() * ppi, rect.height() * ppi],
-                            particle_radius,
-                            fov_y,
-                            &particles_data,
-                            lit_spheres,
-                            &chamber,
-                            bounds,
-                            &colliders,
-                            &faucets,
-                            &drains,
-                            is_2d,
-                        );
                     }
                 }
             });

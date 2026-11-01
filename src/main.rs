@@ -880,6 +880,7 @@ fn run_gui(
             .with_min_inner_size([800.0, 500.0])
             .with_title(window_title),
         renderer: eframe::Renderer::Glow,
+        depth_buffer: 24,
         ..Default::default()
     };
 

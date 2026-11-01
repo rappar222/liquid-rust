@@ -177,9 +177,18 @@ void main() {
         is_2d: bool,
     ) {
         unsafe {
-            gl.enable(glow::DEPTH_TEST);
-            gl.depth_func(glow::LEQUAL);
-            gl.depth_mask(true);
+            if is_2d {
+                gl.disable(glow::DEPTH_TEST);
+                gl.depth_mask(false);
+            } else {
+                gl.enable(glow::DEPTH_TEST);
+                gl.depth_func(glow::LEQUAL);
+                gl.depth_mask(true);
+                // Clear depth buffer for this frame's 3D geometry so previous frames' depth is not stale
+                gl.disable(glow::SCISSOR_TEST);
+                gl.clear(glow::DEPTH_BUFFER_BIT);
+                gl.enable(glow::SCISSOR_TEST);
+            }
             gl.disable(glow::BLEND);
             gl.enable(glow::PROGRAM_POINT_SIZE);
 
@@ -310,6 +319,12 @@ void main() {
             gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.use_program(None);
+
+            // Clean up OpenGL state for egui
+            gl.disable(glow::DEPTH_TEST);
+            gl.depth_mask(true);
+            gl.disable(glow::PROGRAM_POINT_SIZE);
+            gl.enable(glow::BLEND);
         }
     }
 

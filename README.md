@@ -88,20 +88,54 @@ Or download the latest release bundle from [GitHub Releases](https://github.com/
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Installation & Quick Start
 
-### Prerequisites
+### 📦 APT (Ubuntu / Debian / Linux Mint / Pop!_OS)
+
+#### Option 1: Native APT Repository
+Add the repository to receive automatic updates via `apt upgrade`:
+```bash
+curl -fsSL https://rappar222.github.io/liquid-rust/setup-apt.sh | sudo bash
+sudo apt update
+sudo apt install liquid-rust
+```
+
+#### Option 2: Download `.deb` Package
+```bash
+curl -LO https://github.com/rappar222/liquid-rust/releases/latest/download/liquid-rust_0.2.4_amd64.deb
+sudo apt install ./liquid-rust_0.2.4_amd64.deb
+```
+
+---
+
+### 🚀 Portable AppImage (Runs on ANY Linux Distro)
+No installation required:
+```bash
+curl -LO https://github.com/rappar222/liquid-rust/releases/latest/download/liquid-rust-x86_64.AppImage
+chmod +x liquid-rust-x86_64.AppImage
+./liquid-rust-x86_64.AppImage
+```
+
+---
+
+### 🏹 Arch Linux (AUR)
+Ready-to-use `PKGBUILD` scripts are provided in [`packaging/aur/`](packaging/aur/):
+```bash
+# Clone the binary package or build from source
+cd packaging/aur/liquid-rust-bin
+makepkg -si
+```
+
+---
+
+### 🦀 Build from Source (Cargo)
 
 Ensure you have Rust and Cargo installed (1.75+):
-
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### Installation & Launch
-
 Clone the repository and run in release mode for maximum simulation performance:
-
 ```bash
 git clone https://github.com/rappar222/liquid-rust.git
 cd liquid-rust

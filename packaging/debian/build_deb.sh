@@ -12,16 +12,10 @@ BUILD_DIR="$(mktemp -d /tmp/liquid-rust-deb.XXXXXX)"
 
 echo "Building Debian package for liquid-rust v${VERSION} (${ARCH})..."
 
-# Prefer universally compatible static musl binary if present
-BIN_SRC="$ROOT_DIR/target/x86_64-unknown-linux-musl/release/liquid-rust"
+# Prefer glibc 2.17 zigbuild binary for maximum compatibility across all Linux distros
+BIN_SRC="$ROOT_DIR/target/x86_64-unknown-linux-gnu/release/liquid-rust"
 if [ ! -f "$BIN_SRC" ]; then
     BIN_SRC="$ROOT_DIR/target/release/liquid-rust"
-fi
-
-if [ ! -f "$BIN_SRC" ]; then
-    echo "Compiling release binary..."
-    cargo build --release --target x86_64-unknown-linux-musl --manifest-path "$ROOT_DIR/Cargo.toml" || \
-    cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml"
 fi
 
 # Create directory structure
@@ -47,7 +41,7 @@ Section: science
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: Radu <rappar2018@gmail.com>
-Depends: libvulkan1, libx11-6, libxcursor1, libxi6, libxrandr2, libxkbcommon0
+Depends: libvulkan1, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrandr2, libxkbcommon0, libxkbcommon-x11-0
 Homepage: https://github.com/rappar222/liquid-rust
 Description: High-performance 2D/3D SPH fluid simulator in Rust
  Real-time GPU-accelerated fluid mechanics sandbox with interactive colliders,

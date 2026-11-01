@@ -12,9 +12,15 @@ BUILD_DIR="$(mktemp -d /tmp/liquid-rust-deb.XXXXXX)"
 
 echo "Building Debian package for liquid-rust v${VERSION} (${ARCH})..."
 
-# Ensure release binary is compiled
-if [ ! -f "$ROOT_DIR/target/release/liquid-rust" ]; then
+# Prefer universally compatible static musl binary if present
+BIN_SRC="$ROOT_DIR/target/x86_64-unknown-linux-musl/release/liquid-rust"
+if [ ! -f "$BIN_SRC" ]; then
+    BIN_SRC="$ROOT_DIR/target/release/liquid-rust"
+fi
+
+if [ ! -f "$BIN_SRC" ]; then
     echo "Compiling release binary..."
+    cargo build --release --target x86_64-unknown-linux-musl --manifest-path "$ROOT_DIR/Cargo.toml" || \
     cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml"
 fi
 
@@ -26,7 +32,7 @@ mkdir -p "$BUILD_DIR/usr/share/icons/hicolor/scalable/apps"
 mkdir -p "$BUILD_DIR/usr/share/doc/liquid-rust"
 
 # Copy binary & assets
-install -m 755 "$ROOT_DIR/target/release/liquid-rust" "$BUILD_DIR/usr/bin/liquid-rust"
+install -m 755 "$BIN_SRC" "$BUILD_DIR/usr/bin/liquid-rust"
 install -m 644 "$ROOT_DIR/assets/desktop/liquid-rust.desktop" "$BUILD_DIR/usr/share/applications/"
 install -m 644 "$ROOT_DIR/assets/desktop/liquid-rust-2d.desktop" "$BUILD_DIR/usr/share/applications/"
 install -m 644 "$ROOT_DIR/assets/icons/liquid-rust.svg" "$BUILD_DIR/usr/share/icons/hicolor/scalable/apps/"

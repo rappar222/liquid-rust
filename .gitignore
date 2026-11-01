@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+exports/
+*.ply
+*.mp4
+dist/
+.DS_Store
+renders/

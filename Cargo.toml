@@ -1,0 +1,21 @@
+[package]
+name = "liquid-rust"
+version = "0.2.4"
+edition = "2021"
+authors = ["Radu <rappar222>"]
+description = "High-performance 3D SPH Fluid Simulation in Rust with real-time visualization and PLY export"
+license = "MIT"
+repository = "https://github.com/rappar222/liquid-rust"
+
+[dependencies]
+glam = { version = "0.30", features = ["bytemuck"] }
+rayon = "1.10"
+bytemuck = { version = "1.20", features = ["derive"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_glow = "0.31"
+glow = "0.16"
+clap = { version = "4.5", features = ["derive"] }
+instant = "0.1"
+wgpu = "24.0"
+pollster = "0.4"
+ctrlc = "3.4"

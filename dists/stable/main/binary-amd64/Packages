@@ -1,0 +1,14 @@
+Package: liquid-rust
+Version: 0.2.4
+Architecture: amd64
+Maintainer: Radu <rappar2018@gmail.com>
+Depends: libvulkan1, libx11-6, libxcursor1, libxi6, libxrandr2, libxkbcommon0
+Filename: pool/main/l/liquid-rust/liquid-rust_0.2.4_amd64.deb
+Size: 5909836
+SHA256: e93ede4673975b5e6c0ff95c603dac6b69a5300f4a8ac92f7eddd64cc93e76de
+Section: science
+Priority: optional
+Homepage: https://github.com/rappar222/liquid-rust
+Description: High-performance 2D/3D SPH fluid simulator in Rust
+ Real-time GPU-accelerated fluid mechanics sandbox with interactive colliders,
+ faucets, drains, and PLY/MP4 export.

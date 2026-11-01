@@ -5,7 +5,7 @@ Codename: stable
 Architectures: amd64
 Components: main
 Description: liquid-rust APT repository
-Date: Sun, 01 Nov 2026 10:58:10 UTC
+Date: Sun, 01 Nov 2026 11:03:19 UTC
 SHA256:
- ea2c8be9c284731faa2214e9f90bfd1d84570b087ae506b8a656831572ce8ac1 591 main/binary-amd64/Packages
- df3e93d105c0a41fab69dc0d41d91e1bbc132d74e6f360966067b016c1513f5a 433 main/binary-amd64/Packages.gz
+ 06d80df6021eaff306fc97a053824d98269c60dc609e3c428a28d08534c1703b 591 main/binary-amd64/Packages
+ 2b150c41b1f3477ab9834d1202d3f82561e969ad4fc19c5cef46c9908fd61064 434 main/binary-amd64/Packages.gz

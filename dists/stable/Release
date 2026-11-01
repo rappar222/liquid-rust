@@ -2,13 +2,13 @@ Origin: Liquid Rust Repository
 Label: liquid-rust
 Suite: stable
 Codename: stable
-Date: Sun, 01 Nov 2026 11:06:08 +0000
+Date: Sun, 01 Nov 2026 13:51:55 +0000
 Architectures: amd64
 Components: main
 Description: Liquid Rust APT Repository
 MD5Sum:
- a7456394f40fca9373d23e1a1f944d75 665 main/binary-amd64/Packages
- 58bbee49e0a9a6ef22ca53684ae8e836 472 main/binary-amd64/Packages.gz
+ c93ea73e2cfb1522d09a0a1e4227acd4 665 main/binary-amd64/Packages
+ aa48b13adefd20876379af6a54b20640 470 main/binary-amd64/Packages.gz
 SHA256:
- e2e1a01d6cd198e143af920d2331a51c6036cf95e7f493dbc2db965f1a0d8ceb 665 main/binary-amd64/Packages
- bdb4a25166e421743a1482bbd487a682f7d5dc0cb6eeb955833c92932cd766ed 472 main/binary-amd64/Packages.gz
+ 30c0fcc1ff49e8d8b34ed6ed21558351b3e3883f92914a68fc6637224f2d08a7 665 main/binary-amd64/Packages
+ 229ff0dadd0ecca9ca345c8a6e2a21d1dc4bbf7ae659058dc376c1957e4597e0 470 main/binary-amd64/Packages.gz

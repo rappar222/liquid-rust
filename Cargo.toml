@@ -19,3 +19,31 @@ instant = "0.1"
 wgpu = "24.0"
 pollster = "0.4"
 ctrlc = "3.4"
+
+[package.metadata.generate-rpm]
+name = "liquid-rust"
+summary = "High-performance 2D/3D SPH fluid simulator in Rust"
+license = "MIT"
+auto-req = "disabled"
+assets = [
+    { source = "target/release/liquid-rust", dest = "/usr/bin/liquid-rust", mode = "755" },
+    { source = "assets/desktop/liquid-rust.desktop", dest = "/usr/share/applications/liquid-rust.desktop", mode = "644" },
+    { source = "assets/desktop/liquid-rust-2d.desktop", dest = "/usr/share/applications/liquid-rust-2d.desktop", mode = "644" },
+    { source = "assets/icons/liquid-rust.svg", dest = "/usr/share/icons/hicolor/scalable/apps/liquid-rust.svg", mode = "644" },
+    { source = "assets/icons/liquid-rust-2d.svg", dest = "/usr/share/icons/hicolor/scalable/apps/liquid-rust-2d.svg", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/doc/liquid-rust/copyright", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+vulkan-loader = "*"
+libX11 = "*"
+libX11-xcb = "*"
+libXcursor = "*"
+libXi = "*"
+libXrandr = "*"
+libxkbcommon = "*"
+libxkbcommon-x11 = "*"
+
+[package.metadata.generate-rpm.recommends]
+mesa-vulkan-drivers = "*"
+

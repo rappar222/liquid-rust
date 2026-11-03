@@ -250,7 +250,11 @@ fn compute_density_lambda(@builtin(global_invocation_id) id: vec3<u32>) {
     var grad_ci = vec3<f32>(0.0);
     var sum_grad_sq = 0.0;
     
-    for (var dz = -1; dz <= 1; dz++) {
+    let is_2d = (uniforms.counts.w & 0x80000000u) != 0u;
+    let z_min = select(-1, 0, is_2d);
+    let z_max = select(1, 0, is_2d);
+    
+    for (var dz = z_min; dz <= z_max; dz++) {
         let cz = cell.z + dz;
         if (cz < 0 || cz >= i32(dim.z)) { continue; }
         for (var dy = -1; dy <= 1; dy++) {
@@ -327,7 +331,11 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
     
     var delta = vec3<f32>(0.0);
     
-    for (var dz = -1; dz <= 1; dz++) {
+    let is_2d = (uniforms.counts.w & 0x80000000u) != 0u;
+    let z_min = select(-1, 0, is_2d);
+    let z_max = select(1, 0, is_2d);
+    
+    for (var dz = z_min; dz <= z_max; dz++) {
         let cz = cell.z + dz;
         if (cz < 0 || cz >= i32(dim.z)) { continue; }
         for (var dy = -1; dy <= 1; dy++) {
@@ -615,7 +623,11 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
         var sum_v_diff = vec3<f32>(0.0);
         var sum_weights = 0.0;
         
-        for (var dz = -1; dz <= 1; dz++) {
+        let is_2d = (uniforms.counts.w & 0x80000000u) != 0u;
+        let z_min = select(-1, 0, is_2d);
+        let z_max = select(1, 0, is_2d);
+        
+        for (var dz = z_min; dz <= z_max; dz++) {
             let cz = cell.z + dz;
             if (cz < 0 || cz >= i32(dim.z)) { continue; }
             for (var dy = -1; dy <= 1; dy++) {

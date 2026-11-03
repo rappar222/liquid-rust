@@ -7,7 +7,7 @@ use crate::sph::scene::{SceneGenerator, ScenePreset};
 use crate::sph::solver::{compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver};
 use eframe::egui;
 use glam::Vec3;
-use glow::HasContext as _;
+use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1573,12 +1573,12 @@ impl eframe::App for LiquidApp {
                 }
             }
 
-            // Prepare vertex data with optional view frustum culling
+            // Prepare vertex data with optional view frustum culling (parallelized with Rayon)
             let enable_culling = self.enable_culling;
-            let particles_data: Vec<ParticleVertex> = self
+            let mut particles_data: Vec<ParticleVertex> = self
                 .solver
                 .particles
-                .iter()
+                .par_iter()
                 .filter(|p| {
                     if !enable_culling {
                         return true;
@@ -1613,6 +1613,21 @@ impl eframe::App for LiquidApp {
                 })
                 .collect();
 
+            // In 3D mode, sort particles back-to-front (far to near) relative to camera eye.
+            // This provides a secondary occlusion defense alongside hardware FBO 24-bit depth testing!
+            if !is_2d && particles_data.len() > 1 {
+                let camera_pos = self.camera.eye_position();
+                particles_data.par_sort_unstable_by(|a, b| {
+                    let da = (a.pos[0] - camera_pos.x).powi(2)
+                        + (a.pos[1] - camera_pos.y).powi(2)
+                        + (a.pos[2] - camera_pos.z).powi(2);
+                    let db = (b.pos[0] - camera_pos.x).powi(2)
+                        + (b.pos[1] - camera_pos.y).powi(2)
+                        + (b.pos[2] - camera_pos.z).powi(2);
+                    db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+
             self.drawn_particles_count = particles_data.len();
 
             let renderer_arc = self.renderer.clone();
@@ -1631,14 +1646,11 @@ impl eframe::App for LiquidApp {
                         let gl = painter.gl();
                         let vp = info.viewport_in_pixels();
                         if vp.width_px > 0 && vp.height_px > 0 {
-                            unsafe {
-                                gl.viewport(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
-                            }
-
                             renderer.render(
                                 gl,
                                 view,
                                 proj,
+                                [vp.left_px, vp.from_bottom_px],
                                 [vp.width_px as f32, vp.height_px as f32],
                                 particle_radius,
                                 fov_y,

@@ -26,6 +26,10 @@ pub struct GlRenderer {
     particle_vbo: NativeBuffer,
     line_vao: NativeVertexArray,
     line_vbo: NativeBuffer,
+    fbo: Option<NativeFramebuffer>,
+    color_rbo: Option<NativeRenderbuffer>,
+    depth_rbo: Option<NativeRenderbuffer>,
+    fbo_size: [i32; 2],
 }
 
 impl GlRenderer {
@@ -170,6 +174,10 @@ void main() {
                 particle_vbo,
                 line_vao,
                 line_vbo,
+                fbo: None,
+                color_rbo: None,
+                depth_rbo: None,
+                fbo_size: [0, 0],
             })
         }
     }
@@ -180,6 +188,7 @@ void main() {
         gl: &Arc<glow::Context>,
         view: Mat4,
         proj: Mat4,
+        viewport_pos: [i32; 2],
         viewport_size: [f32; 2],
         particle_radius: f32,
         fov_y: f32,
@@ -192,20 +201,96 @@ void main() {
         drains: &[Drain],
         is_2d: bool,
     ) {
+        let w = (viewport_size[0] as i32).max(1);
+        let h = (viewport_size[1] as i32).max(1);
+        let vp_x = viewport_pos[0];
+        let vp_y = viewport_pos[1];
+
         unsafe {
-            if is_2d {
-                gl.disable(glow::DEPTH_TEST);
-                gl.depth_mask(false);
-            } else {
-                gl.enable(glow::DEPTH_TEST);
-                gl.depth_func(glow::LEQUAL);
-                gl.depth_mask(true);
-                gl.clear_depth_f32(1.0);
-                // Clear depth buffer for this frame's 3D geometry so previous frames' depth is not stale
-                gl.disable(glow::SCISSOR_TEST);
-                gl.clear(glow::DEPTH_BUFFER_BIT);
-                gl.enable(glow::SCISSOR_TEST);
+            // 1. Maintain dedicated offscreen FBO with guaranteed 24-bit depth renderbuffer
+            if self.fbo.is_none() || self.fbo_size != [w, h] {
+                if let Some(f) = self.fbo {
+                    gl.delete_framebuffer(f);
+                }
+                if let Some(c) = self.color_rbo {
+                    gl.delete_renderbuffer(c);
+                }
+                if let Some(d) = self.depth_rbo {
+                    gl.delete_renderbuffer(d);
+                }
+
+                if let (Ok(new_fbo), Ok(new_color), Ok(new_depth)) = (
+                    gl.create_framebuffer(),
+                    gl.create_renderbuffer(),
+                    gl.create_renderbuffer(),
+                ) {
+                    gl.bind_renderbuffer(glow::RENDERBUFFER, Some(new_color));
+                    gl.renderbuffer_storage(glow::RENDERBUFFER, glow::RGBA8, w, h);
+
+                    gl.bind_renderbuffer(glow::RENDERBUFFER, Some(new_depth));
+                    gl.renderbuffer_storage(glow::RENDERBUFFER, glow::DEPTH_COMPONENT24, w, h);
+                    gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(new_fbo));
+                    gl.framebuffer_renderbuffer(
+                        glow::FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::RENDERBUFFER,
+                        Some(new_color),
+                    );
+                    gl.framebuffer_renderbuffer(
+                        glow::FRAMEBUFFER,
+                        glow::DEPTH_ATTACHMENT,
+                        glow::RENDERBUFFER,
+                        Some(new_depth),
+                    );
+
+                    self.fbo = Some(new_fbo);
+                    self.color_rbo = Some(new_color);
+                    self.depth_rbo = Some(new_depth);
+                    self.fbo_size = [w, h];
+                }
             }
+
+            // Save previous framebuffer binding
+            let prev_draw_fbo_id = gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) as u32;
+            let prev_draw_fbo = std::num::NonZeroU32::new(prev_draw_fbo_id).map(glow::NativeFramebuffer);
+
+            if let Some(fbo) = self.fbo {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.viewport(0, 0, w, h);
+
+                // Deep viewport background matching egui theme (12, 14, 20)
+                gl.clear_color(12.0 / 255.0, 14.0 / 255.0, 20.0 / 255.0, 1.0);
+                gl.clear_depth_f32(1.0);
+                gl.disable(glow::SCISSOR_TEST);
+
+                if is_2d {
+                    gl.disable(glow::DEPTH_TEST);
+                    gl.depth_mask(false);
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+                } else {
+                    gl.enable(glow::DEPTH_TEST);
+                    gl.depth_func(glow::LEQUAL);
+                    gl.depth_mask(true);
+                    gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+                }
+            } else {
+                gl.viewport(vp_x, vp_y, w, h);
+                if is_2d {
+                    gl.disable(glow::DEPTH_TEST);
+                    gl.depth_mask(false);
+                } else {
+                    gl.enable(glow::DEPTH_TEST);
+                    gl.depth_func(glow::LEQUAL);
+                    gl.depth_mask(true);
+                    gl.clear_depth_f32(1.0);
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.clear(glow::DEPTH_BUFFER_BIT);
+                    gl.enable(glow::SCISSOR_TEST);
+                }
+            }
+
             gl.disable(glow::BLEND);
             gl.enable(glow::PROGRAM_POINT_SIZE);
 
@@ -343,7 +428,22 @@ void main() {
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.use_program(None);
 
+            if let Some(fbo) = self.fbo {
+                // Blit offscreen FBO directly to egui's target framebuffer
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, prev_draw_fbo);
+                gl.enable(glow::SCISSOR_TEST);
+                gl.scissor(vp_x, vp_y, w, h);
+                gl.blit_framebuffer(
+                    0, 0, w, h,
+                    vp_x, vp_y, vp_x + w, vp_y + h,
+                    glow::COLOR_BUFFER_BIT,
+                    glow::NEAREST,
+                );
+            }
+
             // Clean up OpenGL state for egui
+            gl.bind_framebuffer(glow::FRAMEBUFFER, prev_draw_fbo);
             gl.disable(glow::DEPTH_TEST);
             gl.depth_mask(true);
             gl.disable(glow::PROGRAM_POINT_SIZE);
@@ -613,8 +713,17 @@ void main() {
         }
     }
 
-    pub fn destroy(&self, gl: &Arc<glow::Context>) {
+    pub fn destroy(&mut self, gl: &Arc<glow::Context>) {
         unsafe {
+            if let Some(f) = self.fbo.take() {
+                gl.delete_framebuffer(f);
+            }
+            if let Some(c) = self.color_rbo.take() {
+                gl.delete_renderbuffer(c);
+            }
+            if let Some(d) = self.depth_rbo.take() {
+                gl.delete_renderbuffer(d);
+            }
             gl.delete_program(self.particle_program);
             gl.delete_program(self.line_program);
             gl.delete_vertex_array(self.particle_vao);

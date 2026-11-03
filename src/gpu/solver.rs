@@ -5,6 +5,7 @@ use crate::sph::solver::SolverConfig;
 use glam::Vec3;
 use std::f32::consts::PI;
 use std::sync::Arc;
+use rayon::prelude::*;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -738,7 +739,7 @@ impl GpuSphSolver {
             let gpu_slice: &[GpuParticle] = bytemuck::cast_slice(&data[..]);
 
             out.resize(self.particle_count, Particle::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0));
-            for (i, p) in out.iter_mut().enumerate() {
+            out.par_iter_mut().enumerate().for_each(|(i, p)| {
                 let gp = &gpu_slice[i];
                 p.position = Vec3::new(gp.pos_type[0], gp.pos_type[1], gp.pos_type[2]);
                 p.velocity = Vec3::new(gp.vel_dens[0], gp.vel_dens[1], gp.vel_dens[2]);
@@ -749,7 +750,7 @@ impl GpuSphSolver {
                 } else {
                     ParticleType::Fluid
                 };
-            }
+            });
             drop(data);
             r_buf.unmap();
         }

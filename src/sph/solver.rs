@@ -144,15 +144,15 @@ impl SimulationQuality {
                 config.particle_radius = 0.00032;
                 config.spacing = 0.00053;
                 config.smoothing_length = 0.00095;
-                config.substeps = 2;
-                config.solver_iterations = 3;
+                config.substeps = 1;
+                config.solver_iterations = 2;
             }
             SimulationQuality::FiveMillion => {
                 // 5M in 2D
                 config.particle_radius = 0.00020;
                 config.spacing = 0.00033;
                 config.smoothing_length = 0.00060;
-                config.substeps = 2;
+                config.substeps = 1;
                 config.solver_iterations = 2;
             }
             SimulationQuality::TenMillion => {
@@ -160,7 +160,7 @@ impl SimulationQuality {
                 config.particle_radius = 0.00014;
                 config.spacing = 0.00024;
                 config.smoothing_length = 0.00042;
-                config.substeps = 2;
+                config.substeps = 1;
                 config.solver_iterations = 2;
             }
             SimulationQuality::TwentyMillion => {

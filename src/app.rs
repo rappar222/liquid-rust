@@ -7,6 +7,7 @@ use crate::sph::scene::{SceneGenerator, ScenePreset};
 use crate::sph::solver::{compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver};
 use eframe::egui;
 use glam::Vec3;
+use glow::HasContext as _;
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1603,11 +1604,14 @@ impl eframe::App for LiquidApp {
                         let gl = painter.gl();
                         let vp = info.viewport_in_pixels();
                         if vp.width_px > 0 && vp.height_px > 0 {
+                            unsafe {
+                                gl.viewport(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
+                            }
+
                             renderer.render(
                                 gl,
                                 view,
                                 proj,
-                                [vp.left_px, vp.from_bottom_px],
                                 [vp.width_px as f32, vp.height_px as f32],
                                 particle_radius,
                                 fov_y,
@@ -1620,6 +1624,11 @@ impl eframe::App for LiquidApp {
                                 &drains,
                                 is_2d,
                             );
+
+                            // Restore full window viewport for egui UI
+                            unsafe {
+                                gl.viewport(0, 0, info.screen_size_px[0] as i32, info.screen_size_px[1] as i32);
+                            }
                         }
                     }
                 }

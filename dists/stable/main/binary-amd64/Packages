@@ -4,9 +4,9 @@ Architecture: amd64
 Maintainer: Radu <rappar2018@gmail.com>
 Depends: libvulkan1, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrandr2, libxkbcommon0, libxkbcommon-x11-0
 Filename: pool/main/l/liquid-rust/liquid-rust_0.2.4_amd64.deb
-Size: 5272288
-MD5sum: 99926af581d7e356cb32e2d8a5aeceb6
-SHA256: 8e17f2dacef8da730167de4cf75abd22589913d39e4a93a79402f5adaec3eef0
+Size: 5272812
+MD5sum: 91bf587e2e46ef4eba53eea700b85149
+SHA256: 5c3e5c124ba046f14ba2c260eff1ea45a849843fc569af3b6c88c853f7377ae7
 Section: science
 Priority: optional
 Homepage: https://github.com/rappar222/liquid-rust

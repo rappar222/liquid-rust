@@ -47,7 +47,7 @@ impl Camera {
     }
 
     pub fn projection_matrix(&self, aspect: f32) -> Mat4 {
-        Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far)
+        Mat4::perspective_rh_gl(self.fov_y, aspect, self.near, self.far)
     }
 
     pub fn view_projection(&self, aspect: f32) -> Mat4 {

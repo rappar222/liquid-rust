@@ -36,18 +36,21 @@ impl GlRenderer {
 layout (location = 0) in vec3 a_pos;
 layout (location = 1) in vec4 a_color;
 
-uniform mat4 u_view_proj;
+uniform mat4 u_view;
+uniform mat4 u_proj;
 uniform float u_point_radius;
 uniform float u_viewport_height;
 uniform float u_tan_half_fov;
 
 out vec4 v_color;
+out vec3 v_pos_eye;
 
 void main() {
     v_color = a_color;
-    vec4 clip_pos = u_view_proj * vec4(a_pos, 1.0);
-    gl_Position = clip_pos;
-    float dist = max(clip_pos.w, 0.001);
+    vec4 eye_pos = u_view * vec4(a_pos, 1.0);
+    v_pos_eye = eye_pos.xyz;
+    gl_Position = u_proj * eye_pos;
+    float dist = max(-eye_pos.z, 0.001);
     float size_px = (u_point_radius / (dist * u_tan_half_fov)) * u_viewport_height;
     gl_PointSize = clamp(size_px, 2.0, 128.0);
 }
@@ -55,8 +58,13 @@ void main() {
 
             let p_fs_src = r#"#version 330 core
 in vec4 v_color;
+in vec3 v_pos_eye;
+
+uniform mat4 u_proj;
+uniform float u_point_radius;
 uniform vec3 u_light_dir;
 uniform int u_lit_spheres;
+uniform int u_is_2d;
 
 out vec4 FragColor;
 
@@ -67,10 +75,17 @@ void main() {
         discard;
     }
 
-    if (u_lit_spheres != 0) {
-        float z = sqrt(1.0 - r2);
-        vec3 normal = vec3(coord.x, -coord.y, z);
+    float z = sqrt(max(1.0 - r2, 0.0));
+    vec3 normal = vec3(coord.x, -coord.y, z);
 
+    if (u_is_2d == 0) {
+        // True 3D spherical depth calculation in eye space
+        vec3 sphere_pos_eye = v_pos_eye + vec3(coord.x * u_point_radius, -coord.y * u_point_radius, z * u_point_radius);
+        vec4 clip_pos = u_proj * vec4(sphere_pos_eye, 1.0);
+        gl_FragDepth = clamp(((clip_pos.z / clip_pos.w) + 1.0) * 0.5, 0.0, 1.0);
+    }
+
+    if (u_lit_spheres != 0) {
         float diff = max(dot(normal, u_light_dir), 0.0);
         vec3 half_dir = normalize(u_light_dir + vec3(0.0, 0.0, 1.0));
         float spec = pow(max(dot(normal, half_dir), 0.0), 32.0);
@@ -163,7 +178,8 @@ void main() {
     pub fn render(
         &mut self,
         gl: &Arc<glow::Context>,
-        view_proj: Mat4,
+        view: Mat4,
+        proj: Mat4,
         viewport_size: [f32; 2],
         particle_radius: f32,
         fov_y: f32,
@@ -184,6 +200,7 @@ void main() {
                 gl.enable(glow::DEPTH_TEST);
                 gl.depth_func(glow::LEQUAL);
                 gl.depth_mask(true);
+                gl.clear_depth_f32(1.0);
                 // Clear depth buffer for this frame's 3D geometry so previous frames' depth is not stale
                 gl.disable(glow::SCISSOR_TEST);
                 gl.clear(glow::DEPTH_BUFFER_BIT);
@@ -191,6 +208,8 @@ void main() {
             }
             gl.disable(glow::BLEND);
             gl.enable(glow::PROGRAM_POINT_SIZE);
+
+            let view_proj = proj * view;
 
             // 1. Draw Chamber, Colliders, Faucets, and Drains
             let mut line_vertices = Vec::new();
@@ -287,16 +306,19 @@ void main() {
             if !particles_data.is_empty() {
                 gl.use_program(Some(self.particle_program));
 
-                let u_vp = gl.get_uniform_location(self.particle_program, "u_view_proj");
+                let u_view = gl.get_uniform_location(self.particle_program, "u_view");
+                let u_proj = gl.get_uniform_location(self.particle_program, "u_proj");
                 let u_pr = gl.get_uniform_location(self.particle_program, "u_point_radius");
                 let u_vh = gl.get_uniform_location(self.particle_program, "u_viewport_height");
                 let u_tf = gl.get_uniform_location(self.particle_program, "u_tan_half_fov");
                 let u_ld = gl.get_uniform_location(self.particle_program, "u_light_dir");
                 let u_lit = gl.get_uniform_location(self.particle_program, "u_lit_spheres");
+                let u_is_2d = gl.get_uniform_location(self.particle_program, "u_is_2d");
 
                 let tan_half_fov = (fov_y * 0.5).tan();
 
-                gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
+                gl.uniform_matrix_4_f32_slice(u_view.as_ref(), false, &view.to_cols_array());
+                gl.uniform_matrix_4_f32_slice(u_proj.as_ref(), false, &proj.to_cols_array());
                 gl.uniform_1_f32(u_pr.as_ref(), particle_radius);
                 gl.uniform_1_f32(u_vh.as_ref(), viewport_size[1]);
                 gl.uniform_1_f32(u_tf.as_ref(), tan_half_fov);
@@ -304,6 +326,7 @@ void main() {
                 let light_dir = Vec3::new(0.4, 0.8, 0.5).normalize();
                 gl.uniform_3_f32(u_ld.as_ref(), light_dir.x, light_dir.y, light_dir.z);
                 gl.uniform_1_i32(u_lit.as_ref(), if lit_spheres { 1 } else { 0 });
+                gl.uniform_1_i32(u_is_2d.as_ref(), if is_2d { 1 } else { 0 });
 
                 gl.bind_vertex_array(Some(self.particle_vao));
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.particle_vbo));

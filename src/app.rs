@@ -134,7 +134,7 @@ impl LiquidApp {
             drawn_particles_count: 0,
             color_mode: ColorMode::Velocity,
             color_map: ColorMapType::Ocean,
-            display_size_factor: 1.0,
+            display_size_factor: 1.25,
             sphere_obstacle_pos: Vec3::new(0.0, 0.45, 0.0),
             sphere_obstacle_radius: 0.22,
             sphere_obstacle_enabled: false,
@@ -185,7 +185,7 @@ impl LiquidApp {
             drawn_particles_count: 0,
             color_mode: ColorMode::Velocity,
             color_map: ColorMapType::Ocean,
-            display_size_factor: 1.0,
+            display_size_factor: 1.25,
             sphere_obstacle_pos: Vec3::new(0.0, 0.45, 0.0),
             sphere_obstacle_radius: 0.22,
             sphere_obstacle_enabled: false,
@@ -1637,7 +1637,8 @@ impl eframe::App for LiquidApp {
 
                             renderer.render(
                                 gl,
-                                view_proj,
+                                view,
+                                proj,
                                 [vp.width_px as f32, vp.height_px as f32],
                                 particle_radius,
                                 fov_y,

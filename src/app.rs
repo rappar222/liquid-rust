@@ -73,7 +73,6 @@ pub struct LiquidApp {
     pub exported_frames_count: usize,
     pub status_message: String,
     pub show_extreme_modal: bool,
-    pub pending_mega_modal: Option<SimulationQuality>,
     pub obj_file_path: String,
     pub next_collider_id: u32,
     pub next_faucet_id: u32,
@@ -147,7 +146,6 @@ impl LiquidApp {
             exported_frames_count: 0,
             status_message: "Ready".to_string(),
             show_extreme_modal: false,
-            pending_mega_modal: None,
             obj_file_path: "model.obj".to_string(),
             next_collider_id: 1,
             next_faucet_id: 1,
@@ -198,7 +196,6 @@ impl LiquidApp {
             exported_frames_count: 0,
             status_message: "Ready".to_string(),
             show_extreme_modal: false,
-            pending_mega_modal: None,
             obj_file_path: "model.obj".to_string(),
             next_collider_id: 1,
             next_faucet_id: 1,
@@ -334,12 +331,7 @@ impl LiquidApp {
             SimulationQuality::High => Some("high"),
             SimulationQuality::Ultra => Some("ultra"),
             SimulationQuality::Cinematic => Some("cinematic"),
-            SimulationQuality::Extreme => Some("1m"),
-            SimulationQuality::TwoMillion => Some("2m"),
-            SimulationQuality::FiveMillion => Some("5m"),
-            SimulationQuality::TenMillion => Some("10m"),
-            SimulationQuality::TwentyMillion => Some("20m"),
-            SimulationQuality::FiftyMillion => Some("50m"),
+            SimulationQuality::Extreme => Some("extreme"),
             SimulationQuality::Custom => None,
         };
         if let Some(q) = quality_slug {
@@ -754,41 +746,6 @@ impl eframe::App for LiquidApp {
                                 } else {
                                     self.set_quality(q);
                                 }
-                            }
-                        }
-
-                        // In 2D mode: Dropdown with modes in range 2M to 50M
-                        if self.is_2d {
-                            ui.separator();
-                            ui.label("🚀 High-Density 2D Modes (2M - 50M):");
-                            let mega_selected_text = match self.current_quality {
-                                SimulationQuality::TwoMillion
-                                | SimulationQuality::FiveMillion
-                                | SimulationQuality::TenMillion
-                                | SimulationQuality::TwentyMillion
-                                | SimulationQuality::FiftyMillion => self.current_quality.name_for(true),
-                                _ => "Select 2M - 50M Mode...",
-                            };
-                            egui::ComboBox::from_id_salt("mega_2d_quality_combo")
-                                .selected_text(mega_selected_text)
-                                .show_ui(ui, |ui| {
-                                    for &q in SimulationQuality::ALL_2D_MEGA {
-                                        let is_sel = self.current_quality == q;
-                                        if ui.selectable_label(is_sel, q.name_for(true)).clicked() {
-                                            if q.is_over_10m() && !is_sel {
-                                                self.pending_mega_modal = Some(q);
-                                            } else {
-                                                self.set_quality(q);
-                                            }
-                                        }
-                                    }
-                                });
-
-                            if self.current_quality.is_over_10m() {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(255, 170, 0),
-                                    "⚠️ Warning: >10M particle mode active (High VRAM load)",
-                                );
                             }
                         }
 
@@ -1719,58 +1676,6 @@ impl eframe::App for LiquidApp {
                             if ui.add(proceed_btn).clicked() {
                                 self.show_extreme_modal = false;
                                 self.set_quality(SimulationQuality::Extreme);
-                            }
-                        });
-                    });
-                });
-        }
-
-        // 5. Mega Quality (>10M Particles) Confirmation Modal
-        if let Some(target_q) = self.pending_mega_modal {
-            egui::Window::new("⚠️ Warning: Massive Simulation Quality (>10M)")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.set_max_width(480.0);
-                    ui.add_space(4.0);
-                    ui.vertical_centered(|ui| {
-                        ui.heading("⚠️ Massive High-Density Workload (>10M)");
-                    });
-                    ui.add_space(8.0);
-                    let target_name = target_q.name_for(true);
-                    ui.label(format!(
-                        "You are about to switch to {}, simulating tens of millions of fluid particles in 2D space.",
-                        target_name
-                    ));
-                    ui.add_space(6.0);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 120, 40),
-                        "⚡ Extreme GPU Compute & VRAM Warning:",
-                    );
-                    ui.label(
-                        "• Computing over 10M particles requires substantial GPU video memory (VRAM).\n\
-                        • Your desktop environment and display compositor may experience brief lag or frame drops.\n\
-                        • A dedicated Vulkan-capable GPU with ample VRAM is required for smooth operation."
-                    );
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("❌ Cancel (Keep Current Quality)").clicked() {
-                            self.pending_mega_modal = None;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let proceed_btn = egui::Button::new(
-                                egui::RichText::new("⚠️ I Understand, Proceed")
-                                    .color(egui::Color32::BLACK)
-                                    .strong(),
-                            )
-                            .fill(egui::Color32::from_rgb(255, 170, 0));
-
-                            if ui.add(proceed_btn).clicked() {
-                                self.pending_mega_modal = None;
-                                self.set_quality(target_q);
                             }
                         });
                     });

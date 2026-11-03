@@ -15,11 +15,6 @@ pub enum SimulationQuality {
     Ultra,
     Cinematic,
     Extreme,
-    TwoMillion,
-    FiveMillion,
-    TenMillion,
-    TwentyMillion,
-    FiftyMillion,
     Custom,
 }
 
@@ -31,14 +26,6 @@ impl SimulationQuality {
         SimulationQuality::Ultra,
         SimulationQuality::Cinematic,
         SimulationQuality::Extreme,
-    ];
-
-    pub const ALL_2D_MEGA: &'static [SimulationQuality] = &[
-        SimulationQuality::TwoMillion,
-        SimulationQuality::FiveMillion,
-        SimulationQuality::TenMillion,
-        SimulationQuality::TwentyMillion,
-        SimulationQuality::FiftyMillion,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -63,19 +50,10 @@ impl SimulationQuality {
                 if is_2d { "Cinematic (~10k particles)" } else { "Cinematic (~120k particles)" }
             }
             SimulationQuality::Extreme => {
-                if is_2d { "🚀 1M Particles (~1,000,000)" } else { "⚠️ Extreme (1,000,000+ particles, Freeze Warning!)" }
+                if is_2d { "Extreme (~30k particles)" } else { "⚠️ Extreme (1,000,000+ particles, Freeze Warning!)" }
             }
-            SimulationQuality::TwoMillion => "⚡ 2M Particles (~2,000,000)",
-            SimulationQuality::FiveMillion => "⚡ 5M Particles (~5,000,000)",
-            SimulationQuality::TenMillion => "🔥 10M Particles (~10,000,000)",
-            SimulationQuality::TwentyMillion => "⚠️ 20M Particles (~20,000,000) [VRAM Heavy]",
-            SimulationQuality::FiftyMillion => "⚠️ 💥 50M Particles (~50,000,000) [Extreme Load]",
             SimulationQuality::Custom => "Custom",
         }
-    }
-
-    pub fn is_over_10m(&self) -> bool {
-        matches!(self, SimulationQuality::TwentyMillion | SimulationQuality::FiftyMillion)
     }
 
     pub fn slug(&self) -> &'static str {
@@ -85,12 +63,7 @@ impl SimulationQuality {
             SimulationQuality::High => "high",
             SimulationQuality::Ultra => "ultra",
             SimulationQuality::Cinematic => "cinematic",
-            SimulationQuality::Extreme => "1m",
-            SimulationQuality::TwoMillion => "2m",
-            SimulationQuality::FiveMillion => "5m",
-            SimulationQuality::TenMillion => "10m",
-            SimulationQuality::TwentyMillion => "20m",
-            SimulationQuality::FiftyMillion => "50m",
+            SimulationQuality::Extreme => "extreme",
             SimulationQuality::Custom => "custom",
         }
     }
@@ -138,46 +111,6 @@ impl SimulationQuality {
                 config.smoothing_length = 0.014;
                 config.substeps = 4;
                 config.solver_iterations = 4;
-            }
-            SimulationQuality::TwoMillion => {
-                // 2M in 2D
-                config.particle_radius = 0.00032;
-                config.spacing = 0.00053;
-                config.smoothing_length = 0.00095;
-                config.substeps = 1;
-                config.solver_iterations = 2;
-            }
-            SimulationQuality::FiveMillion => {
-                // 5M in 2D
-                config.particle_radius = 0.00020;
-                config.spacing = 0.00033;
-                config.smoothing_length = 0.00060;
-                config.substeps = 1;
-                config.solver_iterations = 2;
-            }
-            SimulationQuality::TenMillion => {
-                // 10M in 2D
-                config.particle_radius = 0.00014;
-                config.spacing = 0.00024;
-                config.smoothing_length = 0.00042;
-                config.substeps = 1;
-                config.solver_iterations = 2;
-            }
-            SimulationQuality::TwentyMillion => {
-                // 20M in 2D
-                config.particle_radius = 0.00010;
-                config.spacing = 0.00017;
-                config.smoothing_length = 0.00030;
-                config.substeps = 1;
-                config.solver_iterations = 2;
-            }
-            SimulationQuality::FiftyMillion => {
-                // 50M in 2D
-                config.particle_radius = 0.000063;
-                config.spacing = 0.000105;
-                config.smoothing_length = 0.00019;
-                config.substeps = 1;
-                config.solver_iterations = 2;
             }
             SimulationQuality::Custom => {}
         }

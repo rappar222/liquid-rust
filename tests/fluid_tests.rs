@@ -663,49 +663,27 @@ fn test_2d_simulation_planar_physics() {
 }
 
 #[test]
-fn test_2d_mega_resolutions_and_cli() {
+fn test_2d_quality_resolutions_and_cli() {
     use liquid_rust::app::LiquidApp;
     use liquid_rust::sph::SimulationQuality;
 
     let mut app = LiquidApp::new_headless();
     app.set_2d(true);
 
-    // In 2D mode, 1M / Extreme should NOT trigger modal warning
+    // In 2D mode, Extreme should NOT trigger 3D extreme warning modal
     assert!(!app.show_extreme_modal);
     app.set_quality(SimulationQuality::Extreme);
     assert!(!app.show_extreme_modal);
     assert_eq!(app.current_quality, SimulationQuality::Extreme);
-    assert!(app.generate_cli_command().contains("--quality 1m"));
+    assert!(app.generate_cli_command().contains("--quality extreme"));
 
-    // Check 2M - 50M modes
-    app.set_quality(SimulationQuality::TwoMillion);
-    assert_eq!(app.current_quality, SimulationQuality::TwoMillion);
-    assert!(app.generate_cli_command().contains("--quality 2m"));
+    app.set_quality(SimulationQuality::Draft);
+    assert_eq!(app.current_quality, SimulationQuality::Draft);
+    assert!(app.generate_cli_command().contains("--quality draft"));
 
-    app.set_quality(SimulationQuality::FiveMillion);
-    assert_eq!(app.current_quality, SimulationQuality::FiveMillion);
-    assert!(app.generate_cli_command().contains("--quality 5m"));
-
-    app.set_quality(SimulationQuality::TenMillion);
-    assert_eq!(app.current_quality, SimulationQuality::TenMillion);
-    assert!(app.generate_cli_command().contains("--quality 10m"));
-
-    app.set_quality(SimulationQuality::TwentyMillion);
-    assert_eq!(app.current_quality, SimulationQuality::TwentyMillion);
-    assert!(app.generate_cli_command().contains("--quality 20m"));
-
-    app.set_quality(SimulationQuality::FiftyMillion);
-    assert_eq!(app.current_quality, SimulationQuality::FiftyMillion);
-    assert!(app.generate_cli_command().contains("--quality 50m"));
-
-    // Check >10M warnings identification
-    assert!(!SimulationQuality::Draft.is_over_10m());
-    assert!(!SimulationQuality::Extreme.is_over_10m());
-    assert!(!SimulationQuality::TwoMillion.is_over_10m());
-    assert!(!SimulationQuality::FiveMillion.is_over_10m());
-    assert!(!SimulationQuality::TenMillion.is_over_10m());
-    assert!(SimulationQuality::TwentyMillion.is_over_10m());
-    assert!(SimulationQuality::FiftyMillion.is_over_10m());
+    app.set_quality(SimulationQuality::Cinematic);
+    assert_eq!(app.current_quality, SimulationQuality::Cinematic);
+    assert!(app.generate_cli_command().contains("--quality cinematic"));
 }
 
 #[test]

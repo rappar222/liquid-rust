@@ -171,11 +171,6 @@ fn parse_quality(name: &str) -> SimulationQuality {
         "ultra" | "realistic" => SimulationQuality::Ultra,
         "cinematic" | "vfx" => SimulationQuality::Cinematic,
         "extreme" | "1m" | "insane" => SimulationQuality::Extreme,
-        "2m" => SimulationQuality::TwoMillion,
-        "5m" => SimulationQuality::FiveMillion,
-        "10m" => SimulationQuality::TenMillion,
-        "20m" => SimulationQuality::TwentyMillion,
-        "50m" => SimulationQuality::FiftyMillion,
         _ => {
             eprintln!("Unknown quality '{}', defaulting to 'medium'", name);
             SimulationQuality::Medium
@@ -565,9 +560,6 @@ fn run_headless(
     println!("=== liquid-rust headless mode ===");
     println!("Preset: {:?}", preset);
     println!("Quality: {} ({:?})", quality.name_for(args.mode_2d), quality);
-    if quality.is_over_10m() {
-        eprintln!("⚠️  WARNING: Quality '{}' creates >10 million particles. High GPU VRAM and compute capacity required!", quality.slug());
-    }
     if args.speed != 1.0 {
         println!("Speed multiplier: {:.2}x", args.speed);
     }

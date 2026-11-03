@@ -1,14 +1,15 @@
-Origin: Liquid Rust Repository
-Label: liquid-rust
+Origin: Liquid-Rust Repository
+Label: Liquid-Rust
 Suite: stable
 Codename: stable
-Date: Tue, 03 Nov 2026 09:12:47 +0000
+Version: 1.0
 Architectures: amd64
 Components: main
-Description: Liquid Rust APT Repository
+Description: Official APT repository for liquid-rust fluid simulation engine
+Date: Tue, 03 Nov 2026 10:05:15 UTC
 MD5Sum:
- 573a7e5728b59ba9e80098c98048d796 665 main/binary-amd64/Packages
- a08d1dd49a35ac5a74ddf95d2b4fde67 471 main/binary-amd64/Packages.gz
+ 580bafabfc9aec1162f064965f85a4f7 712 main/binary-amd64/Packages
+ f1678575d421074c28a6baed70eeefd2 499 main/binary-amd64/Packages.gz
 SHA256:
- 5c7ef4a65a388502bc09b01f64b522a5a644849347994fe53492324f4cf48979 665 main/binary-amd64/Packages
- 89bf8927d86d08cdcd6608653c8d7073b82cf432f02d2b0386c5bb5b7623fe47 471 main/binary-amd64/Packages.gz
+ 2aa15e6c28d03d0d61f3699a29668d820c1f555342523c77cdcc67974ef1a457 712 main/binary-amd64/Packages
+ 175d1f84d3c786443c2c180e6cee23769a58cde337f161a335a4e6064dc326c8 499 main/binary-amd64/Packages.gz

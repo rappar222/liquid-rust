@@ -10,7 +10,7 @@ Description: High-performance 2D/3D SPH fluid simulator in Rust
  Real-time GPU-accelerated fluid mechanics sandbox with interactive colliders,
  faucets, drains, and PLY/MP4 export.
 Filename: pool/main/l/liquid-rust/liquid-rust_0.2.4_amd64.deb
-Size: 5283760
-MD5sum: b769572c1ad48868aa5afd8f83f5f9d3
-SHA1: e7a9a88983faf28bd4780e46bd6873f85bd6904f
-SHA256: 790d55696fba6c4d2662f3b5f5e1ffd0e61f74e775a6fdaaf7db52a6fde7015b
+Size: 5279468
+MD5sum: 443144d4b91386e52bb677b7eab587ee
+SHA1: ffe0ff838d89bf3c9014e9d7ca7681019e88f782
+SHA256: 1d5079805a6f9b3548ce260dc6a601743f5ea053feb7ef36b6efa7fefbd43c20

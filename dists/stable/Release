@@ -6,10 +6,10 @@ Version: 1.0
 Architectures: amd64
 Components: main
 Description: Official APT repository for liquid-rust fluid simulation engine
-Date: Tue, 03 Nov 2026 10:11:24 UTC
+Date: Tue, 03 Nov 2026 10:44:15 UTC
 MD5Sum:
- 9fe667bc33070feba4121a392bde0c47 712 main/binary-amd64/Packages
- 92d25226cee623150a292c9c6e1cb534 503 main/binary-amd64/Packages.gz
+ 0e15aa8079573e33d31771141cd30df3 712 main/binary-amd64/Packages
+ 36a88523e63e200b7a7c5163865f3195 502 main/binary-amd64/Packages.gz
 SHA256:
- 06fb14fb997ed5c27fd2e349f3d78613cb0f82c3692ac4b0f95a4faec4b48636 712 main/binary-amd64/Packages
- c637e32431717621c8a97e3577a8f45fde225932ebb76a43b0000787a7a744f5 503 main/binary-amd64/Packages.gz
+ 9d828627dcf46170332d955ef1a8f5e7d4c359578780c5905467a00fd23b0712 712 main/binary-amd64/Packages
+ e5d57f63f0cac4455c6bc6569fbe877d9ffe4626af64fb909d772de90cfc8541 502 main/binary-amd64/Packages.gz

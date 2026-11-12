@@ -1,4 +1,4 @@
-# LiquidRust Studio — Android Mobile Edition (`.apk`)
+# Liquid Rust Studio — Android Mobile Edition (`.apk`)
 
 Ultra-optimized real-time **Position-Based Fluids (PBF)** simulator built specifically for Android mobile GPUs (**Qualcomm Adreno**, **ARM Mali**, **Samsung Xclipse / RDNA**, **Imagination PowerVR**) with zero external library bloat.
 

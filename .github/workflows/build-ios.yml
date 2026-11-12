@@ -1,0 +1,61 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'ios/LiquidRust/**'
+      - 'ios/project.yml'
+      - '.github/workflows/build-ios.yml'
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+
+      - name: Generate Xcode Project & Build Release arm64 App
+        working-directory: ios
+        run: |
+          xcodegen generate
+          xcodebuild \
+            -project LiquidRust.xcodeproj \
+            -scheme LiquidRust \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            build
+
+      - name: Ad-Hoc Pseudo-Sign & Package Payload into liquid-rust-ios.ipa
+        working-directory: ios
+        run: |
+          APP_DIR="build/Build/Products/Release-iphoneos/LiquidRust.app"
+          codesign --force --deep --sign - "$APP_DIR"
+          rm -rf Payload dist
+          mkdir -p Payload dist
+          cp -R "$APP_DIR" Payload/LiquidRust.app
+          zip -qry dist/liquid-rust-ios.ipa Payload
+          ls -lh dist/liquid-rust-ios.ipa
+
+      - name: Upload compiled IPA and Xcode project artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: liquid-rust-ios-bundle
+          path: |
+            ios/dist/liquid-rust-ios.ipa
+            ios/LiquidRust.xcodeproj/**
+          if-no-files-found: error

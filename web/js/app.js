@@ -13,6 +13,7 @@ const RELEASE_LATEST = 'https://github.com/rappar222/liquid-rust/releases/latest
 const RELEASE_DL = `${RELEASE_LATEST}/download`;
 const RELEASE_V024_DL = 'https://github.com/rappar222/liquid-rust/releases/download/v0.2.4';
 const ANDROID_APK_URL = 'https://github.com/rappar222/liquid-rust/raw/main/android/dist/liquid-rust-android.apk';
+const IOS_IPA_URL = 'https://github.com/rappar222/liquid-rust/raw/main/ios/dist/liquid-rust-ios.ipa';
 
 const MATERIAL_PRESETS = {
     water:   { shallow: '#38bdf8', deep: '#0c3b8a', ior: 1.333, roughness: 0.045, specular: 1.35, refraction: 0.42, metallic: 0.00, foam: 0.35 },
@@ -595,14 +596,14 @@ class LiquidApp {
                 { label: 'macOS ARM64', href: `${RELEASE_DL}/liquid-rust-macos-arm64.tar.gz` },
             ];
         } else if (isIos) {
-            osLabel = 'iOS / iPadOS';
-            primaryLabel = '⬇ Desktop & Android Releases';
-            primaryHref = RELEASE_LATEST;
-            headerLabel = '⬇ Releases';
+            osLabel = 'iOS / iPadOS 16.4+';
+            primaryLabel = '⬇ Download iOS (.ipa)';
+            primaryHref = IOS_IPA_URL;
+            headerLabel = '⬇ iOS IPA';
             alts = [
                 { label: 'Android .apk', href: ANDROID_APK_URL },
-                { label: 'Windows .zip', href: `${RELEASE_DL}/liquid-rust-windows-x86_64.zip` },
                 { label: 'macOS ARM64', href: `${RELEASE_DL}/liquid-rust-macos-arm64.tar.gz` },
+                { label: 'Windows .zip', href: `${RELEASE_DL}/liquid-rust-windows-x86_64.zip` },
             ];
         } else if (p.includes('win')) {
             osLabel = 'Windows x86_64';

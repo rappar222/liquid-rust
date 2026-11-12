@@ -22,10 +22,10 @@ targets:
       - path: LiquidRust/Sources
       - path: LiquidRust/Shaders
       - path: LiquidRust/Assets.xcassets
-    info:
-      path: LiquidRust/Info.plist
     settings:
       base:
+        INFOPLIST_FILE: LiquidRust/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
         PRODUCT_BUNDLE_IDENTIFIER: com.liquidrust.ios
         PRODUCT_NAME: LiquidRust
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

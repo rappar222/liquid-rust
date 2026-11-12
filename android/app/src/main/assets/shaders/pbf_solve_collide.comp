@@ -1,0 +1,183 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std140, binding = 0) uniform SimUniforms {
+    vec4 u_bounds_min;
+    vec4 u_bounds_max;
+    vec4 u_gravity_dt;
+    ivec4 u_grid_dim;
+    vec4 u_touch_orig;
+    vec4 u_touch_dir;
+    vec4 u_obstacle;     // xyz: sphere pos, w: sphere radius
+    vec4 u_kernel;       // x: h, y: h2, z: inv_rho0, w: rho0
+    vec4 u_factors;      // x: poly6, y: spiky, z: w_q, w: tensile_k
+    vec4 u_solver;       // x: eps, y: max_disp, z: restitution, w: friction
+    vec4 u_fluid;        // x: viscosity, y: st_coeff, z: max_vel, w: obs_enabled
+    ivec4 u_counts;      // x: particle_count, y: is_2d
+    vec4 u_extra;        // x: vorticity, y: spacing, z: cfm_scale, w: self_density
+};
+
+layout(std430, binding = 0) readonly buffer PredLambdaBuf {
+    vec4 pred_in[];      // xyz: predicted pos, w: lambda
+};
+
+layout(std430, binding = 1) readonly buffer PosBuf {
+    vec4 pos_buf[];      // xyz: old_pos, w: density
+};
+
+layout(std430, binding = 2) readonly buffer GridBuf {
+    uint grid_data[];
+};
+
+layout(std430, binding = 3) writeonly buffer PredOutBuf {
+    vec4 pred_out[];     // xyz: new_predicted_pos, w: density
+};
+
+float poly6(float r2, float h2, float poly6_factor) {
+    if (r2 < h2 && r2 >= 0.0) {
+        float diff = h2 - r2;
+        return poly6_factor * diff * diff * diff;
+    }
+    return 0.0;
+}
+
+vec3 spiky_grad(vec3 r_vec, float r, float h, float spiky_factor) {
+    if (r < h && r > 1e-6) {
+        float diff = h - r;
+        return r_vec * (-spiky_factor * diff * diff / r);
+    }
+    return vec3(0.0);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_counts.x)) {
+        return;
+    }
+
+    vec4 pi = pred_in[i];
+    vec3 pos_i = pi.xyz;
+    float lambda_i = pi.w;
+    float rho_i = pos_buf[i].w;
+
+    float h = u_kernel.x;
+    float h2 = u_kernel.y;
+    float inv_rho0 = u_kernel.z;
+    float rho0 = u_kernel.w;
+    float poly6_factor = u_factors.x;
+    float spiky_factor = u_factors.y;
+    float w_q = u_factors.z;
+    float tensile_k = u_factors.w;
+    float max_disp = u_solver.y;
+    float st_coeff = u_fluid.y;
+    float spacing = u_extra.y;
+    float cfm_scale = u_extra.z;
+
+    float cell_size = u_bounds_min.w;
+    ivec3 dim = u_grid_dim.xyz;
+    uint total_cells = uint(u_grid_dim.w);
+    bool is_2d = (u_counts.y != 0);
+
+    ivec3 cell = clamp(
+        ivec3(floor((pos_i - u_bounds_min.xyz) / cell_size)),
+        ivec3(0),
+        dim - ivec3(1)
+    );
+
+    vec3 delta = vec3(0.0);
+    int z_min = is_2d ? 0 : -1;
+    int z_max = is_2d ? 0 : 1;
+
+    for (int dz = z_min; dz <= z_max; dz++) {
+        int cz = cell.z + dz;
+        if (cz < 0 || cz >= dim.z) continue;
+        for (int dy = -1; dy <= 1; dy++) {
+            int cy = cell.y + dy;
+            if (cy < 0 || cy >= dim.y) continue;
+            for (int dx = -1; dx <= 1; dx++) {
+                int cx = cell.x + dx;
+                if (cx < 0 || cx >= dim.x) continue;
+
+                uint c_idx = uint(cx + cy * dim.x + cz * (dim.x * dim.y));
+                uint curr = grid_data[c_idx];
+                int guard = 0;
+                while (curr != 0u && guard < 192) {
+                    uint j = curr - 1u;
+                    curr = grid_data[total_cells + j];
+                    guard++;
+
+                    if (i != j) {
+                        vec4 pj = pred_in[j];
+                        vec3 r_vec = pos_i - pj.xyz;
+                        float r2 = dot(r_vec, r_vec);
+
+                        if (r2 < h2 && r2 > 1e-12) {
+                            float r = sqrt(r2);
+                            float lambda_sum = lambda_i + pj.w;
+
+                            float s_corr = 0.0;
+                            if (lambda_sum < -1e-6 && r > spacing * 0.80) {
+                                float ratio = min(poly6(r2, h2, poly6_factor) / w_q, 1.5);
+                                float r4 = ratio * ratio * ratio * ratio;
+                                s_corr = (-tensile_k * r4 * h2) / cfm_scale;
+                            }
+
+                            vec3 grad_w = spiky_grad(r_vec, r, h, spiky_factor);
+                            delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
+
+                            // Akinci bell-spline free-surface cohesion
+                            if (st_coeff > 0.0 && r > spacing * 0.48) {
+                                float q = r / h;
+                                float omq = 1.0 - q;
+                                float spline = (q * q * q) * (omq * omq * omq) * 64.0;
+                                float rho_j = pos_buf[j].w;
+                                float k_ij = (2.0 * rho0) / max(rho_i + rho_j, rho0 * 0.5);
+                                delta -= (r_vec / r) * (st_coeff * k_ij * spline);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    float d_len = length(delta);
+    if (d_len > max_disp && d_len > 1e-7) {
+        delta *= (max_disp / d_len);
+    }
+
+    vec3 pos = pos_i + delta * 0.65;
+    float radius = u_bounds_max.w;
+
+    // Chamber projection
+    vec3 b_min_eff = u_bounds_min.xyz + vec3(radius, radius, is_2d ? 0.0 : radius);
+    vec3 b_max_eff = u_bounds_max.xyz - vec3(radius, radius, is_2d ? 0.0 : radius);
+    pos = clamp(pos, b_min_eff, b_max_eff);
+
+    // Sphere collider projection
+    if (u_fluid.w > 0.5) {
+        vec3 obs_pos = u_obstacle.xyz;
+        if (is_2d) {
+            obs_pos.z = 0.0;
+        }
+        float min_d = u_obstacle.w + radius;
+        vec3 to_p = pos - obs_pos;
+        if (is_2d) {
+            to_p.z = 0.0;
+        }
+        float dist = length(to_p);
+        if (dist < min_d && dist > 1e-5) {
+            pos = obs_pos + (to_p / dist) * min_d;
+            pos = clamp(pos, b_min_eff, b_max_eff);
+        }
+    }
+
+    if (is_2d) {
+        pos.z = 0.0;
+    }
+
+    pred_out[i] = vec4(pos, rho_i);
+}

@@ -1,0 +1,20 @@
+services:
+  liquid-rust-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: liquid-rust-web:latest
+    container_name: liquid-rust-web
+    restart: unless-stopped
+    ports:
+      - "${PORT:-24352}:80"
+    volumes:
+      - ./:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "description=LiquidRust WebGL 3D/2D Fluid Dynamics Simulator"

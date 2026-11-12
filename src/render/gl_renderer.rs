@@ -1,4 +1,5 @@
 use crate::math::Aabb;
+use crate::render::surface_mesh::{MeshVertex, SurfaceMesh, SurfaceMeshConfig};
 use crate::sph::collider::{Collider, ColliderShape};
 use crate::sph::faucet::{CubeFace, Drain, Faucet, FaucetShape};
 use bytemuck::{Pod, Zeroable};
@@ -22,16 +23,22 @@ pub struct LineVertex {
 pub struct GlRenderer {
     particle_program: NativeProgram,
     line_program: NativeProgram,
+    mesh_program: NativeProgram,
     particle_vao: NativeVertexArray,
     particle_vbo: NativeBuffer,
     line_vao: NativeVertexArray,
     line_vbo: NativeBuffer,
+    mesh_vao: NativeVertexArray,
+    mesh_vbo: NativeBuffer,
+    mesh_ibo: NativeBuffer,
+    line_scratch: Vec<LineVertex>,
+    floor_scratch: Vec<LineVertex>,
 }
 
 impl GlRenderer {
     pub fn new(gl: &Arc<glow::Context>) -> Result<Self, String> {
         unsafe {
-            // 1. Compile particle shader
+            // 1. Compile glossy wet particle shader
             let p_vs_src = r#"#version 330 core
 layout (location = 0) in vec3 a_pos;
 layout (location = 1) in vec4 a_color;
@@ -79,7 +86,6 @@ void main() {
     vec3 normal = vec3(coord.x, -coord.y, z);
 
     if (u_is_2d == 0) {
-        // True 3D spherical depth calculation in eye space
         vec3 sphere_pos_eye = v_pos_eye + vec3(coord.x * u_point_radius, -coord.y * u_point_radius, z * u_point_radius);
         vec4 clip_pos = u_proj * vec4(sphere_pos_eye, 1.0);
         gl_FragDepth = clamp(((clip_pos.z / clip_pos.w) + 1.0) * 0.5, 0.0, 1.0);
@@ -87,10 +93,13 @@ void main() {
 
     if (u_lit_spheres != 0) {
         float diff = max(dot(normal, u_light_dir), 0.0);
-        vec3 half_dir = normalize(u_light_dir + vec3(0.0, 0.0, 1.0));
-        float spec = pow(max(dot(normal, half_dir), 0.0), 32.0);
+        vec3 view_dir = vec3(0.0, 0.0, 1.0);
+        vec3 half_dir = normalize(u_light_dir + view_dir);
+        float spec = pow(max(dot(normal, half_dir), 0.0), 48.0);
+        float fresnel = pow(1.0 - max(normal.z, 0.0), 3.2);
+        vec3 rim_sky = vec3(0.35, 0.68, 0.96) * fresnel * 0.28;
 
-        vec3 rgb = v_color.rgb * (0.45 + 0.55 * diff) + vec3(0.35) * spec;
+        vec3 rgb = v_color.rgb * (0.42 + 0.58 * diff) + vec3(0.45, 0.48, 0.52) * spec + rim_sky;
         FragColor = vec4(rgb, 1.0);
     } else {
         FragColor = vec4(v_color.rgb, 1.0);
@@ -121,7 +130,254 @@ void main() {
 
             let line_program = create_shader_program(gl, l_vs_src, l_fs_src)?;
 
-            // 3. Create Particle VAO & VBO
+            // 3. Compile physically-based 3D Surface Mesh shader
+            let m_vs_src = r#"#version 330 core
+layout (location = 0) in vec3 a_pos;
+layout (location = 1) in vec3 a_normal;
+layout (location = 2) in vec2 a_speed_foam;
+
+uniform mat4 u_view_proj;
+
+out vec3 v_world_pos;
+out vec3 v_normal;
+out float v_speed;
+out float v_foam;
+
+void main() {
+    v_world_pos = a_pos;
+    v_normal = a_normal;
+    v_speed = a_speed_foam.x;
+    v_foam = a_speed_foam.y;
+    gl_Position = u_view_proj * vec4(a_pos, 1.0);
+}
+"#;
+
+            let m_fs_src = r#"#version 330 core
+in vec3 v_world_pos;
+in vec3 v_normal;
+in float v_speed;
+in float v_foam;
+
+uniform vec3 u_eye_pos;
+uniform vec3 u_shallow_color;
+uniform vec3 u_deep_color;
+uniform vec4 u_mat_params;   // x: opacity, y: absorption, z: foam_intensity, w: metallic
+uniform vec4 u_light_params; // x: ior, y: roughness, z: specular_intensity, w: sss
+uniform vec4 u_env_params;   // x: env_reflection, y: refraction_strength, z: light_intensity, w: ambient_intensity
+uniform vec3 u_light_dir;
+uniform vec4 u_tex_params;   // x: mode (int), y: scale, z: strength, w: time
+uniform int u_backface_pass;
+
+out vec4 FragColor;
+
+vec3 hash3(ivec3 p) {
+    uvec3 q = uvec3(p) * uvec3(1597334677u, 3812015801u, 2798796415u);
+    uint n = (q.x ^ q.y ^ q.z) * 0x27d4eb2du;
+    float r1 = float(n & 0xFFFFu) / 65535.0;
+    n = ((n >> 11u) | (n << 21u)) * 0x165667b1u;
+    float r2 = float(n & 0xFFFFu) / 65535.0;
+    n = ((n >> 13u) | (n << 19u)) * 0x27d4eb2du;
+    float r3 = float(n & 0xFFFFu) / 65535.0;
+    return vec3(r1, r2, r3);
+}
+
+float value_noise(vec3 p) {
+    ivec3 i = ivec3(floor(p));
+    vec3 f = fract(p);
+    vec3 u = f * f * (3.0 - 2.0 * f);
+    float c000 = hash3(i + ivec3(0,0,0)).x;
+    float c100 = hash3(i + ivec3(1,0,0)).x;
+    float c010 = hash3(i + ivec3(0,1,0)).x;
+    float c110 = hash3(i + ivec3(1,1,0)).x;
+    float c001 = hash3(i + ivec3(0,0,1)).x;
+    float c101 = hash3(i + ivec3(1,0,1)).x;
+    float c011 = hash3(i + ivec3(0,1,1)).x;
+    float c111 = hash3(i + ivec3(1,1,1)).x;
+    float x00 = mix(c000, c100, u.x);
+    float x10 = mix(c010, c110, u.x);
+    float x01 = mix(c001, c101, u.x);
+    float x11 = mix(c011, c111, u.x);
+    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
+float fbm(vec3 p) {
+    float s = 0.0;
+    float a = 0.5;
+    for (int k = 0; k < 4; k++) {
+        s += a * value_noise(p);
+        p *= 2.03;
+        a *= 0.5;
+    }
+    return s;
+}
+
+float voronoi_ridge(vec3 p) {
+    ivec3 b = ivec3(floor(p));
+    vec3 f = fract(p);
+    float d1 = 8.0;
+    float d2 = 8.0;
+    for (int dz = -1; dz <= 1; dz++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                ivec3 o = ivec3(dx, dy, dz);
+                vec3 r = vec3(o) + hash3(b + o) - f;
+                float d = dot(r, r);
+                if (d < d1) { d2 = d1; d1 = d; }
+                else if (d < d2) { d2 = d; }
+            }
+        }
+    }
+    return 1.0 - clamp((sqrt(d2) - sqrt(d1)) * 2.2, 0.0, 1.0);
+}
+
+float grid_line(vec2 uv) {
+    vec2 f = abs(fract(uv) - 0.5);
+    float d = min(0.5 - f.x, 0.5 - f.y);
+    return 1.0 - clamp(d / 0.045, 0.0, 1.0);
+}
+
+vec3 sample_studio_sky(vec3 dir) {
+    float y = clamp(dir.y, -1.0, 1.0);
+    vec3 zenith = vec3(0.18, 0.42, 0.78);
+    vec3 horizon = vec3(0.62, 0.80, 0.96);
+    vec3 ground = vec3(0.05, 0.07, 0.11);
+    if (y >= 0.0) {
+        vec3 sky = mix(horizon, zenith, pow(y, 0.55));
+        float sun_spot = pow(max(dot(dir, u_light_dir), 0.0), 96.0);
+        return sky + vec3(1.4, 1.35, 1.25) * sun_spot;
+    } else {
+        return mix(horizon * 0.45, ground, pow(-y, 0.45));
+    }
+}
+
+void main() {
+    vec3 N = normalize(v_normal);
+    if (!gl_FrontFacing) {
+        N = -N;
+    }
+    vec3 V = normalize(u_eye_pos - v_world_pos);
+    vec3 L = normalize(u_light_dir);
+
+    int tex_mode = int(u_tex_params.x + 0.5);
+    float tex_scale = max(u_tex_params.y, 0.2);
+    float tex_strength = clamp(u_tex_params.z, 0.0, 1.0);
+    float t_anim = u_tex_params.w;
+
+    vec3 albedo_mod = vec3(1.0);
+    float caustic_glow = 0.0;
+    float foam_extra = 0.0;
+
+    if (tex_mode > 0 && tex_strength > 0.001) {
+        vec3 p = v_world_pos * tex_scale;
+        if (tex_mode == 1) {
+            // Capillary Ripples
+            float t = t_anim * 3.2;
+            vec3 k1 = vec3(3.1, 0.7, 2.4);
+            vec3 k2 = vec3(-2.3, 1.1, 3.3);
+            vec3 k3 = vec3(1.5, -2.9, -2.1);
+            float ph1 = dot(p, k1) - t * 1.3;
+            float ph2 = dot(p, k2) + t * 1.7;
+            float ph3 = dot(p, k3 * 1.6) - t * 2.3;
+            vec3 grad = k1 * cos(ph1) * 0.45 + k2 * cos(ph2) * 0.35 + k3 * cos(ph3) * 0.20;
+            vec3 tang = grad - N * dot(grad, N);
+            N = normalize(N + tang * (tex_strength * 0.22));
+            albedo_mod = vec3(1.0 + sin(ph1) * sin(ph2) * tex_strength * 0.08);
+        } else if (tex_mode == 2) {
+            // Voronoi Caustics
+            vec3 q = p * 0.85 + vec3(t_anim * 0.55, -t_anim * 0.35, t_anim * 0.45);
+            float c1 = voronoi_ridge(q);
+            float c2 = voronoi_ridge(q * 1.7 + vec3(3.7));
+            float caustic = pow(c1 * 0.65 + c2 * 0.35, 2.2) * tex_strength;
+            float cx = voronoi_ridge(q + vec3(0.06, 0.0, 0.0)) - c1;
+            float cz = voronoi_ridge(q + vec3(0.0, 0.0, 0.06)) - c1;
+            vec3 bump = vec3(cx, 0.0, cz) * (tex_strength * 1.8);
+            N = normalize(N + (bump - N * dot(bump, N)));
+            albedo_mod = vec3(1.0) + vec3(0.25, 0.45, 0.55) * caustic;
+            caustic_glow = caustic * 0.55;
+        } else if (tex_mode == 3) {
+            // FBM Foam Streaks
+            vec3 q = p * 0.9 + vec3(t_anim * 0.3, -t_anim * 0.2, t_anim * 0.25);
+            float f = fbm(q);
+            float sf = clamp(v_speed / 2.2, 0.15, 1.0);
+            foam_extra = clamp((f - 0.42) * 2.4, 0.0, 1.0) * tex_strength * sf * 0.85;
+            vec3 bump = vec3(f - 0.5, 0.0, fbm(q + vec3(0.0, 0.0, 1.3)) - 0.5) * (tex_strength * 0.30);
+            N = normalize(N + (bump - N * dot(bump, N)));
+        } else if (tex_mode == 4) {
+            // Studio UV Grid
+            vec3 w = pow(abs(N), vec3(4.0));
+            w /= max(w.x + w.y + w.z, 1e-5);
+            float line = grid_line(p.yz) * w.x + grid_line(p.xz) * w.y + grid_line(p.xy) * w.z;
+            int chk = (int(floor(p.x)) + int(floor(p.y)) + int(floor(p.z))) & 1;
+            float base_m = 1.0 - float(chk) * 0.14 * tex_strength;
+            float lb = line * tex_strength * 0.65;
+            albedo_mod = vec3(base_m + lb);
+            caustic_glow = lb * 0.25;
+            foam_extra = lb * 0.35;
+        }
+    }
+
+    float ndotv = max(dot(N, V), 0.001);
+    float ndotl = max(dot(N, L), 0.0);
+    vec3 H = normalize(L + V);
+    float ndoth = max(dot(N, H), 0.0);
+
+    float ior = max(u_light_params.x, 1.0);
+    float f0_dielectric = pow((ior - 1.0) / (ior + 1.0), 2.0);
+    float metallic = clamp(u_mat_params.w, 0.0, 1.0);
+    vec3 f0 = mix(vec3(f0_dielectric), u_shallow_color, metallic);
+    vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - ndotv, 5.0);
+
+    // Beer-Lambert optical thickness approximation from grazing angle & height
+    float optical_depth = clamp((1.0 - ndotv * 0.65) * u_mat_params.y * 0.55, 0.0, 1.0);
+    vec3 body_color = mix(u_shallow_color, u_deep_color, optical_depth) * albedo_mod;
+
+    if (u_backface_pass != 0) {
+        // Subtle interior volume tint pass
+        float back_alpha = clamp(u_mat_params.x * 0.42, 0.05, 0.65);
+        FragColor = vec4(u_deep_color * (u_env_params.w + 0.35 * ndotl), back_alpha);
+        return;
+    }
+
+    // GGX Microfacet Specular
+    float rough = clamp(u_light_params.y, 0.02, 1.0);
+    float alpha = rough * rough;
+    float alpha2 = alpha * alpha;
+    float denom = (ndoth * ndoth * (alpha2 - 1.0) + 1.0);
+    float d_ggx = alpha2 / max(3.14159265 * denom * denom, 1e-5);
+    vec3 spec = d_ggx * fresnel * u_light_params.z * u_env_params.z * (0.25 + 0.75 * ndotl);
+
+    // Studio sky reflection
+    vec3 R = reflect(-V, N);
+    vec3 env_col = sample_studio_sky(R) * u_env_params.x;
+
+    // Subsurface back-scattered wave crest glow
+    float back_light = pow(clamp(dot(V, -L + N * 0.55), 0.0, 1.0), 3.0);
+    vec3 sss = u_shallow_color * back_light * u_light_params.w * u_env_params.z * (1.0 - metallic);
+
+    // Diffuse + Ambient
+    float amb = u_env_params.w;
+    float diff = ndotl * u_env_params.z;
+    vec3 fluid_lit = body_color * (amb + diff * (1.0 - metallic * 0.8)) + sss + u_shallow_color * caustic_glow;
+
+    // Blend transmission body with Fresnel reflection + GGX sun highlight
+    vec3 color = mix(fluid_lit, env_col, clamp(fresnel * (0.65 + 0.35 * metallic), 0.0, 0.96)) + spec;
+
+    // Aerated whitewater foam on energetic crests
+    float foam = clamp(v_foam * u_mat_params.z + foam_extra, 0.0, 1.0);
+    vec3 foam_col = vec3(0.94, 0.97, 1.0) * (amb + diff * 0.85 + 0.25);
+    color = mix(color, foam_col, foam);
+
+    // Filmic tone compression for bright glints
+    color = color / (vec3(1.0) + color * 0.18);
+
+    float out_alpha = clamp(mix(u_mat_params.x, 1.0, max(max(fresnel.r, foam), metallic)), 0.12, 1.0);
+    FragColor = vec4(color, out_alpha);
+}
+"#;
+
+            let mesh_program = create_shader_program(gl, m_vs_src, m_fs_src)?;
+
+            // 4. Create Particle VAO & VBO
             let particle_vao = gl.create_vertex_array()?;
             let particle_vbo = gl.create_buffer()?;
 
@@ -129,10 +385,8 @@ void main() {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(particle_vbo));
 
             let stride = std::mem::size_of::<ParticleVertex>() as i32;
-
             gl.enable_vertex_attrib_array(0);
             gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
-
             gl.enable_vertex_attrib_array(1);
             gl.vertex_attrib_pointer_f32(
                 1,
@@ -143,13 +397,12 @@ void main() {
                 (3 * std::mem::size_of::<f32>()) as i32,
             );
 
-            // 4. Create Line VAO & VBO
+            // 5. Create Line VAO & VBO
             let line_vao = gl.create_vertex_array()?;
             let line_vbo = gl.create_buffer()?;
 
             gl.bind_vertex_array(Some(line_vao));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(line_vbo));
-
             gl.enable_vertex_attrib_array(0);
             gl.vertex_attrib_pointer_f32(
                 0,
@@ -160,17 +413,227 @@ void main() {
                 0,
             );
 
+            // 6. Create Surface Mesh VAO, VBO & IBO
+            let mesh_vao = gl.create_vertex_array()?;
+            let mesh_vbo = gl.create_buffer()?;
+            let mesh_ibo = gl.create_buffer()?;
+
+            gl.bind_vertex_array(Some(mesh_vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(mesh_vbo));
+            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(mesh_ibo));
+
+            let m_stride = std::mem::size_of::<MeshVertex>() as i32;
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, m_stride, 0);
+            gl.enable_vertex_attrib_array(1);
+            gl.vertex_attrib_pointer_f32(
+                1,
+                3,
+                glow::FLOAT,
+                false,
+                m_stride,
+                (3 * std::mem::size_of::<f32>()) as i32,
+            );
+            gl.enable_vertex_attrib_array(2);
+            gl.vertex_attrib_pointer_f32(
+                2,
+                2,
+                glow::FLOAT,
+                false,
+                m_stride,
+                (6 * std::mem::size_of::<f32>()) as i32,
+            );
+
             gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
 
             Ok(Self {
                 particle_program,
                 line_program,
+                mesh_program,
                 particle_vao,
                 particle_vbo,
                 line_vao,
                 line_vbo,
+                mesh_vao,
+                mesh_vbo,
+                mesh_ibo,
+                line_scratch: Vec::with_capacity(512),
+                floor_scratch: Vec::with_capacity(128),
             })
+        }
+    }
+
+    unsafe fn draw_scene_wireframes(
+        &mut self,
+        gl: &Arc<glow::Context>,
+        view_proj: Mat4,
+        chamber: &crate::sph::chamber::Chamber,
+        bounds: Aabb,
+        colliders: &[Collider],
+        faucets: &[Faucet],
+        drains: &[Drain],
+        is_2d: bool,
+    ) {
+        // Subtle 3D studio reference floor grid beneath the chamber
+        if !is_2d {
+            self.floor_scratch.clear();
+            let y_floor = bounds.min.y - 0.002;
+            let grid_half = 1.6f32;
+            let steps = 16;
+            let step = (grid_half * 2.0) / steps as f32;
+            for i in 0..=steps {
+                let v = -grid_half + i as f32 * step;
+                self.floor_scratch.push(LineVertex {
+                    pos: [v, y_floor, -grid_half],
+                });
+                self.floor_scratch.push(LineVertex {
+                    pos: [v, y_floor, grid_half],
+                });
+                self.floor_scratch.push(LineVertex {
+                    pos: [-grid_half, y_floor, v],
+                });
+                self.floor_scratch.push(LineVertex {
+                    pos: [grid_half, y_floor, v],
+                });
+            }
+
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.use_program(Some(self.line_program));
+            let u_vp = gl.get_uniform_location(self.line_program, "u_view_proj");
+            let u_col = gl.get_uniform_location(self.line_program, "u_line_color");
+            gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
+            gl.uniform_4_f32(u_col.as_ref(), 0.16, 0.22, 0.32, 0.42);
+
+            gl.bind_vertex_array(Some(self.line_vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.line_vbo));
+            gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck::cast_slice(&self.floor_scratch),
+                glow::DYNAMIC_DRAW,
+            );
+            gl.line_width(1.0);
+            gl.draw_arrays(glow::LINES, 0, self.floor_scratch.len() as i32);
+        }
+
+        self.line_scratch.clear();
+        let chamber_wireframe = if is_2d {
+            chamber.generate_wireframe_lines_2d(&bounds)
+        } else {
+            chamber.generate_wireframe_lines(&bounds)
+        };
+        for (p0, p1) in chamber_wireframe {
+            self.line_scratch.push(LineVertex { pos: p0.to_array() });
+            self.line_scratch.push(LineVertex { pos: p1.to_array() });
+        }
+
+        for collider in colliders {
+            if collider.enabled {
+                if is_2d {
+                    match &collider.shape {
+                        ColliderShape::Sphere { center, radius } => {
+                            Self::generate_circle_lines_xy(
+                                *center,
+                                *radius,
+                                36,
+                                &mut self.line_scratch,
+                            );
+                        }
+                        ColliderShape::Box { aabb } => {
+                            let p0 = Vec3::new(aabb.min.x, aabb.min.y, 0.0);
+                            let p1 = Vec3::new(aabb.max.x, aabb.min.y, 0.0);
+                            let p2 = Vec3::new(aabb.max.x, aabb.max.y, 0.0);
+                            let p3 = Vec3::new(aabb.min.x, aabb.max.y, 0.0);
+                            self.line_scratch.push(LineVertex { pos: p0.to_array() });
+                            self.line_scratch.push(LineVertex { pos: p1.to_array() });
+                            self.line_scratch.push(LineVertex { pos: p1.to_array() });
+                            self.line_scratch.push(LineVertex { pos: p2.to_array() });
+                            self.line_scratch.push(LineVertex { pos: p2.to_array() });
+                            self.line_scratch.push(LineVertex { pos: p3.to_array() });
+                            self.line_scratch.push(LineVertex { pos: p3.to_array() });
+                            self.line_scratch.push(LineVertex { pos: p0.to_array() });
+                        }
+                        ColliderShape::Cylinder { center, radius, .. } => {
+                            Self::generate_circle_lines_xy(
+                                *center,
+                                *radius,
+                                36,
+                                &mut self.line_scratch,
+                            );
+                        }
+                        ColliderShape::Mesh(mesh) => {
+                            Self::generate_mesh_lines(mesh, &mut self.line_scratch);
+                        }
+                    }
+                } else {
+                    match &collider.shape {
+                        ColliderShape::Sphere { center, radius } => {
+                            Self::generate_sphere_lines(
+                                *center,
+                                *radius,
+                                28,
+                                &mut self.line_scratch,
+                            );
+                        }
+                        ColliderShape::Box { aabb } => {
+                            Self::generate_box_lines(aabb, &mut self.line_scratch);
+                        }
+                        ColliderShape::Cylinder {
+                            center,
+                            radius,
+                            height,
+                        } => {
+                            Self::generate_cylinder_lines(
+                                *center,
+                                *radius,
+                                *height,
+                                20,
+                                &mut self.line_scratch,
+                            );
+                        }
+                        ColliderShape::Mesh(mesh) => {
+                            Self::generate_mesh_lines(mesh, &mut self.line_scratch);
+                        }
+                    }
+                }
+            }
+        }
+
+        for faucet in faucets {
+            if faucet.enabled {
+                Self::generate_faucet_lines(faucet, &mut self.line_scratch);
+            }
+        }
+
+        for drain in drains {
+            if drain.enabled {
+                Self::generate_drain_lines(drain, &bounds, &mut self.line_scratch);
+            }
+        }
+
+        if !self.line_scratch.is_empty() {
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.use_program(Some(self.line_program));
+
+            let u_vp = gl.get_uniform_location(self.line_program, "u_view_proj");
+            let u_col = gl.get_uniform_location(self.line_program, "u_line_color");
+
+            gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
+            gl.uniform_4_f32(u_col.as_ref(), 0.34, 0.68, 0.96, 0.78);
+
+            gl.bind_vertex_array(Some(self.line_vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.line_vbo));
+            gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck::cast_slice(&self.line_scratch),
+                glow::DYNAMIC_DRAW,
+            );
+
+            gl.line_width(1.5);
+            gl.draw_arrays(glow::LINES, 0, self.line_scratch.len() as i32);
         }
     }
 
@@ -203,101 +666,16 @@ void main() {
                 gl.clear_depth_f32(1.0);
                 gl.clear(glow::DEPTH_BUFFER_BIT);
             }
-            gl.disable(glow::BLEND);
             gl.enable(glow::PROGRAM_POINT_SIZE);
 
             let view_proj = proj * view;
 
-            // 1. Draw Chamber, Colliders, Faucets, and Drains
-            let mut line_vertices = Vec::new();
-            let chamber_wireframe = if is_2d {
-                chamber.generate_wireframe_lines_2d(&bounds)
-            } else {
-                chamber.generate_wireframe_lines(&bounds)
-            };
-            for (p0, p1) in chamber_wireframe {
-                line_vertices.push(LineVertex { pos: p0.to_array() });
-                line_vertices.push(LineVertex { pos: p1.to_array() });
-            }
-            for collider in colliders {
-                if collider.enabled {
-                    if is_2d {
-                        match &collider.shape {
-                            ColliderShape::Sphere { center, radius } => {
-                                Self::generate_circle_lines_xy(*center, *radius, 32, &mut line_vertices);
-                            }
-                            ColliderShape::Box { aabb } => {
-                                let p0 = Vec3::new(aabb.min.x, aabb.min.y, 0.0);
-                                let p1 = Vec3::new(aabb.max.x, aabb.min.y, 0.0);
-                                let p2 = Vec3::new(aabb.max.x, aabb.max.y, 0.0);
-                                let p3 = Vec3::new(aabb.min.x, aabb.max.y, 0.0);
-                                line_vertices.push(LineVertex { pos: p0.to_array() });
-                                line_vertices.push(LineVertex { pos: p1.to_array() });
-                                line_vertices.push(LineVertex { pos: p1.to_array() });
-                                line_vertices.push(LineVertex { pos: p2.to_array() });
-                                line_vertices.push(LineVertex { pos: p2.to_array() });
-                                line_vertices.push(LineVertex { pos: p3.to_array() });
-                                line_vertices.push(LineVertex { pos: p3.to_array() });
-                                line_vertices.push(LineVertex { pos: p0.to_array() });
-                            }
-                            ColliderShape::Cylinder { center, radius, .. } => {
-                                Self::generate_circle_lines_xy(*center, *radius, 32, &mut line_vertices);
-                            }
-                            ColliderShape::Mesh(mesh) => {
-                                Self::generate_mesh_lines(mesh, &mut line_vertices);
-                            }
-                        }
-                    } else {
-                        match &collider.shape {
-                            ColliderShape::Sphere { center, radius } => {
-                                Self::generate_sphere_lines(*center, *radius, 24, &mut line_vertices);
-                            }
-                            ColliderShape::Box { aabb } => {
-                                Self::generate_box_lines(aabb, &mut line_vertices);
-                            }
-                            ColliderShape::Cylinder { center, radius, height } => {
-                                Self::generate_cylinder_lines(*center, *radius, *height, 16, &mut line_vertices);
-                            }
-                            ColliderShape::Mesh(mesh) => {
-                                Self::generate_mesh_lines(mesh, &mut line_vertices);
-                            }
-                        }
-                    }
-                }
-            }
+            // 1. Draw Studio Grid, Chamber, Colliders, Faucets, and Drains
+            self.draw_scene_wireframes(
+                gl, view_proj, chamber, bounds, colliders, faucets, drains, is_2d,
+            );
 
-            for faucet in faucets {
-                if faucet.enabled {
-                    Self::generate_faucet_lines(faucet, &mut line_vertices);
-                }
-            }
-
-            for drain in drains {
-                if drain.enabled {
-                    Self::generate_drain_lines(drain, &bounds, &mut line_vertices);
-                }
-            }
-
-            if !line_vertices.is_empty() {
-                gl.use_program(Some(self.line_program));
-
-                let u_vp = gl.get_uniform_location(self.line_program, "u_view_proj");
-                let u_col = gl.get_uniform_location(self.line_program, "u_line_color");
-
-                gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
-                gl.uniform_4_f32(u_col.as_ref(), 0.35, 0.65, 0.95, 0.85);
-
-                gl.bind_vertex_array(Some(self.line_vao));
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.line_vbo));
-                gl.buffer_data_u8_slice(
-                    glow::ARRAY_BUFFER,
-                    bytemuck::cast_slice(&line_vertices),
-                    glow::DYNAMIC_DRAW,
-                );
-
-                gl.line_width(1.5);
-                gl.draw_arrays(glow::LINES, 0, line_vertices.len() as i32);
-            }
+            gl.disable(glow::BLEND);
 
             // 2. Draw Particles
             if !particles_data.is_empty() {
@@ -320,7 +698,7 @@ void main() {
                 gl.uniform_1_f32(u_vh.as_ref(), viewport_size[1]);
                 gl.uniform_1_f32(u_tf.as_ref(), tan_half_fov);
 
-                let light_dir = Vec3::new(0.4, 0.8, 0.5).normalize();
+                let light_dir = Vec3::new(0.42, 0.82, 0.38).normalize();
                 gl.uniform_3_f32(u_ld.as_ref(), light_dir.x, light_dir.y, light_dir.z);
                 gl.uniform_1_i32(u_lit.as_ref(), if lit_spheres { 1 } else { 0 });
                 gl.uniform_1_i32(u_is_2d.as_ref(), if is_2d { 1 } else { 0 });
@@ -344,6 +722,160 @@ void main() {
             gl.disable(glow::DEPTH_TEST);
             gl.depth_mask(true);
             gl.disable(glow::PROGRAM_POINT_SIZE);
+            gl.enable(glow::BLEND);
+        }
+    }
+
+    /// Render reconstructed 3D liquid surface mesh in real time with configured texture, color, and lighting.
+    pub fn render_surface_mesh(
+        &mut self,
+        gl: &Arc<glow::Context>,
+        view: Mat4,
+        proj: Mat4,
+        eye_pos: Vec3,
+        mesh: &SurfaceMesh,
+        mesh_cfg: &SurfaceMeshConfig,
+        anim_time: f32,
+        chamber: &crate::sph::chamber::Chamber,
+        bounds: Aabb,
+        colliders: &[Collider],
+        faucets: &[Faucet],
+        drains: &[Drain],
+        is_2d: bool,
+    ) {
+        unsafe {
+            gl.enable(glow::DEPTH_TEST);
+            gl.depth_func(glow::LEQUAL);
+            gl.depth_mask(true);
+            gl.clear_depth_f32(1.0);
+            gl.clear(glow::DEPTH_BUFFER_BIT);
+
+            let view_proj = proj * view;
+
+            // 1. Draw Studio Grid, Chamber, Colliders, Faucets, and Drains first so translucent liquid blends over them
+            self.draw_scene_wireframes(
+                gl, view_proj, chamber, bounds, colliders, faucets, drains, is_2d,
+            );
+
+            // 2. Draw Surface Mesh (two-pass back/front translucent optical shading)
+            if !mesh.is_empty() {
+                gl.use_program(Some(self.mesh_program));
+
+                let u_vp = gl.get_uniform_location(self.mesh_program, "u_view_proj");
+                let u_eye = gl.get_uniform_location(self.mesh_program, "u_eye_pos");
+                let u_shallow = gl.get_uniform_location(self.mesh_program, "u_shallow_color");
+                let u_deep = gl.get_uniform_location(self.mesh_program, "u_deep_color");
+                let u_mat = gl.get_uniform_location(self.mesh_program, "u_mat_params");
+                let u_lgt = gl.get_uniform_location(self.mesh_program, "u_light_params");
+                let u_env = gl.get_uniform_location(self.mesh_program, "u_env_params");
+                let u_ldir = gl.get_uniform_location(self.mesh_program, "u_light_dir");
+                let u_tex = gl.get_uniform_location(self.mesh_program, "u_tex_params");
+                let u_back = gl.get_uniform_location(self.mesh_program, "u_backface_pass");
+
+                let ld = mesh_cfg.light_dir.normalize_or_zero();
+                let ld = if ld.length_squared() > 0.5 {
+                    ld
+                } else {
+                    Vec3::new(0.42, 0.82, 0.38).normalize()
+                };
+
+                gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
+                gl.uniform_3_f32(u_eye.as_ref(), eye_pos.x, eye_pos.y, eye_pos.z);
+                gl.uniform_3_f32(
+                    u_shallow.as_ref(),
+                    mesh_cfg.shallow_color[0],
+                    mesh_cfg.shallow_color[1],
+                    mesh_cfg.shallow_color[2],
+                );
+                gl.uniform_3_f32(
+                    u_deep.as_ref(),
+                    mesh_cfg.deep_color[0],
+                    mesh_cfg.deep_color[1],
+                    mesh_cfg.deep_color[2],
+                );
+                gl.uniform_4_f32(
+                    u_mat.as_ref(),
+                    mesh_cfg.opacity,
+                    mesh_cfg.absorption,
+                    mesh_cfg.foam_intensity,
+                    mesh_cfg.metallic,
+                );
+                gl.uniform_4_f32(
+                    u_lgt.as_ref(),
+                    mesh_cfg.ior,
+                    mesh_cfg.roughness,
+                    mesh_cfg.specular_intensity,
+                    mesh_cfg.subsurface_scattering,
+                );
+                gl.uniform_4_f32(
+                    u_env.as_ref(),
+                    mesh_cfg.env_reflection,
+                    mesh_cfg.refraction_strength,
+                    mesh_cfg.light_intensity,
+                    mesh_cfg.ambient_intensity,
+                );
+                gl.uniform_3_f32(u_ldir.as_ref(), ld.x, ld.y, ld.z);
+                gl.uniform_4_f32(
+                    u_tex.as_ref(),
+                    mesh_cfg.texture_mode.gpu_id() as f32,
+                    mesh_cfg.texture_scale,
+                    mesh_cfg.texture_strength,
+                    anim_time,
+                );
+
+                gl.bind_vertex_array(Some(self.mesh_vao));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.mesh_vbo));
+                gl.buffer_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    bytemuck::cast_slice(&mesh.vertices),
+                    glow::DYNAMIC_DRAW,
+                );
+                gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.mesh_ibo));
+                gl.buffer_data_u8_slice(
+                    glow::ELEMENT_ARRAY_BUFFER,
+                    bytemuck::cast_slice(&mesh.indices),
+                    glow::DYNAMIC_DRAW,
+                );
+
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.enable(glow::CULL_FACE);
+
+                // Pass A: Backfaces (interior volume absorption tint, depth write off)
+                if mesh_cfg.opacity < 0.98 && mesh_cfg.metallic < 0.85 {
+                    gl.depth_mask(false);
+                    gl.cull_face(glow::FRONT);
+                    gl.uniform_1_i32(u_back.as_ref(), 1);
+                    gl.draw_elements(
+                        glow::TRIANGLES,
+                        mesh.indices.len() as i32,
+                        glow::UNSIGNED_INT,
+                        0,
+                    );
+                }
+
+                // Pass B: Frontfaces (optical Fresnel + GGX specular + texture, depth write on)
+                gl.depth_mask(true);
+                gl.cull_face(glow::BACK);
+                gl.uniform_1_i32(u_back.as_ref(), 0);
+                gl.draw_elements(
+                    glow::TRIANGLES,
+                    mesh.indices.len() as i32,
+                    glow::UNSIGNED_INT,
+                    0,
+                );
+
+                gl.disable(glow::CULL_FACE);
+            }
+
+            gl.bind_vertex_array(None);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
+            gl.use_program(None);
+
+            // Restore state for egui
+            gl.disable(glow::DEPTH_TEST);
+            gl.depth_mask(true);
             gl.enable(glow::BLEND);
         }
     }
@@ -388,7 +920,6 @@ void main() {
     ) {
         let d_theta = std::f32::consts::TAU / segments as f32;
 
-        // XY circle
         for i in 0..segments {
             let t0 = i as f32 * d_theta;
             let t1 = (i + 1) as f32 * d_theta;
@@ -399,7 +930,6 @@ void main() {
                 pos: (center + Vec3::new(t1.cos() * radius, t1.sin() * radius, 0.0)).to_array(),
             });
         }
-        // XZ circle
         for i in 0..segments {
             let t0 = i as f32 * d_theta;
             let t1 = (i + 1) as f32 * d_theta;
@@ -410,7 +940,6 @@ void main() {
                 pos: (center + Vec3::new(t1.cos() * radius, 0.0, t1.sin() * radius)).to_array(),
             });
         }
-        // YZ circle
         for i in 0..segments {
             let t0 = i as f32 * d_theta;
             let t1 = (i + 1) as f32 * d_theta;
@@ -442,26 +971,40 @@ void main() {
 
             let p0_top = top_center + Vec3::new(t0.cos() * radius, 0.0, t0.sin() * radius);
             let p1_top = top_center + Vec3::new(t1.cos() * radius, 0.0, t1.sin() * radius);
-            lines.push(LineVertex { pos: p0_top.to_array() });
-            lines.push(LineVertex { pos: p1_top.to_array() });
+            lines.push(LineVertex {
+                pos: p0_top.to_array(),
+            });
+            lines.push(LineVertex {
+                pos: p1_top.to_array(),
+            });
 
             let p0_bot = bot_center + Vec3::new(t0.cos() * radius, 0.0, t0.sin() * radius);
             let p1_bot = bot_center + Vec3::new(t1.cos() * radius, 0.0, t1.sin() * radius);
-            lines.push(LineVertex { pos: p0_bot.to_array() });
-            lines.push(LineVertex { pos: p1_bot.to_array() });
+            lines.push(LineVertex {
+                pos: p0_bot.to_array(),
+            });
+            lines.push(LineVertex {
+                pos: p1_bot.to_array(),
+            });
 
             if i % (segments / 4).max(1) == 0 {
-                lines.push(LineVertex { pos: p0_top.to_array() });
-                lines.push(LineVertex { pos: p0_bot.to_array() });
+                lines.push(LineVertex {
+                    pos: p0_top.to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: p0_bot.to_array(),
+                });
             }
         }
     }
 
-    fn generate_mesh_lines(
-        mesh: &crate::sph::mesh::TriangleMesh,
-        lines: &mut Vec<LineVertex>,
-    ) {
-        let rot_mat = glam::Mat3::from_euler(glam::EulerRot::YXZ, mesh.rotation.y, mesh.rotation.x, mesh.rotation.z);
+    fn generate_mesh_lines(mesh: &crate::sph::mesh::TriangleMesh, lines: &mut Vec<LineVertex>) {
+        let rot_mat = glam::Mat3::from_euler(
+            glam::EulerRot::YXZ,
+            mesh.rotation.y,
+            mesh.rotation.x,
+            mesh.rotation.z,
+        );
         let s = mesh.scale;
         let pos = mesh.position;
 
@@ -472,19 +1015,14 @@ void main() {
 
             lines.push(LineVertex { pos: v0.to_array() });
             lines.push(LineVertex { pos: v1.to_array() });
-
             lines.push(LineVertex { pos: v1.to_array() });
             lines.push(LineVertex { pos: v2.to_array() });
-
             lines.push(LineVertex { pos: v2.to_array() });
             lines.push(LineVertex { pos: v0.to_array() });
         }
     }
 
-    fn generate_faucet_lines(
-        faucet: &Faucet,
-        lines: &mut Vec<LineVertex>,
-    ) {
+    fn generate_faucet_lines(faucet: &Faucet, lines: &mut Vec<LineVertex>) {
         let pos = faucet.position;
         let flow_dir = if faucet.direction.length_squared() > 1e-6 {
             faucet.direction.normalize()
@@ -492,12 +1030,15 @@ void main() {
             -Vec3::Y
         };
 
-        // Draw nozzle aperture
         match faucet.shape {
             FaucetShape::Circle { radius } => {
                 let segments = 16;
                 let d_theta = std::f32::consts::TAU / segments as f32;
-                let up = if flow_dir.y.abs() < 0.95 { Vec3::Y } else { Vec3::X };
+                let up = if flow_dir.y.abs() < 0.95 {
+                    Vec3::Y
+                } else {
+                    Vec3::X
+                };
                 let right = flow_dir.cross(up).normalize();
                 let forward = right.cross(flow_dir).normalize();
 
@@ -511,7 +1052,11 @@ void main() {
                 }
             }
             FaucetShape::Rectangle { width, depth } => {
-                let up = if flow_dir.y.abs() < 0.95 { Vec3::Y } else { Vec3::X };
+                let up = if flow_dir.y.abs() < 0.95 {
+                    Vec3::Y
+                } else {
+                    Vec3::X
+                };
                 let right = flow_dir.cross(up).normalize() * (width * 0.5);
                 let forward = right.cross(flow_dir).normalize() * (depth * 0.5);
 
@@ -531,31 +1076,40 @@ void main() {
             }
             FaucetShape::Point => {
                 let s = 0.03;
-                lines.push(LineVertex { pos: (pos - Vec3::X * s).to_array() });
-                lines.push(LineVertex { pos: (pos + Vec3::X * s).to_array() });
-                lines.push(LineVertex { pos: (pos - Vec3::Z * s).to_array() });
-                lines.push(LineVertex { pos: (pos + Vec3::Z * s).to_array() });
+                lines.push(LineVertex {
+                    pos: (pos - Vec3::X * s).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos + Vec3::X * s).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos - Vec3::Z * s).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos + Vec3::Z * s).to_array(),
+                });
             }
         }
 
-        // Draw directional flow arrow
         let arrow_len = 0.12;
         let arrow_tip = pos + flow_dir * arrow_len;
-        lines.push(LineVertex { pos: pos.to_array() });
-        lines.push(LineVertex { pos: arrow_tip.to_array() });
+        lines.push(LineVertex {
+            pos: pos.to_array(),
+        });
+        lines.push(LineVertex {
+            pos: arrow_tip.to_array(),
+        });
     }
 
-    fn generate_drain_lines(
-        drain: &Drain,
-        bounds: &Aabb,
-        lines: &mut Vec<LineVertex>,
-    ) {
+    fn generate_drain_lines(drain: &Drain, bounds: &Aabb, lines: &mut Vec<LineVertex>) {
         let segments = 20;
         let d_theta = std::f32::consts::TAU / segments as f32;
         let radius = drain.radius;
         let pos = match drain.face {
             CubeFace::Floor => Vec3::new(drain.position.x, bounds.min.y + 0.001, drain.position.z),
-            CubeFace::Ceiling => Vec3::new(drain.position.x, bounds.max.y - 0.001, drain.position.z),
+            CubeFace::Ceiling => {
+                Vec3::new(drain.position.x, bounds.max.y - 0.001, drain.position.z)
+            }
             CubeFace::Left => Vec3::new(bounds.min.x + 0.001, drain.position.y, drain.position.z),
             CubeFace::Right => Vec3::new(bounds.max.x - 0.001, drain.position.y, drain.position.z),
             CubeFace::Back => Vec3::new(drain.position.x, drain.position.y, bounds.min.z + 0.001),
@@ -563,7 +1117,6 @@ void main() {
             CubeFace::Custom => drain.position,
         };
 
-        // Draw ring according to orientation
         for i in 0..segments {
             let t0 = i as f32 * d_theta;
             let t1 = (i + 1) as f32 * d_theta;
@@ -587,25 +1140,48 @@ void main() {
             lines.push(LineVertex { pos: p1.to_array() });
         }
 
-        // Draw crossbars / grate across the drain
         match drain.face {
             CubeFace::Floor | CubeFace::Ceiling => {
-                lines.push(LineVertex { pos: (pos - Vec3::X * radius).to_array() });
-                lines.push(LineVertex { pos: (pos + Vec3::X * radius).to_array() });
-                lines.push(LineVertex { pos: (pos - Vec3::Z * radius).to_array() });
-                lines.push(LineVertex { pos: (pos + Vec3::Z * radius).to_array() });
+                lines.push(LineVertex {
+                    pos: (pos - Vec3::X * radius).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos + Vec3::X * radius).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos - Vec3::Z * radius).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos + Vec3::Z * radius).to_array(),
+                });
             }
             CubeFace::Left | CubeFace::Right => {
-                lines.push(LineVertex { pos: (pos - Vec3::Y * radius).to_array() });
-                lines.push(LineVertex { pos: (pos + Vec3::Y * radius).to_array() });
-                lines.push(LineVertex { pos: (pos - Vec3::Z * radius).to_array() });
-                lines.push(LineVertex { pos: (pos + Vec3::Z * radius).to_array() });
+                lines.push(LineVertex {
+                    pos: (pos - Vec3::Y * radius).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos + Vec3::Y * radius).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos - Vec3::Z * radius).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos + Vec3::Z * radius).to_array(),
+                });
             }
             CubeFace::Back | CubeFace::Front | CubeFace::Custom => {
-                lines.push(LineVertex { pos: (pos - Vec3::X * radius).to_array() });
-                lines.push(LineVertex { pos: (pos + Vec3::X * radius).to_array() });
-                lines.push(LineVertex { pos: (pos - Vec3::Y * radius).to_array() });
-                lines.push(LineVertex { pos: (pos + Vec3::Y * radius).to_array() });
+                lines.push(LineVertex {
+                    pos: (pos - Vec3::X * radius).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos + Vec3::X * radius).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos - Vec3::Y * radius).to_array(),
+                });
+                lines.push(LineVertex {
+                    pos: (pos + Vec3::Y * radius).to_array(),
+                });
             }
         }
     }
@@ -614,10 +1190,14 @@ void main() {
         unsafe {
             gl.delete_program(self.particle_program);
             gl.delete_program(self.line_program);
+            gl.delete_program(self.mesh_program);
             gl.delete_vertex_array(self.particle_vao);
             gl.delete_buffer(self.particle_vbo);
             gl.delete_vertex_array(self.line_vao);
             gl.delete_buffer(self.line_vbo);
+            gl.delete_vertex_array(self.mesh_vao);
+            gl.delete_buffer(self.mesh_vbo);
+            gl.delete_buffer(self.mesh_ibo);
         }
     }
 }

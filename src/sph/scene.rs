@@ -404,8 +404,8 @@ impl SceneGenerator {
                                 if r <= r_max && r > 0.08 {
                                     let theta = z.atan2(x);
                                     let speed = 2.4 * (r / r_max);
-                                    let vx = -speed * theta.cos();
-                                    let vz = speed * theta.sin();
+                                    let vx = -speed * theta.sin();
+                                    let vz = speed * theta.cos();
                                     let p = Particle::new(
                                         Vec3::new(x, y, z),
                                         Vec3::new(vx, 0.0, vz),

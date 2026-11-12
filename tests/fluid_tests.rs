@@ -704,3 +704,266 @@ fn test_2d_objects_zero_z() {
     let d = Drain::new("Drain".to_string(), CubeFace::Floor, Vec3::new(0.2, 0.0, 0.0), 0.1);
     assert_eq!(d.position.z, 0.0);
 }
+
+
+#[test]
+fn test_marching_cubes_tables_valid() {
+    use liquid_rust::render::surface_mesh::{MC_EDGE_CORNERS, MC_EDGE_TABLE, MC_TRI_TABLE};
+
+    assert_eq!(MC_EDGE_TABLE[0], 0);
+    assert_eq!(MC_EDGE_TABLE[255], 0);
+    assert_eq!(MC_TRI_TABLE[0][0], -1);
+    assert_eq!(MC_TRI_TABLE[255][0], -1);
+
+    for &(c0, c1) in &MC_EDGE_CORNERS {
+        assert!(c0 < 8 && c1 < 8 && c0 != c1);
+    }
+
+    for cube_idx in 0..256 {
+        let edge_mask = MC_EDGE_TABLE[cube_idx];
+        assert!(edge_mask <= 0x0FFF, "Cube {} mask out of 12-edge range", cube_idx);
+
+        let row = &MC_TRI_TABLE[cube_idx];
+        let mut count = 0usize;
+        while count < 16 && row[count] != -1 {
+            let e = row[count];
+            assert!(
+                (0..12).contains(&e),
+                "Cube {} has invalid edge index {}",
+                cube_idx,
+                e
+            );
+            assert!(
+                (edge_mask & (1u16 << (e as u16))) != 0,
+                "Cube {} references edge {} not enabled in MC_EDGE_TABLE",
+                cube_idx,
+                e
+            );
+            count += 1;
+        }
+        assert_eq!(
+            count % 3,
+            0,
+            "Cube {} triangle list length {} is not a multiple of 3",
+            cube_idx,
+            count
+        );
+    }
+}
+
+#[test]
+fn test_surface_mesh_reconstruction_and_obj_export() {
+    use liquid_rust::render::{SurfaceMesh, SurfaceMeshConfig};
+    use liquid_rust::sph::{SimulationQuality, TriangleMesh};
+
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
+    let mut config = SolverConfig::default();
+    SimulationQuality::Draft.apply(&mut config, false);
+    let mut solver = SphSolver::new(bounds, config.clone());
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DamBreak);
+
+    for _ in 0..8 {
+        solver.step(1.0 / 60.0);
+    }
+
+    let mesh_cfg = SurfaceMeshConfig::default();
+    let mesh = SurfaceMesh::from_particles(
+        &solver.particles,
+        solver.config.particle_radius,
+        solver.config.smoothing_length,
+        &mesh_cfg,
+    );
+
+    assert!(!mesh.is_empty(), "Reconstructed fluid surface mesh must not be empty");
+    assert!(mesh.vertices.len() > 50, "Expected > 50 welded vertices, got {}", mesh.vertices.len());
+    assert!(mesh.triangle_count() > 80, "Expected > 80 triangles, got {}", mesh.triangle_count());
+
+    for v in &mesh.vertices {
+        let p = Vec3::from_array(v.position);
+        let n = Vec3::from_array(v.normal);
+        assert!(p.is_finite(), "Mesh vertex position must be finite");
+        assert!(n.is_finite(), "Mesh vertex normal must be finite");
+        assert!(
+            (n.length() - 1.0).abs() < 0.05,
+            "Mesh vertex normal must be normalized, got len {}",
+            n.length()
+        );
+    }
+
+    let obj_path = std::env::temp_dir().join("liquid_rust_test_surface_mesh.obj");
+    mesh.save_obj(&obj_path).expect("OBJ export should succeed");
+    let raw_obj = std::fs::read_to_string(&obj_path).expect("Read exported OBJ");
+    let parsed = TriangleMesh::from_obj_str(&raw_obj, "ExportedFluid")
+        .expect("Exported fluid OBJ should parse cleanly as valid geometry");
+    assert_eq!(parsed.triangles.len(), mesh.triangle_count());
+    let _ = std::fs::remove_file(&obj_path);
+}
+
+#[test]
+fn test_surface_mesh_software_render_materials_and_textures() {
+    use liquid_rust::export::SoftwareRenderer;
+    use liquid_rust::render::{
+        Camera, FluidMaterialPreset, MeshTextureMode, SurfaceMesh, SurfaceMeshConfig,
+    };
+    use liquid_rust::sph::SimulationQuality;
+
+    let bounds = Aabb::new(Vec3::new(-0.9, 0.0, -0.45), Vec3::new(0.9, 1.2, 0.45));
+    let mut config = SolverConfig::default();
+    SimulationQuality::Draft.apply(&mut config, false);
+    let mut solver = SphSolver::new(bounds, config);
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::ObstacleDrop);
+    for _ in 0..6 {
+        solver.step(1.0 / 60.0);
+    }
+
+    let mut mesh_cfg = SurfaceMeshConfig::default();
+    let mesh = SurfaceMesh::from_particles(
+        &solver.particles,
+        solver.config.particle_radius,
+        solver.config.smoothing_length,
+        &mesh_cfg,
+    );
+    assert!(!mesh.is_empty());
+
+    let mut cam = Camera::default();
+    cam.reset();
+    let mut renderer = SoftwareRenderer::new(160, 120);
+
+    // 1. Render ClearWater with Ripples
+    FluidMaterialPreset::ClearWater.apply(&mut mesh_cfg);
+    mesh_cfg.texture_mode = MeshTextureMode::Ripples;
+    renderer.render_surface_mesh_frame(
+        &mesh,
+        &mesh_cfg,
+        &cam,
+        &solver.chamber,
+        solver.bounds,
+        &solver.colliders,
+        0.25,
+        false,
+    );
+    let water_sum: (u64, u64, u64) = renderer.rgb_buffer.chunks_exact(3).fold((0, 0, 0), |acc, px| {
+        (acc.0 + px[0] as u64, acc.1 + px[1] as u64, acc.2 + px[2] as u64)
+    });
+    assert!(
+        water_sum.2 > water_sum.0,
+        "ClearWater render should have stronger blue channel than red: {:?}",
+        water_sum
+    );
+
+    // 2. Render MoltenAmber with Caustics
+    FluidMaterialPreset::MoltenAmber.apply(&mut mesh_cfg);
+    mesh_cfg.texture_mode = MeshTextureMode::Caustics;
+    renderer.render_surface_mesh_frame(
+        &mesh,
+        &mesh_cfg,
+        &cam,
+        &solver.chamber,
+        solver.bounds,
+        &solver.colliders,
+        0.25,
+        false,
+    );
+    let amber_sum: (u64, u64, u64) = renderer.rgb_buffer.chunks_exact(3).fold((0, 0, 0), |acc, px| {
+        (acc.0 + px[0] as u64, acc.1 + px[1] as u64, acc.2 + px[2] as u64)
+    });
+    assert!(
+        amber_sum.0 > water_sum.0,
+        "MoltenAmber render should increase warm red energy compared to ClearWater: amber={:?} water={:?}",
+        amber_sum,
+        water_sum
+    );
+
+    // 3. Verify remaining texture modes evaluate without NaNs or panics
+    for &tex in &[MeshTextureMode::Foam, MeshTextureMode::Grid, MeshTextureMode::None] {
+        FluidMaterialPreset::LiquidChrome.apply(&mut mesh_cfg);
+        mesh_cfg.texture_mode = tex;
+        renderer.render_surface_mesh_frame(
+            &mesh,
+            &mesh_cfg,
+            &cam,
+            &solver.chamber,
+            solver.bounds,
+            &solver.colliders,
+            0.5,
+            false,
+        );
+        assert!(renderer.rgb_buffer.iter().any(|&v| v > 60));
+    }
+}
+
+#[test]
+fn test_vorticity_and_calm_pool_stability() {
+    use liquid_rust::sph::SimulationQuality;
+
+    // Settled pool in 2D should remain calm with flow-gated vorticity enabled
+    let bounds = Aabb::new(Vec3::new(-0.9, 0.0, -0.05), Vec3::new(0.9, 1.2, 0.05));
+    let mut config = SolverConfig::default();
+    config.vorticity = 0.065;
+    config.surface_tension = 0.035;
+    let mut solver = SphSolver::new(bounds, config);
+    solver.set_2d(true);
+    solver.apply_quality(SimulationQuality::Draft);
+
+    // Create a flat resting pool on the chamber floor
+    let s = solver.config.spacing;
+    let r = solver.config.particle_radius;
+    let mut id = 0u32;
+    let mut y = bounds.min.y + r * 1.2;
+    while y <= bounds.min.y + 0.28 {
+        let mut x = bounds.min.x + r * 1.5;
+        while x <= bounds.max.x - r * 1.5 {
+            solver.particles.push(Particle::new(Vec3::new(x, y, 0.0), Vec3::ZERO, 1.0, id));
+            id += 1;
+            x += s;
+        }
+        y += s;
+    }
+
+    for _ in 0..90 {
+        solver.step(1.0 / 60.0);
+    }
+
+    let mut avg_speed = 0.0f32;
+    let mut max_y = 0.0f32;
+    for p in &solver.particles {
+        assert!(p.position.is_finite() && p.velocity.is_finite());
+        avg_speed += p.velocity.length();
+        max_y = max_y.max(p.position.y);
+    }
+    avg_speed /= solver.particles.len() as f32;
+    assert!(
+        avg_speed < 0.15,
+        "Hydrostatic pool with flow-gated vorticity must settle calmly, got avg_speed={}",
+        avg_speed
+    );
+    assert!(
+        max_y < 0.36,
+        "Resting pool particles must not pop upward, got max_y={}",
+        max_y
+    );
+}
+
+#[test]
+fn test_cli_surface_mesh_command_generation() {
+    use liquid_rust::app::{CliCommandMode, LiquidApp};
+    use liquid_rust::render::{FluidMaterialPreset, MeshTextureMode, RenderMode};
+
+    let mut app = LiquidApp::new_headless();
+    app.cli_mode = CliCommandMode::Mp4Video;
+    app.cli_mp4_output = "studio_amber.mp4".to_string();
+    app.render_mode = RenderMode::SurfaceMesh;
+    FluidMaterialPreset::MoltenAmber.apply(&mut app.mesh_config);
+    app.mesh_config.shallow_color = [0.95, 0.55, 0.12];
+    app.mesh_config.texture_mode = MeshTextureMode::Caustics;
+    app.mesh_config.ior = 1.58;
+    app.mesh_config.roughness = 0.03;
+
+    let cmd = app.generate_cli_command();
+    assert!(cmd.contains("--surface-mesh"), "Expected --surface-mesh in {}", cmd);
+    assert!(cmd.contains("--mesh-material amber"), "Expected --mesh-material amber in {}", cmd);
+    assert!(cmd.contains("--mesh-color"), "Expected custom --mesh-color override in {}", cmd);
+    assert!(cmd.contains("--mesh-texture caustics"), "Expected --mesh-texture caustics in {}", cmd);
+    assert!(cmd.contains("--mesh-ior 1.580"), "Expected --mesh-ior 1.580 in {}", cmd);
+    assert!(cmd.contains("--mesh-roughness 0.030"), "Expected --mesh-roughness 0.030 in {}", cmd);
+}

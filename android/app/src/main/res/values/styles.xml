@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="StudioTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0E141B</item>
+        <item name="android:colorBackground">#0E141B</item>
+        <item name="android:colorPrimary">#8ECDFF</item>
+        <item name="android:colorAccent">#8ECDFF</item>
+        <item name="android:colorControlActivated">#8ECDFF</item>
+        <item name="android:colorControlNormal">#64748B</item>
+        <item name="android:statusBarColor">#00000000</item>
+        <item name="android:navigationBarColor">#00000000</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+</resources>

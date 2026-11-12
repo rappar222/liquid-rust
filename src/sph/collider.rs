@@ -104,7 +104,8 @@ impl Collider {
                     let rel_vel = *vel - self.velocity;
                     let vn = rel_vel.dot(normal);
                     if vn < 0.0 {
-                        let normal_impulse = -(1.0 + self.restitution) * vn * normal;
+                        let eff_restitution = if vn < -0.10 { self.restitution } else { 0.0 };
+                        let normal_impulse = -(1.0 + eff_restitution) * vn * normal;
                         let mut new_rel = rel_vel + normal_impulse;
                         let vt = new_rel - normal * new_rel.dot(normal);
                         new_rel -= vt * (1.0 - self.friction);
@@ -161,7 +162,8 @@ impl Collider {
                     let rel_vel = *vel - self.velocity;
                     let vn = rel_vel.dot(normal);
                     if vn < 0.0 {
-                        let normal_impulse = -(1.0 + self.restitution) * vn * normal;
+                        let eff_restitution = if vn < -0.10 { self.restitution } else { 0.0 };
+                        let normal_impulse = -(1.0 + eff_restitution) * vn * normal;
                         let mut new_rel = rel_vel + normal_impulse;
                         let vt = new_rel - normal * new_rel.dot(normal);
                         new_rel -= vt * (1.0 - self.friction);
@@ -192,7 +194,8 @@ impl Collider {
                     let rel_vel = *vel - self.velocity;
                     let vn = rel_vel.dot(normal);
                     if vn < 0.0 {
-                        let normal_impulse = -(1.0 + self.restitution) * vn * normal;
+                        let eff_restitution = if vn < -0.10 { self.restitution } else { 0.0 };
+                        let normal_impulse = -(1.0 + eff_restitution) * vn * normal;
                         let mut new_rel = rel_vel + normal_impulse;
                         let vt = new_rel - normal * new_rel.dot(normal);
                         new_rel -= vt * (1.0 - self.friction);

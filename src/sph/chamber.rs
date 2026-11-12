@@ -188,39 +188,66 @@ impl Chamber {
         restitution: f32,
         friction: f32,
     ) {
-        let margin = 0.002;
-        let slip = (1.0 - (1.0 - friction).max(0.0) * dt * 3.0).clamp(0.98, 1.0);
+        let margin = (radius * 0.25).max(0.003);
+        let slip = (1.0 - (1.0 - friction).max(0.0) * dt * 3.0).clamp(0.95, 1.0);
+        let rest_threshold = 0.10; // m/s: below this normal speed, restitution is zero (inelastic resting)
         match self.shape {
             ChamberShape::Box => {
                 if new_pos.y <= bounds.min.y + radius + margin {
                     if vel.y < 0.0 {
-                        vel.y = -vel.y * restitution;
+                        if vel.y < -rest_threshold {
+                            vel.y = -vel.y * restitution;
+                        } else {
+                            vel.y = 0.0;
+                        }
+                    } else if vel.y > 0.0 && vel.y < 0.20 && new_pos.y <= bounds.min.y + radius + 0.001 {
+                        vel.y *= 0.1;
                     }
                     vel.x *= slip;
                     vel.z *= slip;
                 }
                 if new_pos.y >= bounds.max.y - radius - margin && vel.y > 0.0 {
-                    vel.y = -vel.y * restitution;
+                    if vel.y > rest_threshold {
+                        vel.y = -vel.y * restitution;
+                    } else {
+                        vel.y = 0.0;
+                    }
                     vel.x *= slip;
                     vel.z *= slip;
                 }
                 if new_pos.x <= bounds.min.x + radius + margin && vel.x < 0.0 {
-                    vel.x = -vel.x * restitution;
+                    if vel.x < -rest_threshold {
+                        vel.x = -vel.x * restitution;
+                    } else {
+                        vel.x = 0.0;
+                    }
                     vel.y *= slip;
                     vel.z *= slip;
                 }
                 if new_pos.x >= bounds.max.x - radius - margin && vel.x > 0.0 {
-                    vel.x = -vel.x * restitution;
+                    if vel.x > rest_threshold {
+                        vel.x = -vel.x * restitution;
+                    } else {
+                        vel.x = 0.0;
+                    }
                     vel.y *= slip;
                     vel.z *= slip;
                 }
                 if new_pos.z <= bounds.min.z + radius + margin && vel.z < 0.0 {
-                    vel.z = -vel.z * restitution;
+                    if vel.z < -rest_threshold {
+                        vel.z = -vel.z * restitution;
+                    } else {
+                        vel.z = 0.0;
+                    }
                     vel.x *= slip;
                     vel.y *= slip;
                 }
                 if new_pos.z >= bounds.max.z - radius - margin && vel.z > 0.0 {
-                    vel.z = -vel.z * restitution;
+                    if vel.z > rest_threshold {
+                        vel.z = -vel.z * restitution;
+                    } else {
+                        vel.z = 0.0;
+                    }
                     vel.x *= slip;
                     vel.y *= slip;
                 }

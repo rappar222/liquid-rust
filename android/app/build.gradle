@@ -1,0 +1,35 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.liquidrust.mobile'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.liquidrust.mobile"
+        minSdk 26
+        targetSdk 34
+        versionCode 205
+        versionName "0.2.5"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources false
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// Zero external dependencies: pure Android SDK + OpenGL ES 3.1/3.2 hardware compute!
+dependencies {
+}

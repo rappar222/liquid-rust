@@ -54,6 +54,7 @@ pub struct GpuSphSolver {
     pipeline_delta_positions: wgpu::ComputePipeline,
     pipeline_apply_delta: wgpu::ComputePipeline,
     pipeline_update_velocity: wgpu::ComputePipeline,
+    pipeline_vorticity: wgpu::ComputePipeline,
 
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: Option<wgpu::BindGroup>,
@@ -277,6 +278,15 @@ impl GpuSphSolver {
             cache: None,
         });
 
+        let pipeline_vorticity = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Pipeline Apply Vorticity"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("apply_vorticity"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("PBF Uniform Buffer"),
             size: std::mem::size_of::<GpuUniforms>() as u64,
@@ -295,6 +305,7 @@ impl GpuSphSolver {
             pipeline_delta_positions,
             pipeline_apply_delta,
             pipeline_update_velocity,
+            pipeline_vorticity,
             bind_group_layout,
             bind_group: None,
             uniform_buf,
@@ -471,6 +482,64 @@ impl GpuSphSolver {
         self.bind_group = Some(bind_group);
     }
 
+    /// Incrementally synchronize CPU particle changes (e.g. faucet emissions or drain removals)
+    /// without reallocating GPU buffers whenever `particles.len() <= self.particle_capacity`.
+    pub fn sync_particles(
+        &mut self,
+        bounds: Aabb,
+        config: &SolverConfig,
+        particles: &[Particle],
+        append_only: bool,
+    ) {
+        let new_count = particles.len();
+        if self.particle_buf.is_none() || new_count > self.particle_capacity {
+            self.init_buffers(bounds, config, particles);
+            return;
+        }
+        if new_count == 0 {
+            self.particle_count = 0;
+            return;
+        }
+
+        let p_buf = self.particle_buf.as_ref().unwrap();
+        if append_only && new_count > self.particle_count {
+            let start = self.particle_count;
+            let added = &particles[start..new_count];
+            let mut gpu_added = Vec::with_capacity(added.len());
+            for p in added {
+                let p_type = if p.particle_type == ParticleType::Boundary {
+                    1.0f32
+                } else {
+                    0.0f32
+                };
+                gpu_added.push(GpuParticle {
+                    pos_type: [p.position.x, p.position.y, p.position.z, p_type],
+                    vel_dens: [p.velocity.x, p.velocity.y, p.velocity.z, p.density],
+                });
+            }
+            let byte_offset = (start * std::mem::size_of::<GpuParticle>()) as u64;
+            self.queue
+                .write_buffer(p_buf, byte_offset, bytemuck::cast_slice(&gpu_added));
+            self.particle_count = new_count;
+        } else {
+            let mut gpu_all = Vec::with_capacity(new_count);
+            for p in particles {
+                let p_type = if p.particle_type == ParticleType::Boundary {
+                    1.0f32
+                } else {
+                    0.0f32
+                };
+                gpu_all.push(GpuParticle {
+                    pos_type: [p.position.x, p.position.y, p.position.z, p_type],
+                    vel_dens: [p.velocity.x, p.velocity.y, p.velocity.z, p.density],
+                });
+            }
+            self.queue
+                .write_buffer(p_buf, 0, bytemuck::cast_slice(&gpu_all));
+            self.particle_count = new_count;
+        }
+    }
+
     pub fn step(
         &mut self,
         bounds: Aabb,
@@ -561,8 +630,10 @@ impl GpuSphSolver {
         }
 
         let (m_orig, m_dir) = if let Some(ray) = mouse_ray {
-            ([ray.origin.x, ray.origin.y, ray.origin.z, mouse_force_strength],
-             [ray.direction.x, ray.direction.y, ray.direction.z, mouse_force_mode as f32])
+            (
+                [ray.origin.x, ray.origin.y, ray.origin.z, mouse_force_strength],
+                [ray.direction.x, ray.direction.y, ray.direction.z, mouse_force_mode as f32],
+            )
         } else {
             ([0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
         };
@@ -573,6 +644,9 @@ impl GpuSphSolver {
         let dt_factor = (sub_dt / dt_ref).clamp(0.0001, 1.0);
         let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
         let max_displacement = (config.particle_radius * 0.45).max(h * 0.25) * dt_factor;
+
+        let mut ch_info = chamber.gpu_info(&bounds);
+        ch_info[1] = config.vorticity.max(0.0);
 
         let uniforms = GpuUniforms {
             bounds_min: [bounds.min.x, bounds.min.y, bounds.min.z, self.cell_size],
@@ -603,7 +677,7 @@ impl GpuSphSolver {
                 num_colliders | (if is_2d { 0x80000000 } else { 0 }),
             ],
             colliders: gpu_colliders,
-            chamber_info: chamber.gpu_info(&bounds),
+            chamber_info: ch_info,
         };
 
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
@@ -619,94 +693,59 @@ impl GpuSphSolver {
         };
 
         let bind_group = self.bind_group.as_ref().unwrap();
+        let has_vorticity = config.vorticity > 1e-5;
 
-        for _ in 0..substeps {
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("PBF Substep Encoder"),
+        // Batch ALL substeps and solver dispatches into a single CommandEncoder,
+        // single ComputePass, and single GPU queue submission per frame!
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("PBF Frame Batched Encoder"),
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("PBF Batched Frame Compute Pass"),
+                timestamp_writes: None,
             });
+            cpass.set_bind_group(0, bind_group, &[]);
 
-            // 1. Predict positions
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("PBF Predict Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_bind_group(0, bind_group, &[]);
+            for _ in 0..substeps {
+                // 1. Predict positions
                 cpass.set_pipeline(&self.pipeline_predict);
                 cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-            }
 
-            // 2. Clear uniform grid
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("PBF Clear Grid Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_bind_group(0, bind_group, &[]);
+                // 2. Clear uniform grid
                 cpass.set_pipeline(&self.pipeline_clear_grid);
                 cpass.dispatch_workgroups(workgroups_cells, 1, 1);
-            }
 
-            // 3. Insert particles into grid
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("PBF Insert Grid Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_bind_group(0, bind_group, &[]);
+                // 3. Insert particles into grid
                 cpass.set_pipeline(&self.pipeline_insert_particles);
                 cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-            }
 
-            // 4. PBF Solver Iterations
-            for _ in 0..config.solver_iterations {
-                // 4a. Compute density & lambda
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("PBF Density Lambda Pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_bind_group(0, bind_group, &[]);
+                // 4. PBF Solver Iterations
+                for _ in 0..config.solver_iterations {
                     cpass.set_pipeline(&self.pipeline_density_lambda);
                     cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-                }
 
-                // 4b. Compute displacement delta
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("PBF Delta Positions Pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_bind_group(0, bind_group, &[]);
                     cpass.set_pipeline(&self.pipeline_delta_positions);
                     cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-                }
 
-                // 4c. Apply delta & boundary collision
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("PBF Apply Delta Pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_bind_group(0, bind_group, &[]);
                     cpass.set_pipeline(&self.pipeline_apply_delta);
                     cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
                 }
-            }
 
-            // 5. Update velocity & XSPH viscosity
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("PBF Update Velocity Pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_bind_group(0, bind_group, &[]);
+                // 5. Update velocity, XSPH viscosity & Vorticity Curl
                 cpass.set_pipeline(&self.pipeline_update_velocity);
                 cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-            }
 
-            self.queue.submit(Some(encoder.finish()));
+                // 6. Vorticity Confinement (only when enabled)
+                if has_vorticity {
+                    cpass.set_pipeline(&self.pipeline_vorticity);
+                    cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
+                }
+            }
         }
+
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Read particle data back from GPU to CPU

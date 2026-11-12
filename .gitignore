@@ -3,6 +3,7 @@ Cargo.lock
 exports/
 *.ply
 *.mp4
-dist/
+/dist/
+/*.tar.gz
 .DS_Store
 renders/

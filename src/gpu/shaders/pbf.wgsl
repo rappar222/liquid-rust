@@ -369,7 +369,7 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
                             var s_corr = 0.0;
                             if (lambda_sum < -1e-6) {
                                 let w_r = poly6(r2, h2, poly6_factor);
-                                let ratio = w_r / w_q;
+                                let ratio = min(w_r / w_q, 1.5);
                                 s_corr = -tensile_k * (ratio * ratio * ratio * ratio) * (h * h);
                             }
                             
@@ -377,8 +377,13 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
                             delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
                             
                             if (surface_tension > 0.0) {
-                                let w_r = poly6(r2, h2, poly6_factor);
-                                let cohesion = (w_r * surface_tension * 0.05) / rho0;
+                                let q = r / h;
+                                let omq = 1.0 - q;
+                                let c_q = 64.0 * (q * q * q) * (omq * omq * omq);
+                                let rho_i = particles[i].vel_dens.w;
+                                let rho_j = particles[j].vel_dens.w;
+                                let surf_w = clamp(2.0 - (rho_i + rho_j) * inv_rho0, 0.15, 1.40);
+                                let cohesion = c_q * surf_w * surface_tension * 0.016 * h;
                                 delta -= (r_vec / r) * cohesion;
                             }
                         }
@@ -404,7 +409,7 @@ fn apply_delta_and_collide(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     
-    var pos = predicted_positions[i].xyz + delta_positions[i].xyz;
+    var pos = predicted_positions[i].xyz + delta_positions[i].xyz * 0.65;
     let radius = uniforms.bounds_max.w;
     
     // Chamber bounds collision
@@ -572,45 +577,77 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
             vel.z *= slip;
         }
     } else {
-        let slip = clamp(1.0 - (1.0 - friction) * dt * 3.0, 0.98, 1.0);
+        let slip = clamp(1.0 - (1.0 - friction) * dt * 3.0, 0.95, 1.0);
+        let rest_threshold = 0.10;
         if (new_pos.y <= b_min.y + radius + margin) {
             if (vel.y < 0.0) {
-                vel.y = -vel.y * restitution;
+                if (vel.y < -rest_threshold) {
+                    vel.y = -vel.y * restitution;
+                } else {
+                    vel.y = 0.0;
+                }
+            } else if (vel.y > 0.0 && vel.y < 0.20 && new_pos.y <= b_min.y + radius + 0.001) {
+                vel.y *= 0.1;
             }
             vel.x *= slip;
             vel.z *= slip;
         }
         if (new_pos.y >= b_max.y - radius - margin && vel.y > 0.0) {
-            vel.y = -vel.y * restitution;
+            if (vel.y > rest_threshold) {
+                vel.y = -vel.y * restitution;
+            } else {
+                vel.y = 0.0;
+            }
             vel.x *= slip;
             vel.z *= slip;
         }
         if (new_pos.x <= b_min.x + radius + margin && vel.x < 0.0) {
-            vel.x = -vel.x * restitution;
+            if (vel.x < -rest_threshold) {
+                vel.x = -vel.x * restitution;
+            } else {
+                vel.x = 0.0;
+            }
             vel.y *= slip;
             vel.z *= slip;
         }
         if (new_pos.x >= b_max.x - radius - margin && vel.x > 0.0) {
-            vel.x = -vel.x * restitution;
+            if (vel.x > rest_threshold) {
+                vel.x = -vel.x * restitution;
+            } else {
+                vel.x = 0.0;
+            }
             vel.y *= slip;
             vel.z *= slip;
         }
         if (new_pos.z <= b_min.z + radius + margin && vel.z < 0.0) {
-            vel.z = -vel.z * restitution;
+            if (vel.z < -rest_threshold) {
+                vel.z = -vel.z * restitution;
+            } else {
+                vel.z = 0.0;
+            }
             vel.x *= slip;
             vel.y *= slip;
         }
         if (new_pos.z >= b_max.z - radius - margin && vel.z > 0.0) {
-            vel.z = -vel.z * restitution;
+            if (vel.z > rest_threshold) {
+                vel.z = -vel.z * restitution;
+            } else {
+                vel.z = 0.0;
+            }
             vel.x *= slip;
             vel.y *= slip;
         }
     }
-    // XSPH Viscosity
+    // Fused XSPH Viscosity + Vorticity Curl
     let viscosity = uniforms.fluid_params.x;
-    if (viscosity > 0.0) {
+    let vort_eps = uniforms.chamber_info.y;
+    var curl = vec3<f32>(0.0);
+    if (viscosity > 0.0 || vort_eps > 1e-5) {
+        let h = uniforms.kernel_params.x;
         let h2 = uniforms.kernel_params.y;
+        let inv_rho0 = uniforms.kernel_params.z;
         let poly6_factor = uniforms.kernel_factors.x;
+        let spiky_factor = uniforms.kernel_factors.y;
         let cell_size = uniforms.bounds_min.w;
         let dim = uniforms.grid_dim.xyz;
         
@@ -650,10 +687,17 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
                             let r_vec = new_pos - pos_j;
                             let r2 = dot(r_vec, r_vec);
                             if (r2 < h2 && r2 > 1e-12) {
-                                let w_ij = poly6(r2, h2, poly6_factor);
-                                let v_j = (predicted_positions[j].xyz - old_positions[j].xyz) / dt;
-                                sum_v_diff += (v_j - vel) * w_ij;
-                                sum_weights += w_ij;
+                                let v_j = (pos_j - old_positions[j].xyz) / dt;
+                                if (viscosity > 0.0) {
+                                    let w_ij = poly6(r2, h2, poly6_factor);
+                                    sum_v_diff += (v_j - vel) * w_ij;
+                                    sum_weights += w_ij;
+                                }
+                                if (vort_eps > 1e-5) {
+                                    let r = sqrt(r2);
+                                    let grad_w = spiky_gradient(r_vec, r, h, spiky_factor);
+                                    curl += cross(vel - v_j, grad_w) * inv_rho0;
+                                }
                             }
                         }
                     }
@@ -661,7 +705,7 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
         
-        if (sum_weights > 1e-6) {
+        if (viscosity > 0.0 && sum_weights > 1e-6) {
             vel += (sum_v_diff / sum_weights) * viscosity;
         }
     }
@@ -678,6 +722,111 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
         vel.z = 0.0;
     }
 
+    delta_positions[i] = vec4<f32>(curl, length(curl));
     particles[i].pos_type = vec4<f32>(new_pos, p_type);
     particles[i].vel_dens = vec4<f32>(vel, particles[i].vel_dens.w);
+}
+
+// 8. Vorticity Confinement Pass (Macklin & Müller 2013)
+@compute @workgroup_size(256)
+fn apply_vorticity(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= uniforms.counts.x) {
+        return;
+    }
+    if (particles[i].pos_type.w > 0.5) {
+        return;
+    }
+
+    var vel = particles[i].vel_dens.xyz;
+    let speed = length(vel);
+    let flow_gate = clamp((speed - 0.08) / 0.35, 0.0, 1.0);
+    if (flow_gate <= 0.0) {
+        return;
+    }
+
+    let omega_data = delta_positions[i];
+    let omega_i = omega_data.xyz;
+    let omega_i_mag = omega_data.w;
+    if (omega_i_mag <= 1e-4) {
+        return;
+    }
+
+    let pos_i = particles[i].pos_type.xyz;
+    let h = uniforms.kernel_params.x;
+    let h2 = uniforms.kernel_params.y;
+    let inv_rho0 = uniforms.kernel_params.z;
+    let spiky_factor = uniforms.kernel_factors.y;
+    let cell_size = uniforms.bounds_min.w;
+    let b_min = uniforms.bounds_min.xyz;
+    let dim = uniforms.grid_dim.xyz;
+    let dt = uniforms.gravity.w;
+    let vort_eps = uniforms.chamber_info.y;
+
+    let cell = clamp(
+        vec3<i32>((pos_i - b_min) / cell_size),
+        vec3<i32>(0),
+        vec3<i32>(dim) - vec3<i32>(1)
+    );
+
+    let is_2d = (uniforms.counts.w & 0x80000000u) != 0u;
+    let z_min = select(-1, 0, is_2d);
+    let z_max = select(1, 0, is_2d);
+
+    var eta = vec3<f32>(0.0);
+    for (var dz = z_min; dz <= z_max; dz++) {
+        let cz = cell.z + dz;
+        if (cz < 0 || cz >= i32(dim.z)) { continue; }
+        for (var dy = -1; dy <= 1; dy++) {
+            let cy = cell.y + dy;
+            if (cy < 0 || cy >= i32(dim.y)) { continue; }
+            for (var dx = -1; dx <= 1; dx++) {
+                let cx = cell.x + dx;
+                if (cx < 0 || cx >= i32(dim.x)) { continue; }
+
+                let c_idx = u32(cx + cy * i32(dim.x) + cz * i32(dim.x * dim.y));
+                var curr = atomicLoad(&grid_heads[c_idx]);
+                var iter_count = 0u;
+                while (curr != 0u && iter_count < 128u) {
+                    let j = curr - 1u;
+                    curr = grid_next[j];
+                    iter_count++;
+
+                    if (i != j) {
+                        let pos_j = predicted_positions[j].xyz;
+                        let r_vec = pos_i - pos_j;
+                        let r2 = dot(r_vec, r_vec);
+                        if (r2 < h2 && r2 > 1e-12) {
+                            let r = sqrt(r2);
+                            let omega_j_mag = delta_positions[j].w;
+                            let grad_w = spiky_gradient(r_vec, r, h, spiky_factor);
+                            eta += grad_w * ((omega_j_mag - omega_i_mag) * inv_rho0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let eta_len = length(eta);
+    if (eta_len > 1e-5) {
+        let n_dir = eta / eta_len;
+        let f_vort = cross(n_dir, omega_i) * (vort_eps * h * 8.0 * flow_gate);
+        var dv = f_vort * dt;
+        let dv_len = length(dv);
+        let max_dv = speed * 0.22;
+        if (dv_len > max_dv && dv_len > 1e-6) {
+            dv *= (max_dv / dv_len);
+        }
+        vel += dv;
+        if (is_2d) {
+            vel.z = 0.0;
+        }
+        let max_v = uniforms.fluid_params.z;
+        let final_speed = length(vel);
+        if (final_speed > max_v && final_speed > 1e-6) {
+            vel *= (max_v / final_speed);
+        }
+        particles[i].vel_dens = vec4<f32>(vel, particles[i].vel_dens.w);
+    }
 }

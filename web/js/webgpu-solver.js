@@ -3,9 +3,9 @@
 // Includes Akinci free-surface cohesion, flow-gated vorticity confinement,
 // and single-encoder / single-pass substep batching for minimal driver overhead.
 
-import { Vec3, Aabb } from './math.js?v=20261113e';
-import { ScenePreset } from './pbf-solver.js?v=20261113e';
-import { PBF_COMPUTE_WGSL } from './pbf-shader.js?v=20261113e';
+import { Vec3, Aabb } from './math.js?v=20261113b';
+import { ScenePreset } from './pbf-solver.js?v=20261113b';
+import { PBF_COMPUTE_WGSL } from './pbf-shader.js?v=20261113b';
 
 export class WebGpuSolver {
     constructor(device) {

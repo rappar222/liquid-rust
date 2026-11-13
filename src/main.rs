@@ -29,7 +29,7 @@ struct Args {
     #[arg(long)]
     headless: bool,
 
-    /// Run simulation in 2D mode (planar fluid physics on XY plane)
+    /// Run CLI headless rendering in 2D mode (GUI uses the built-in 3D / 2D switch button)
     #[arg(long = "2d", alias = "two-d")]
     mode_2d: bool,
 
@@ -1458,12 +1458,10 @@ fn run_gui(
     parsed_faucets: Vec<Faucet>,
     parsed_drains: Vec<Drain>,
 ) -> Result<(), eframe::Error> {
-    let is_2d = args.mode_2d;
-    let window_title = if is_2d {
-        "LiquidRust Studio — 2D Planar Fluid Lab"
-    } else {
-        "LiquidRust Studio — 3D SPH & Surface Meshing"
-    };
+    if args.mode_2d {
+        eprintln!("Note: --2d is for headless CLI rendering only; switch between 3D and 2D directly using the toolbar button.");
+    }
+    let window_title = "LiquidRust Studio — 2D/3D SPH & Surface Meshing";
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1492,9 +1490,6 @@ fn run_gui(
         native_options,
         Box::new(move |cc| {
             let mut app = LiquidApp::new(cc);
-            if is_2d {
-                app.set_2d(true);
-            }
             if (args.speed - 1.0).abs() > 1e-4 {
                 app.sim_speed = args.speed;
             }

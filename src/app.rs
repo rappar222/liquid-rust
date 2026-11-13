@@ -1123,6 +1123,46 @@ impl LiquidApp {
     }
 
     fn draw_scene_tab(&mut self, ui: &mut egui::Ui) {
+        // 0. 3D / 2D Simulation Space Switcher
+        Self::section_card(ui, "Simulation Space", |ui| {
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 6.0) * 0.5;
+                let btn_3d = egui::Button::new(
+                    egui::RichText::new("🌐 3D Volumetric").strong().color(if !self.is_2d {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_rgb(175, 190, 210)
+                    }),
+                )
+                .fill(if !self.is_2d {
+                    egui::Color32::from_rgb(14, 116, 184)
+                } else {
+                    egui::Color32::from_rgb(30, 38, 50)
+                });
+                if ui.add_sized([w, 26.0], btn_3d).clicked() && self.is_2d {
+                    self.set_2d(false);
+                }
+
+                let btn_2d = egui::Button::new(
+                    egui::RichText::new("▭ 2D Planar").strong().color(if self.is_2d {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_rgb(175, 190, 210)
+                    }),
+                )
+                .fill(if self.is_2d {
+                    egui::Color32::from_rgb(14, 116, 184)
+                } else {
+                    egui::Color32::from_rgb(30, 38, 50)
+                });
+                if ui.add_sized([w, 26.0], btn_2d).clicked() && !self.is_2d {
+                    self.set_2d(true);
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+
         // 1. Scene Presets
         Self::section_card(ui, "Scene Presets", |ui| {
             egui::Grid::new("preset_grid")
@@ -2159,12 +2199,38 @@ impl eframe::App for LiquidApp {
                             .color(egui::Color32::from_rgb(235, 244, 255)),
                     );
 
+                    let active_fill = egui::Color32::from_rgb(14, 116, 184);
+                    let idle_fill = egui::Color32::from_rgb(32, 41, 54);
+                    let btn_3d = egui::Button::new(
+                        egui::RichText::new("🌐 3D")
+                            .strong()
+                            .size(13.0)
+                            .color(if !self.is_2d { egui::Color32::WHITE } else { egui::Color32::from_rgb(175, 190, 210) }),
+                    )
+                    .fill(if !self.is_2d { active_fill } else { idle_fill });
                     if ui
-                        .selectable_label(self.is_2d, if self.is_2d { "2D" } else { "3D" })
-                        .on_hover_text("Toggle between 2D Planar and 3D Volumetric simulation")
+                        .add(btn_3d)
+                        .on_hover_text("Switch to 3D Volumetric simulation")
                         .clicked()
+                        && self.is_2d
                     {
-                        self.set_2d(!self.is_2d);
+                        self.set_2d(false);
+                    }
+
+                    let btn_2d = egui::Button::new(
+                        egui::RichText::new("▭ 2D")
+                            .strong()
+                            .size(13.0)
+                            .color(if self.is_2d { egui::Color32::WHITE } else { egui::Color32::from_rgb(175, 190, 210) }),
+                    )
+                    .fill(if self.is_2d { active_fill } else { idle_fill });
+                    if ui
+                        .add(btn_2d)
+                        .on_hover_text("Switch to 2D Planar simulation")
+                        .clicked()
+                        && !self.is_2d
+                    {
+                        self.set_2d(true);
                     }
 
                     ui.separator();

@@ -588,7 +588,7 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
         "obj" | "mesh" => {
             if parts.len() < 4 {
                 return Err(format!(
-                    "Invalid obj spec '{}'. Format: obj:filepath:x,y,z:scale",
+                    "Invalid obj spec '{}'. Format: obj:filepath:x,y,z:scale[:rx,ry,rz]",
                     spec
                 ));
             }
@@ -598,7 +598,13 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
                 .trim()
                 .parse::<f32>()
                 .map_err(|e| format!("invalid scale: {}", e))?;
-            let mut col = Collider::load_obj(path, pos, scale)
+            let rot_rad = if parts.len() >= 5 {
+                let deg = parse_vec3(&parts[4])?;
+                glam::Vec3::new(deg.x.to_radians(), deg.y.to_radians(), deg.z.to_radians())
+            } else {
+                glam::Vec3::ZERO
+            };
+            let mut col = Collider::load_obj_transformed(path, pos, scale, rot_rad)
                 .map_err(|e| format!("failed to load OBJ '{}': {}", path, e))?;
             col.name = format!("OBJ #{} ({})", index + 1, path);
             col.id = (index + 1) as u32;
@@ -1289,17 +1295,29 @@ fn run_headless(
                 .iter()
                 .any(|c| c.enabled && matches!(c.shape, ColliderShape::Mesh(_)));
             if has_mesh_col {
+                use rayon::prelude::*;
                 let radius = solver.config.particle_radius;
-                let mut hit = false;
-                for col in &solver.colliders {
-                    if let ColliderShape::Mesh(_) = &col.shape {
-                        for p in &mut solver.particles {
-                            hit |= col.resolve(&mut p.position, &mut p.velocity, radius);
+                let colliders = &solver.colliders;
+                let is_2d = args.mode_2d;
+                let hit = solver
+                    .particles
+                    .par_iter_mut()
+                    .map(|p| {
+                        let mut p_hit = false;
+                        for col in colliders {
+                            if let ColliderShape::Mesh(_) = &col.shape {
+                                p_hit |= col.resolve(&mut p.position, &mut p.velocity, radius);
+                            }
                         }
-                    }
-                }
+                        if p_hit && is_2d {
+                            p.position.z = 0.0;
+                            p.velocity.z = 0.0;
+                        }
+                        p_hit
+                    })
+                    .reduce(|| false, |a, b| a || b);
                 if hit {
-                    gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, true);
+                    gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, false);
                 }
             }
 

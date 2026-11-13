@@ -1008,17 +1008,12 @@ void main() {
         let s = mesh.scale;
         let pos = mesh.position;
 
-        for tri in &mesh.triangles {
-            let v0 = pos + (rot_mat * (tri.a * s));
-            let v1 = pos + (rot_mat * (tri.b * s));
-            let v2 = pos + (rot_mat * (tri.c * s));
-
+        lines.reserve(mesh.wireframe_segments.len() * 2);
+        for &[a, b] in mesh.wireframe_segments.iter() {
+            let v0 = pos + (rot_mat * (a * s));
+            let v1 = pos + (rot_mat * (b * s));
             lines.push(LineVertex { pos: v0.to_array() });
             lines.push(LineVertex { pos: v1.to_array() });
-            lines.push(LineVertex { pos: v1.to_array() });
-            lines.push(LineVertex { pos: v2.to_array() });
-            lines.push(LineVertex { pos: v2.to_array() });
-            lines.push(LineVertex { pos: v0.to_array() });
         }
     }
 

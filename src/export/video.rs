@@ -1059,7 +1059,7 @@ impl SoftwareRenderer {
         let w_i = self.width as i32;
         let h_i = self.height as i32;
 
-        for tri in &tri_mesh.triangles {
+        for tri in tri_mesh.triangles.iter() {
             let p0 = pos + rot * (tri.a * s);
             let p1 = pos + rot * (tri.b * s);
             let p2 = pos + rot * (tri.c * s);

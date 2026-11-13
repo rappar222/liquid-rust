@@ -1028,3 +1028,97 @@ fn test_boundary_contribution_prevents_edge_compression_and_wall_sticking() {
         stuck_high
     );
 }
+
+#[test]
+fn test_high_poly_obj_bvh_normalization_and_transforms() {
+    use liquid_rust::sph::{Collider, ColliderShape};
+    use std::io::Write;
+    use std::time::Instant;
+
+    // Build a 32,000-triangle UV sphere in giant millimeter coordinates (-2500..+2500)
+    // plus degenerate zero-area faces to verify crash-proof BVH + auto-normalization.
+    let rings = 128usize;
+    let segs = 128usize;
+    let mm_radius = 2500.0f32;
+    let mm_offset = Vec3::new(12_000.0, -8_500.0, 4_200.0);
+
+    let tmp_path = std::env::temp_dir().join("liquid_rust_bvh_stress_test.obj");
+    {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp_path).unwrap());
+        writeln!(f, "# High-poly millimeter OBJ stress test").unwrap();
+        for r in 0..=rings {
+            let phi = std::f32::consts::PI * (r as f32 / rings as f32);
+            for s in 0..=segs {
+                let theta = std::f32::consts::TAU * (s as f32 / segs as f32);
+                let v = mm_offset
+                    + Vec3::new(
+                        mm_radius * phi.sin() * theta.cos(),
+                        mm_radius * phi.cos(),
+                        mm_radius * phi.sin() * theta.sin(),
+                    );
+                writeln!(f, "v {:.4} {:.4} {:.4}", v.x, v.y, v.z).unwrap();
+            }
+        }
+        let stride = segs + 1;
+        for r in 0..rings {
+            for s in 0..segs {
+                let i0 = r * stride + s + 1;
+                let i1 = i0 + 1;
+                let i2 = (r + 1) * stride + s + 1;
+                let i3 = i2 + 1;
+                writeln!(f, "f {} {} {}", i0, i2, i1).unwrap();
+                writeln!(f, "f {} {} {}", i1, i2, i3).unwrap();
+            }
+        }
+        // Degenerate collinear/duplicate faces
+        writeln!(f, "f 1 1 2").unwrap();
+        writeln!(f, "f 2 2 2").unwrap();
+    }
+
+    let mut col = Collider::load_obj(&tmp_path, Vec3::new(0.0, 0.5, 0.0), 0.45)
+        .expect("High-poly millimeter OBJ must load cleanly");
+    let _ = std::fs::remove_file(&tmp_path);
+
+    if let ColliderShape::Mesh(ref mut mesh_arc) = col.shape {
+        let mesh = std::sync::Arc::make_mut(mesh_arc);
+        let size = mesh.world_bounds.size();
+        assert!(
+            (size.max_element() - 0.45).abs() < 0.02,
+            "5000mm OBJ should normalize to ~0.45m world diameter, got {:?}",
+            size
+        );
+        assert!(
+            mesh.wireframe_segments.len() <= 24_000,
+            "Wireframe segments must be capped for smooth viewport FPS"
+        );
+
+        // Rotate, scale, and move via transform API
+        mesh.set_transform(
+            Vec3::new(0.15, 0.42, -0.10),
+            0.60,
+            Vec3::new(35.0f32.to_radians(), -50.0f32.to_radians(), 20.0f32.to_radians()),
+        );
+    }
+
+    // Benchmark 20,000 fluid particles resolving against ~32k triangles via BVH
+    let t0 = Instant::now();
+    let mut hits = 0usize;
+    for i in 0..20_000 {
+        let fx = ((i % 25) as f32 / 24.0) * 1.2 - 0.6;
+        let fy = (((i / 25) % 32) as f32 / 31.0) * 1.0;
+        let fz = ((i / 800) as f32 / 24.0) * 1.2 - 0.6;
+        let mut p = Vec3::new(fx, fy, fz);
+        let mut v = Vec3::new(0.0, -1.5, 0.0);
+        if col.resolve(&mut p, &mut v, 0.015) {
+            hits += 1;
+        }
+        assert!(p.is_finite() && v.is_finite(), "Collision must never produce NaN");
+    }
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    assert!(hits > 0, "Particles near transformed sphere surface must collide");
+    assert!(
+        elapsed_ms < 250.0,
+        "BVH mesh collision for 20k particles x 32k tris took {:.2} ms (too slow!)",
+        elapsed_ms
+    );
+}

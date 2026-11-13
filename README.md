@@ -61,8 +61,9 @@ Once installed, run `liquid-rust` from any directory — and update anytime via 
   - Perceptual colormaps: **Ocean**, **Turbo (Google Rainbow)**, **Viridis**, **Fire / Magma**.
 
 - **Interactive Fluid Manipulation**:
-  - Hold `Shift` + Left Drag to **attract** fluid towards the mouse ray.
-  - Hold `Shift` + Right Drag to **repel** fluid.
+  - Left-Click Drag to **attract** fluid towards the mouse ray.
+  - Hold `Shift` + Left-Click Drag to **repel** fluid.
+  - Middle-Click Drag to **pan** the camera, and Right-Click Drag to **orbit** (3D).
   - Add and interactively move solid obstacles (spheres, boxes) in real time.
 
 - **Blender / VFX Point Cloud & MP4 Video Export**:
@@ -148,11 +149,11 @@ cargo run --release
 
 | Action | Control |
 | :--- | :--- |
-| **Orbit Camera** | Left-Click + Drag in Viewport |
-| **Pan Camera** | Right-Click / Middle-Click + Drag |
+| **Attract Fluid** | Left-Click + Drag in Viewport |
+| **Repel Fluid** | `Shift` + Left-Click + Drag |
+| **Pan Camera** | Middle-Click + Drag |
+| **Orbit Camera (3D)** | Right-Click + Drag |
 | **Zoom In / Out** | Scroll Wheel |
-| **Attract Fluid** | `Shift` + Left-Click Drag |
-| **Repel Fluid** | `Shift` + Right-Click Drag |
 | **Play / Pause** | Top Toolbar Button or Space |
 | **Step Single Frame** | `⏭ Step` Button |
 | **Reset Simulation** | `🔄 Reset` Button |

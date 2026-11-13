@@ -1694,9 +1694,9 @@ impl LiquidApp {
 
         Self::section_card(ui, "Interactive Viewport Forces", |ui| {
             ui.weak(if self.is_2d {
-                "Left Drag: Attract Fluid • Right Drag: Repel Fluid • Shift+Drag: Pan"
+                "Left Drag: Attract • Shift+Left Drag: Repel • Middle Drag: Pan"
             } else {
-                "Shift+Left Drag: Attract Fluid • Shift+Right Drag: Repel Fluid"
+                "Left Drag: Attract • Shift+Left Drag: Repel • Middle: Pan • Right: Orbit"
             });
             ui.add(
                 egui::Slider::new(&mut self.solver.mouse_force_strength, 10.0..=120.0)
@@ -2477,9 +2477,9 @@ impl eframe::App for LiquidApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.weak(if self.is_2d {
-                            "Space: Play/Pause • Drag: Attract/Repel • Shift+Drag: Pan • Scroll: Zoom"
+                            "Space: Play/Pause • Left-Drag: Attract • Shift+Left-Drag: Repel • Middle-Drag: Pan • Scroll: Zoom"
                         } else {
-                            "Space: Play/Pause • Left-Drag: Orbit • Right-Drag: Pan • Shift+Drag: Fluid Force"
+                            "Space: Play/Pause • Left-Drag: Attract • Shift+Left-Drag: Repel • Middle-Drag: Pan • Right-Drag: Orbit"
                         });
                     });
                 });
@@ -2555,16 +2555,14 @@ impl eframe::App for LiquidApp {
                 let fov_y = self.camera.fov_y;
                 let eye_pos = self.camera.eye_position();
 
-                // Handle Fluid Interaction and Camera Navigation
-                let interact_active = (is_2d && !is_shift_held) || (!is_2d && is_shift_held);
-                if interact_active
-                    && response.hovered()
-                    && (response.dragged_by(egui::PointerButton::Primary)
-                        || response.dragged_by(egui::PointerButton::Secondary))
-                {
-                    if let Some(hover_pos) = response.hover_pos() {
-                        let local_x = hover_pos.x - rect.min.x;
-                        let local_y = hover_pos.y - rect.min.y;
+                // Handle Fluid Interaction (Left-Drag = Attract, Shift + Left-Drag = Repel)
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    if let Some(pointer_pos) = response
+                        .interact_pointer_pos()
+                        .or_else(|| response.hover_pos())
+                    {
+                        let local_x = (pointer_pos.x - rect.min.x).clamp(0.0, rect.width());
+                        let local_y = (pointer_pos.y - rect.min.y).clamp(0.0, rect.height());
                         let ray = unproject_mouse_ray(
                             glam::vec2(local_x, local_y),
                             glam::vec2(rect.width(), rect.height()),
@@ -2572,37 +2570,19 @@ impl eframe::App for LiquidApp {
                             proj,
                         );
                         self.solver.mouse_ray = Some(ray);
-
-                        if response.dragged_by(egui::PointerButton::Primary) {
-                            self.solver.mouse_force_mode = 1;
-                        } else if response.dragged_by(egui::PointerButton::Secondary) {
-                            self.solver.mouse_force_mode = -1;
-                        }
+                        self.solver.mouse_force_mode = if is_shift_held { -1 } else { 1 };
                     }
                 } else {
                     self.solver.mouse_force_mode = 0;
                 }
 
-                // Camera panning / rotation
-                if is_2d {
-                    if response.dragged_by(egui::PointerButton::Middle)
-                        || (is_shift_held
-                            && (response.dragged_by(egui::PointerButton::Primary)
-                                || response.dragged_by(egui::PointerButton::Secondary)))
-                    {
-                        let delta = response.drag_delta();
-                        self.camera.pan(delta.x, delta.y);
-                    }
-                } else if !is_shift_held {
-                    if response.dragged_by(egui::PointerButton::Primary) {
-                        let delta = response.drag_delta();
-                        self.camera.rotate(delta.x * 0.006, -delta.y * 0.006);
-                    } else if response.dragged_by(egui::PointerButton::Secondary)
-                        || response.dragged_by(egui::PointerButton::Middle)
-                    {
-                        let delta = response.drag_delta();
-                        self.camera.pan(delta.x, delta.y);
-                    }
+                // Camera Navigation: Middle-Drag = Pan, Right-Drag = Orbit (3D)
+                if response.dragged_by(egui::PointerButton::Middle) {
+                    let delta = response.drag_delta();
+                    self.camera.pan(delta.x, delta.y);
+                } else if !is_2d && response.dragged_by(egui::PointerButton::Secondary) {
+                    let delta = response.drag_delta();
+                    self.camera.rotate(delta.x * 0.006, -delta.y * 0.006);
                 }
 
                 let renderer_arc = self.renderer.clone();

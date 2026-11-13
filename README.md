@@ -8,15 +8,15 @@ A high-performance, real-time 3D fluid simulation engine written in Rust using P
 
 ---
 
-## ⚡ Quick Install
+## ⚡ Quick Install (`/bin/liquid-rust`)
 
-Install `liquid-rust` (both GUI & CLI) with a single command:
+Install `liquid-rust` system-wide into `/bin` (both GUI & CLI, runnable from anywhere) with a single command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rappar222/liquid-rust/main/install.sh | bash
 ```
 
-Or download the latest release bundle from [GitHub Releases](https://github.com/rappar222/liquid-rust/releases), extract and run `./install.sh`.
+Once installed, run `liquid-rust` from any directory — and update anytime via the built-in Studio GUI updater or CLI (`liquid-rust --update`).
 
 ---
 

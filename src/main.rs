@@ -277,6 +277,18 @@ struct Args {
     /// Print performance benchmark statistics
     #[arg(long)]
     benchmark: bool,
+
+    /// Check GitHub Releases for a newer LiquidRust version and exit
+    #[arg(long)]
+    check_update: bool,
+
+    /// Download and install the latest LiquidRust release from GitHub in-place
+    #[arg(long, alias = "self-update")]
+    update: bool,
+
+    /// Force reinstalling the latest GitHub release even if version matches
+    #[arg(long)]
+    force_update: bool,
 }
 
 fn format_time(seconds: f64) -> String {
@@ -1540,7 +1552,18 @@ fn run_gui(
 }
 
 fn main() {
+    liquid_rust::updater::cleanup_old_binary();
     let args = Args::parse();
+
+    if args.check_update {
+        std::process::exit(liquid_rust::updater::run_cli_check_update());
+    }
+    if args.update {
+        std::process::exit(liquid_rust::updater::run_cli_self_update(
+            args.force_update,
+            false,
+        ));
+    }
 
     let mut parsed_colliders = Vec::new();
     for (i, spec) in args.obstacles.iter().enumerate() {

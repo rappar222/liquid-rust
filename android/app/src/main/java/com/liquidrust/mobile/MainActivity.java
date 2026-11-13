@@ -19,6 +19,8 @@ import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
@@ -37,12 +39,14 @@ import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.window.OnBackInvokedCallback;
 import android.window.OnBackInvokedDispatcher;
 
+import java.io.File;
 import java.util.Locale;
 
 /**
@@ -101,6 +105,32 @@ public final class MainActivity extends Activity implements SensorEventListener,
 
     private FrameLayout btnTopTilt;
     private MaterialIconDrawable iconTopTilt;
+
+    private LinearLayout btnTopUpdate;
+    private TextView tvTopUpdate;
+    private String transientBannerText = null;
+
+    // GitHub Self-Updater & Material 3 Update Modal
+    private final AppUpdater appUpdater = new AppUpdater();
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private AppUpdater.ReleaseInfo latestReleaseInfo;
+    private boolean isUpdateModalOpen = false;
+    private boolean isUpdateBusy = false;
+    private boolean waitingPermissionGrant = false;
+    private FrameLayout updateModalScrim;
+    private TextView tvModalTitle;
+    private TextView tvModalMeta;
+    private ScrollView svModalNotes;
+    private TextView tvModalNotes;
+    private ProgressBar pbUpdateProgress;
+    private TextView tvUpdateProgress;
+    private LinearLayout btnModalSecondary;
+    private TextView tvModalSecondary;
+    private LinearLayout btnModalReinstall;
+    private LinearLayout btnModalPrimary;
+    private TextView tvModalPrimary;
+    private TextView tvSheetUpdateSubtitle;
+    private TextView tvSheetUpdateAction;
 
     // Bottom Thumb Dock
     private LinearLayout bottomDock;
@@ -201,6 +231,12 @@ public final class MainActivity extends Activity implements SensorEventListener,
         FrameLayout.LayoutParams sheetLp = createBottomSheetLayoutParams(getResources().getConfiguration());
         root.addView(bottomSheet, sheetLp);
 
+        updateModalScrim = buildUpdateModalScrim();
+        root.addView(updateModalScrim, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             safeTopInset = insets.getSystemWindowInsetTop();
             safeBottomInset = insets.getSystemWindowInsetBottom();
@@ -218,12 +254,33 @@ public final class MainActivity extends Activity implements SensorEventListener,
 
         registerPredictiveBackHandler();
         setContentView(root);
+
+        appUpdater.setInstallErrorListener(err -> {
+            isUpdateBusy = false;
+            waitingPermissionGrant = false;
+            showUpdateErrorState(err);
+        });
+
+        String justUpdated = AppUpdater.consumeJustUpdatedVersion(this);
+        if (justUpdated != null) {
+            transientBannerText = "Updated to v" + justUpdated;
+            refreshStatusText();
+            uiHandler.postDelayed(() -> {
+                transientBannerText = null;
+                refreshStatusText();
+            }, 4500L);
+        }
+
+        // Silent non-blocking GitHub Release check after OpenGL ES shaders finish warming up
+        uiHandler.postDelayed(() -> triggerUpdateCheck(false), 1200L);
     }
 
     private void registerPredictiveBackHandler() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             backCallback = () -> {
-                if (isSheetOpen) {
+                if (isUpdateModalOpen && !isUpdateBusy) {
+                    setUpdateModalOpen(false);
+                } else if (isSheetOpen) {
                     setBottomSheetOpen(false);
                 }
             };
@@ -237,7 +294,7 @@ public final class MainActivity extends Activity implements SensorEventListener,
                 try {
                     dispatcher.unregisterOnBackInvokedCallback(backCallback);
                 } catch (Throwable ignored) {}
-                if (isSheetOpen) {
+                if (isSheetOpen || (isUpdateModalOpen && !isUpdateBusy)) {
                     dispatcher.registerOnBackInvokedCallback(
                         OnBackInvokedDispatcher.PRIORITY_DEFAULT, backCallback);
                 }
@@ -248,6 +305,12 @@ public final class MainActivity extends Activity implements SensorEventListener,
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
+        if (isUpdateModalOpen) {
+            if (!isUpdateBusy) {
+                setUpdateModalOpen(false);
+            }
+            return;
+        }
         if (isSheetOpen) {
             setBottomSheetOpen(false);
             return;
@@ -355,7 +418,46 @@ public final class MainActivity extends Activity implements SensorEventListener,
         View spacer = new View(this);
         row.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
 
-        // Right Cluster: [2D/3D Pill]  [Tilt Circle]  [Reset Circle]
+        // Right Cluster: [Update Pill (when available)]  [2D/3D Pill]  [Tilt Circle]  [Reset Circle]
+        btnTopUpdate = new LinearLayout(this);
+        btnTopUpdate.setOrientation(LinearLayout.HORIZONTAL);
+        btnTopUpdate.setGravity(Gravity.CENTER);
+        btnTopUpdate.setMinimumHeight(dp(38));
+        btnTopUpdate.setPadding(dp(11), 0, dp(12), 0);
+        btnTopUpdate.setElevation(dp(5));
+        btnTopUpdate.setBackground(ripplePill(0xFF134E3A, 0xFF34D399, dp(19)));
+        btnTopUpdate.setVisibility(View.GONE);
+
+        MaterialIconDrawable iconTopUpd = new MaterialIconDrawable(
+            MaterialIconDrawable.ICON_UPDATE, 0xFFA7F3D0, dp(16));
+        ImageView ivUpd = new ImageView(this);
+        ivUpd.setImageDrawable(iconTopUpd);
+        LinearLayout.LayoutParams ivUpdLp = new LinearLayout.LayoutParams(dp(16), dp(16));
+        ivUpdLp.rightMargin = dp(5);
+        btnTopUpdate.addView(ivUpd, ivUpdLp);
+
+        tvTopUpdate = new TextView(this);
+        tvTopUpdate.setText("Update");
+        tvTopUpdate.setTextColor(0xFFD1FAE5);
+        tvTopUpdate.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        tvTopUpdate.setTypeface(TF_MEDIUM);
+        tvTopUpdate.setSingleLine(true);
+        btnTopUpdate.addView(tvTopUpdate);
+
+        btnTopUpdate.setOnClickListener(v -> {
+            hapticClick(v);
+            if (latestReleaseInfo != null) {
+                populateModalForRelease(latestReleaseInfo);
+                setUpdateModalOpen(true);
+            } else {
+                triggerUpdateCheck(true);
+            }
+        });
+        LinearLayout.LayoutParams updTopLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(38));
+        updTopLp.rightMargin = dp(8);
+        row.addView(btnTopUpdate, updTopLp);
+
         btnTopDimension = new LinearLayout(this);
         btnTopDimension.setOrientation(LinearLayout.HORIZONTAL);
         btnTopDimension.setGravity(Gravity.CENTER);
@@ -890,6 +992,53 @@ public final class MainActivity extends Activity implements SensorEventListener,
         cardObs.addView(obstacleSlidersWrap);
         col.addView(cardObs, cardTopGap());
 
+        // Section: GitHub Software Updates Card
+        LinearLayout cardUpd = makeM3Card();
+        addCardTitle(cardUpd, "Software Updates");
+
+        String curVer = AppUpdater.getCurrentVersionName(this);
+        tvSheetUpdateSubtitle = makeSubtleLabel(
+            "Installed: v" + curVer + " · Source: github.com/" + AppUpdater.GITHUB_REPO
+        );
+        tvSheetUpdateSubtitle.setPadding(0, 0, 0, dp(10));
+        cardUpd.addView(tvSheetUpdateSubtitle);
+
+        LinearLayout btnCheckRow = new LinearLayout(this);
+        btnCheckRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnCheckRow.setGravity(Gravity.CENTER);
+        btnCheckRow.setMinimumHeight(dp(40));
+        btnCheckRow.setPadding(dp(16), 0, dp(16), 0);
+        btnCheckRow.setBackground(ripplePill(M3_PRIMARY_CONTAINER, 0, dp(20)));
+
+        MaterialIconDrawable icSheetUpd = new MaterialIconDrawable(
+            MaterialIconDrawable.ICON_UPDATE, M3_ON_PRIMARY_CONT, dp(17));
+        ImageView ivSheetUpd = new ImageView(this);
+        ivSheetUpd.setImageDrawable(icSheetUpd);
+        LinearLayout.LayoutParams ivSuLp = new LinearLayout.LayoutParams(dp(17), dp(17));
+        ivSuLp.rightMargin = dp(7);
+        btnCheckRow.addView(ivSheetUpd, ivSuLp);
+
+        tvSheetUpdateAction = new TextView(this);
+        tvSheetUpdateAction.setText("Check for Updates");
+        tvSheetUpdateAction.setTextColor(M3_ON_PRIMARY_CONT);
+        tvSheetUpdateAction.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
+        tvSheetUpdateAction.setTypeface(TF_MEDIUM);
+        btnCheckRow.addView(tvSheetUpdateAction);
+
+        btnCheckRow.setOnClickListener(v -> {
+            hapticClick(v);
+            setBottomSheetOpen(false);
+            if (latestReleaseInfo != null && latestReleaseInfo.isNewer) {
+                populateModalForRelease(latestReleaseInfo);
+                setUpdateModalOpen(true);
+            } else {
+                triggerUpdateCheck(true);
+            }
+        });
+        cardUpd.addView(btnCheckRow, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
+        col.addView(cardUpd, cardTopGap());
+
         return col;
     }
 
@@ -1191,6 +1340,10 @@ public final class MainActivity extends Activity implements SensorEventListener,
 
     private void refreshStatusText() {
         if (tvStatusText == null) return;
+        if (transientBannerText != null) {
+            tvStatusText.setText(transientBannerText);
+            return;
+        }
         String pts = formatParticlesShort(lastParticles);
         if (showDetailedStats) {
             tvStatusText.setText(String.format(Locale.US, "%s · %d FPS · %s · %.1fms",
@@ -1283,6 +1436,421 @@ public final class MainActivity extends Activity implements SensorEventListener,
         super.onResume();
         glView.onResume();
         updateSensorRegistration();
+        if (waitingPermissionGrant && appUpdater.hasPendingPermissionApk()) {
+            if (getPackageManager().canRequestPackageInstalls()) {
+                waitingPermissionGrant = false;
+                appUpdater.continuePendingInstallIfPermitted(this, createDownloadCallback());
+            }
+        }
+    }
+
+    // =========================================================================
+    // 7B. GITHUB SELF-UPDATER MODAL & WORKFLOW
+    // =========================================================================
+
+    private FrameLayout buildUpdateModalScrim() {
+        FrameLayout scrim = new FrameLayout(this);
+        scrim.setBackgroundColor(0xA805080D);
+        scrim.setElevation(dp(30));
+        scrim.setClickable(true);
+        scrim.setVisibility(View.GONE);
+        scrim.setOnClickListener(v -> {
+            if (!isUpdateBusy) {
+                setUpdateModalOpen(false);
+            }
+        });
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setClickable(true);
+        card.setPadding(dp(22), dp(20), dp(22), dp(18));
+        card.setBackground(roundRect(M3_SHEET_SURFACE, 0x38CBE6FF, dp(26)));
+        card.setElevation(dp(32));
+
+        // Header Row: Icon + Title
+        LinearLayout hdr = new LinearLayout(this);
+        hdr.setOrientation(LinearLayout.HORIZONTAL);
+        hdr.setGravity(Gravity.CENTER_VERTICAL);
+
+        FrameLayout badge = new FrameLayout(this);
+        badge.setBackground(roundRect(M3_PRIMARY_CONTAINER, 0, dp(12)));
+        MaterialIconDrawable icHdr = new MaterialIconDrawable(
+            MaterialIconDrawable.ICON_UPDATE, M3_ON_PRIMARY_CONT, dp(20));
+        ImageView ivHdr = new ImageView(this);
+        ivHdr.setImageDrawable(icHdr);
+        badge.addView(ivHdr, new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER));
+        LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(dp(38), dp(38));
+        badgeLp.rightMargin = dp(12);
+        hdr.addView(badge, badgeLp);
+
+        tvModalTitle = new TextView(this);
+        tvModalTitle.setText("Software Update");
+        tvModalTitle.setTextColor(M3_ON_SURFACE);
+        tvModalTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17.5f);
+        tvModalTitle.setTypeface(TF_MEDIUM);
+        hdr.addView(tvModalTitle, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+        card.addView(hdr);
+
+        tvModalMeta = new TextView(this);
+        tvModalMeta.setTextColor(M3_ON_SURFACE_VAR);
+        tvModalMeta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        tvModalMeta.setPadding(0, dp(12), 0, dp(4));
+        card.addView(tvModalMeta);
+
+        // Scrollable Release Notes Box
+        svModalNotes = new ScrollView(this);
+        svModalNotes.setBackground(roundRect(0xFF0E141C, M3_DIVIDER, dp(14)));
+        svModalNotes.setPadding(dp(12), dp(10), dp(12), dp(10));
+        svModalNotes.setVisibility(View.GONE);
+
+        tvModalNotes = new TextView(this);
+        tvModalNotes.setTextColor(0xFFCBD5E1);
+        tvModalNotes.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        tvModalNotes.setLineSpacing(dp(2), 1.0f);
+        svModalNotes.addView(tvModalNotes);
+
+        LinearLayout.LayoutParams notesLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(130));
+        notesLp.topMargin = dp(8);
+        card.addView(svModalNotes, notesLp);
+
+        // Determinate Download Progress Bar + Byte Counter
+        pbUpdateProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        pbUpdateProgress.setMax(1000);
+        pbUpdateProgress.setProgress(0);
+        pbUpdateProgress.setProgressTintList(ColorStateList.valueOf(M3_PRIMARY));
+        pbUpdateProgress.setProgressBackgroundTintList(ColorStateList.valueOf(0xFF263342));
+        pbUpdateProgress.setVisibility(View.GONE);
+        LinearLayout.LayoutParams pbLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pbLp.topMargin = dp(12);
+        card.addView(pbUpdateProgress, pbLp);
+
+        tvUpdateProgress = new TextView(this);
+        tvUpdateProgress.setTextColor(M3_ON_SURFACE_VAR);
+        tvUpdateProgress.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        tvUpdateProgress.setPadding(0, dp(4), 0, 0);
+        tvUpdateProgress.setVisibility(View.GONE);
+        card.addView(tvUpdateProgress);
+
+        // Action Row: [Later/Close]  spacer  [Reinstall]  [Update & Restart]
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setGravity(Gravity.CENTER_VERTICAL);
+        actions.setPadding(0, dp(16), 0, 0);
+
+        btnModalSecondary = new LinearLayout(this);
+        btnModalSecondary.setGravity(Gravity.CENTER);
+        btnModalSecondary.setMinimumHeight(dp(40));
+        btnModalSecondary.setPadding(dp(16), 0, dp(16), 0);
+        btnModalSecondary.setBackground(ripplePill(M3_TONAL_BTN, 0, dp(20)));
+        tvModalSecondary = new TextView(this);
+        tvModalSecondary.setText("Later");
+        tvModalSecondary.setTextColor(M3_ON_SURFACE);
+        tvModalSecondary.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
+        tvModalSecondary.setTypeface(TF_MEDIUM);
+        btnModalSecondary.addView(tvModalSecondary);
+        btnModalSecondary.setOnClickListener(v -> {
+            if (!isUpdateBusy) {
+                hapticTick(v);
+                waitingPermissionGrant = false;
+                appUpdater.clearPendingPermissionApk();
+                setUpdateModalOpen(false);
+            }
+        });
+        actions.addView(btnModalSecondary);
+
+        View actSpacer = new View(this);
+        actions.addView(actSpacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
+
+        btnModalReinstall = new LinearLayout(this);
+        btnModalReinstall.setGravity(Gravity.CENTER);
+        btnModalReinstall.setMinimumHeight(dp(40));
+        btnModalReinstall.setPadding(dp(14), 0, dp(14), 0);
+        btnModalReinstall.setBackground(ripplePill(M3_TONAL_BTN, 0, dp(20)));
+        btnModalReinstall.setVisibility(View.GONE);
+        TextView tvReinst = new TextView(this);
+        tvReinst.setText("Reinstall");
+        tvReinst.setTextColor(M3_PRIMARY);
+        tvReinst.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        tvReinst.setTypeface(TF_MEDIUM);
+        btnModalReinstall.addView(tvReinst);
+        btnModalReinstall.setOnClickListener(v -> {
+            if (!isUpdateBusy && latestReleaseInfo != null) {
+                hapticClick(v);
+                startUpdateDownload(latestReleaseInfo);
+            }
+        });
+        LinearLayout.LayoutParams reinstLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
+        reinstLp.rightMargin = dp(8);
+        actions.addView(btnModalReinstall, reinstLp);
+
+        btnModalPrimary = new LinearLayout(this);
+        btnModalPrimary.setGravity(Gravity.CENTER);
+        btnModalPrimary.setMinimumHeight(dp(40));
+        btnModalPrimary.setPadding(dp(18), 0, dp(18), 0);
+        btnModalPrimary.setBackground(ripplePill(M3_PRIMARY, 0, dp(20)));
+        tvModalPrimary = new TextView(this);
+        tvModalPrimary.setText("Update & Restart");
+        tvModalPrimary.setTextColor(M3_ON_PRIMARY);
+        tvModalPrimary.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
+        tvModalPrimary.setTypeface(TF_MEDIUM);
+        btnModalPrimary.addView(tvModalPrimary);
+        actions.addView(btnModalPrimary, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+
+        card.addView(actions);
+
+        FrameLayout.LayoutParams cardLp = new FrameLayout.LayoutParams(
+            Math.min(dp(380), getResources().getDisplayMetrics().widthPixels - dp(32)),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER
+        );
+        scrim.addView(card, cardLp);
+        return scrim;
+    }
+
+    private void setUpdateModalOpen(boolean open) {
+        if (isUpdateModalOpen == open || updateModalScrim == null) return;
+        isUpdateModalOpen = open;
+        updateBackCallbackState();
+
+        if (open) {
+            updateModalScrim.setAlpha(0f);
+            updateModalScrim.setVisibility(View.VISIBLE);
+            updateModalScrim.animate().alpha(1f).setDuration(180).start();
+        } else {
+            updateModalScrim.animate()
+                .alpha(0f)
+                .setDuration(150)
+                .withEndAction(() -> {
+                    if (!isUpdateModalOpen) {
+                        updateModalScrim.setVisibility(View.GONE);
+                    }
+                })
+                .start();
+        }
+    }
+
+    private void triggerUpdateCheck(final boolean manual) {
+        if (isUpdateBusy) return;
+
+        if (manual) {
+            tvModalTitle.setText("Checking for Updates");
+            tvModalMeta.setText("Contacting GitHub Releases (" + AppUpdater.GITHUB_REPO + ")...");
+            svModalNotes.setVisibility(View.GONE);
+            pbUpdateProgress.setIndeterminate(true);
+            pbUpdateProgress.setVisibility(View.VISIBLE);
+            tvUpdateProgress.setVisibility(View.GONE);
+            btnModalReinstall.setVisibility(View.GONE);
+            btnModalPrimary.setVisibility(View.GONE);
+            btnModalSecondary.setVisibility(View.VISIBLE);
+            tvModalSecondary.setText("Close");
+            setUpdateModalOpen(true);
+        }
+
+        appUpdater.checkForUpdates(this, new AppUpdater.CheckCallback() {
+            @Override
+            public void onResult(AppUpdater.ReleaseInfo info) {
+                latestReleaseInfo = info;
+                String curVer = AppUpdater.getCurrentVersionName(MainActivity.this);
+
+                if (info.isNewer) {
+                    if (btnTopUpdate != null && tvTopUpdate != null) {
+                        tvTopUpdate.setText(info.tagName);
+                        btnTopUpdate.setVisibility(View.VISIBLE);
+                    }
+                    if (tvSheetUpdateSubtitle != null) {
+                        tvSheetUpdateSubtitle.setText(
+                            "New release " + info.tagName + " available (" + AppUpdater.formatBytes(info.assetSize) + ")"
+                        );
+                    }
+                    if (tvSheetUpdateAction != null) {
+                        tvSheetUpdateAction.setText("Update to " + info.tagName);
+                    }
+                    populateModalForRelease(info);
+                    setUpdateModalOpen(true);
+                } else {
+                    if (btnTopUpdate != null) {
+                        btnTopUpdate.setVisibility(View.GONE);
+                    }
+                    if (tvSheetUpdateSubtitle != null) {
+                        tvSheetUpdateSubtitle.setText("Up to date · Installed v" + curVer + " (" + info.tagName + ")");
+                    }
+                    if (tvSheetUpdateAction != null) {
+                        tvSheetUpdateAction.setText("Check for Updates");
+                    }
+                    if (manual) {
+                        populateModalForRelease(info);
+                        setUpdateModalOpen(true);
+                    }
+                }
+            }
+
+            @Override
+            public void onError(String message) {
+                if (manual) {
+                    showUpdateErrorState(message);
+                    setUpdateModalOpen(true);
+                }
+            }
+        });
+    }
+
+    private void populateModalForRelease(final AppUpdater.ReleaseInfo info) {
+        String curVer = AppUpdater.getCurrentVersionName(this);
+        pbUpdateProgress.setIndeterminate(false);
+        pbUpdateProgress.setVisibility(View.GONE);
+        tvUpdateProgress.setVisibility(View.GONE);
+        btnModalSecondary.setVisibility(View.VISIBLE);
+
+        if (info.isNewer) {
+            tvModalTitle.setText("Update Available · " + info.tagName);
+            tvModalMeta.setText(
+                "Installed: v" + curVer + "  →  Latest: " + info.tagName
+                + "  (" + AppUpdater.formatBytes(info.assetSize) + ")"
+            );
+            if (info.notes != null && !info.notes.isEmpty()) {
+                tvModalNotes.setText(info.notes);
+                svModalNotes.setVisibility(View.VISIBLE);
+            } else {
+                svModalNotes.setVisibility(View.GONE);
+            }
+            tvModalSecondary.setText("Later");
+            btnModalReinstall.setVisibility(View.GONE);
+            btnModalPrimary.setVisibility(View.VISIBLE);
+            tvModalPrimary.setText("Update & Restart");
+            btnModalPrimary.setOnClickListener(v -> {
+                hapticClick(v);
+                startUpdateDownload(info);
+            });
+        } else {
+            tvModalTitle.setText("Liquid Rust is Up to Date");
+            tvModalMeta.setText(
+                "You are running the latest version (v" + curVer + ").\n"
+                + "Release package: " + info.assetName + " (" + AppUpdater.formatBytes(info.assetSize) + ")"
+            );
+            svModalNotes.setVisibility(View.GONE);
+            tvModalSecondary.setText("Close");
+            btnModalReinstall.setVisibility(View.VISIBLE);
+            btnModalPrimary.setVisibility(View.VISIBLE);
+            tvModalPrimary.setText("Check Again");
+            btnModalPrimary.setOnClickListener(v -> {
+                hapticTick(v);
+                triggerUpdateCheck(true);
+            });
+        }
+    }
+
+    private void startUpdateDownload(final AppUpdater.ReleaseInfo info) {
+        isUpdateBusy = true;
+        waitingPermissionGrant = false;
+        updateBackCallbackState();
+
+        tvModalTitle.setText("Downloading " + info.tagName + "...");
+        tvModalMeta.setText("Fetching " + info.assetName + " from GitHub Releases...");
+        svModalNotes.setVisibility(View.GONE);
+        pbUpdateProgress.setIndeterminate(false);
+        pbUpdateProgress.setProgress(0);
+        pbUpdateProgress.setVisibility(View.VISIBLE);
+        tvUpdateProgress.setText("0% · Starting download...");
+        tvUpdateProgress.setVisibility(View.VISIBLE);
+        btnModalSecondary.setVisibility(View.GONE);
+        btnModalReinstall.setVisibility(View.GONE);
+        btnModalPrimary.setVisibility(View.GONE);
+
+        appUpdater.downloadAndInstall(this, info, createDownloadCallback());
+    }
+
+    private AppUpdater.DownloadCallback createDownloadCallback() {
+        return new AppUpdater.DownloadCallback() {
+            @Override
+            public void onProgress(long downloadedBytes, long totalBytes) {
+                if (totalBytes > 0) {
+                    int permille = (int) Math.min(1000L, (downloadedBytes * 1000L) / totalBytes);
+                    int pct = (int) Math.min(100L, (downloadedBytes * 100L) / totalBytes);
+                    pbUpdateProgress.setIndeterminate(false);
+                    pbUpdateProgress.setProgress(permille);
+                    tvUpdateProgress.setText(
+                        pct + "% · " + AppUpdater.formatBytes(downloadedBytes)
+                        + " / " + AppUpdater.formatBytes(totalBytes)
+                    );
+                } else {
+                    pbUpdateProgress.setIndeterminate(true);
+                    tvUpdateProgress.setText("Downloaded " + AppUpdater.formatBytes(downloadedBytes));
+                }
+            }
+
+            @Override
+            public void onInstalling() {
+                isUpdateBusy = false;
+                waitingPermissionGrant = false;
+                updateBackCallbackState();
+                tvModalTitle.setText("Installing Update...");
+                tvModalMeta.setText("Confirm installation if prompted — Liquid Rust will restart automatically.");
+                pbUpdateProgress.setIndeterminate(true);
+                pbUpdateProgress.setVisibility(View.VISIBLE);
+                tvUpdateProgress.setText("Applying package & preparing automatic relaunch...");
+                tvUpdateProgress.setVisibility(View.VISIBLE);
+                btnModalSecondary.setVisibility(View.VISIBLE);
+                tvModalSecondary.setText("Close");
+                btnModalPrimary.setVisibility(View.GONE);
+            }
+
+            @Override
+            public void onNeedsInstallPermission(File downloadedApk) {
+                isUpdateBusy = false;
+                waitingPermissionGrant = true;
+                updateBackCallbackState();
+                tvModalTitle.setText("Allow App Updates");
+                tvModalMeta.setText(
+                    "Update downloaded! Enable 'Allow from this source' once in Android Settings — "
+                    + "installation will continue automatically as soon as you return."
+                );
+                pbUpdateProgress.setVisibility(View.GONE);
+                tvUpdateProgress.setVisibility(View.GONE);
+                btnModalSecondary.setVisibility(View.VISIBLE);
+                tvModalSecondary.setText("Cancel");
+                btnModalReinstall.setVisibility(View.GONE);
+                btnModalPrimary.setVisibility(View.VISIBLE);
+                tvModalPrimary.setText("Open Settings");
+                btnModalPrimary.setOnClickListener(v -> {
+                    hapticClick(v);
+                    AppUpdater.openUnknownSourcesSettings(MainActivity.this);
+                });
+            }
+
+            @Override
+            public void onError(String message) {
+                isUpdateBusy = false;
+                waitingPermissionGrant = false;
+                updateBackCallbackState();
+                showUpdateErrorState(message);
+            }
+        };
+    }
+
+    private void showUpdateErrorState(String errorMessage) {
+        tvModalTitle.setText("Update Notice");
+        tvModalMeta.setText(errorMessage);
+        svModalNotes.setVisibility(View.GONE);
+        pbUpdateProgress.setVisibility(View.GONE);
+        tvUpdateProgress.setVisibility(View.GONE);
+        btnModalReinstall.setVisibility(View.GONE);
+        btnModalSecondary.setVisibility(View.VISIBLE);
+        tvModalSecondary.setText("Close");
+        btnModalPrimary.setVisibility(View.VISIBLE);
+        tvModalPrimary.setText("Retry");
+        btnModalPrimary.setOnClickListener(v -> {
+            hapticTick(v);
+            if (latestReleaseInfo != null && latestReleaseInfo.isNewer) {
+                startUpdateDownload(latestReleaseInfo);
+            } else {
+                triggerUpdateCheck(true);
+            }
+        });
     }
 
     @Override

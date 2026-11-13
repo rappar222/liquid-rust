@@ -2,8 +2,8 @@
 // Zero-copy GPU rendering directly from the compute storage buffer with cached BindGroups,
 // zero per-frame JS heap allocations, 3D studio floor grid, and glossy Fresnel shading.
 
-import { PBF_RENDER_WGSL, WIREFRAME_WGSL } from './pbf-shader.js?v=20261112c';
-import { Mat4 } from './math.js?v=20261112c';
+import { PBF_RENDER_WGSL, WIREFRAME_WGSL } from './pbf-shader.js?v=20261113b';
+import { Mat4 } from './math.js?v=20261113b';
 
 export class WebGpuRenderer {
     constructor(device, context, format) {

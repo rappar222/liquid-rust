@@ -43,6 +43,31 @@ impl ScenePreset {
 pub struct SceneGenerator;
 
 impl SceneGenerator {
+    /// Apply small deterministic quasi-random offset to break artificial initial Cartesian axes
+    /// without significantly changing bulk lattice density.
+    fn apply_spawn_jitter(particles: &mut [Particle], spacing: f32, is_2d: bool, bounds: &Aabb) {
+        let amp = spacing * 0.08;
+        let pad = spacing * 0.52;
+        for p in particles.iter_mut() {
+            let mut h = p.id.wrapping_mul(0x9E37_79B9).wrapping_add(0x85EB_CA6B);
+            h ^= h >> 15;
+            h = h.wrapping_mul(0xC2B2_AE35);
+            let jx = ((h & 0xFFFF) as f32 / 65535.0 - 0.5) * 2.0 * amp;
+            let jy = (((h >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5) * 2.0 * amp;
+            h = h.wrapping_mul(0x27D4_EB2F);
+            let jz = if is_2d {
+                0.0
+            } else {
+                ((h & 0xFFFF) as f32 / 65535.0 - 0.5) * 2.0 * amp
+            };
+            p.position.x = (p.position.x + jx).clamp(bounds.min.x + pad, bounds.max.x - pad);
+            p.position.y = (p.position.y + jy).clamp(bounds.min.y + pad, bounds.max.y - pad);
+            if !is_2d {
+                p.position.z = (p.position.z + jz).clamp(bounds.min.z + pad, bounds.max.z - pad);
+            }
+        }
+    }
+
     /// Spawn regular lattice block of particles (supports both 3D volumes and 2D planar sheets)
     pub fn spawn_block(
         min: Vec3,
@@ -454,6 +479,13 @@ impl SceneGenerator {
                     solver.config.viscosity = 0.05;
                 }
             }
+        }
+
+        if matches!(
+            preset,
+            ScenePreset::DamBreak | ScenePreset::DoubleDamBreak | ScenePreset::ObstacleDrop
+        ) {
+            Self::apply_spawn_jitter(&mut solver.particles, spacing, solver.is_2d, &solver.bounds);
         }
 
         // If the chamber has a custom shape or scale, re-apply the chamber bounds

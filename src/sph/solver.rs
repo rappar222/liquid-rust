@@ -525,6 +525,7 @@ impl SphSolver {
         let dt_factor = (dt / dt_ref).clamp(0.0001, 1.0);
         let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
         let max_displacement = (radius * 0.45).max(h * 0.25) * dt_factor;
+        let spacing = self.config.spacing;
         let colliders = &self.colliders;
 
         // 4. PBF Incompressibility Solver Iterations
@@ -556,7 +557,26 @@ impl SphSolver {
                     }
                 });
 
-                sum_grad_sq += grad_ci.length_squared();
+                let (mut psi_b, mut grad_psi_b) =
+                    chamber.boundary_contribution(pos_i, radius, spacing, h, &bounds, is_2d);
+                for collider in colliders {
+                    collider.fold_boundary_contribution(
+                        pos_i,
+                        radius,
+                        spacing,
+                        h,
+                        is_2d,
+                        &mut psi_b,
+                        &mut grad_psi_b,
+                    );
+                }
+                if is_2d {
+                    grad_psi_b.z = 0.0;
+                }
+
+                density += rho0 * psi_b;
+                grad_ci += grad_psi_b;
+                sum_grad_sq += grad_psi_b.length_squared() + grad_ci.length_squared();
                 *density_out = density;
 
                 let c_i = (density * inv_rho0 - 1.0).max(0.0);
@@ -586,6 +606,24 @@ impl SphSolver {
                 let lambda_i = lambdas[i];
                 let rho_i = densities[i];
                 let mut delta = Vec3::ZERO;
+
+                let (mut psi_b, mut grad_psi_b) =
+                    chamber.boundary_contribution(pos_i, radius, spacing, h, &bounds, is_2d);
+                for collider in colliders {
+                    collider.fold_boundary_contribution(
+                        pos_i,
+                        radius,
+                        spacing,
+                        h,
+                        is_2d,
+                        &mut psi_b,
+                        &mut grad_psi_b,
+                    );
+                }
+                if is_2d {
+                    grad_psi_b.z = 0.0;
+                }
+                let wall_cohesion_scale = (1.0 - psi_b * 3.5).clamp(0.08, 1.0);
 
                 grid.for_each_neighbor_mode(pos_i, is_2d, |j| {
                     if i != j {
@@ -617,13 +655,23 @@ impl SphSolver {
                                 let c_q = 64.0 * (q * q * q) * (one_minus_q * one_minus_q * one_minus_q);
                                 let surf_weight =
                                     (2.0 - (rho_i + densities[j]) * inv_rho0).clamp(0.15, 1.40);
-                                let cohesion =
-                                    (c_q * surf_weight * surface_tension * 0.016 * h) / cfm_scale;
+                                let cohesion = (c_q
+                                    * surf_weight
+                                    * surface_tension
+                                    * wall_cohesion_scale
+                                    * 0.016
+                                    * h)
+                                    / cfm_scale;
                                 delta -= (r_vec / r) * cohesion;
                             }
                         }
                     }
                 });
+
+                // Mirror hydrostatic boundary pressure repulsion (prevents pinning/clustering on walls & floors)
+                if lambda_i < -1e-7 {
+                    delta += grad_psi_b * (2.0 * lambda_i);
+                }
 
                 // Anti-trampoline: clamp displacement magnitude per iteration
                 let delta_len = delta.length();

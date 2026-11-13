@@ -1322,7 +1322,7 @@ fn run_headless(
                 RenderMode::Particles => {
                     rend.render_frame(
                         &solver.particles,
-                        solver.config.particle_radius,
+                        solver.config.particle_radius * 1.25,
                         &solver.chamber,
                         solver.bounds,
                         &camera,

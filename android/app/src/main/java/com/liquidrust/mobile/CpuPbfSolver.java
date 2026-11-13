@@ -165,7 +165,7 @@ public final class CpuPbfSolver {
                 }
             }
         }
-        restDensity = Math.max(1.0f, sum * 0.96f);
+        restDensity = Math.max(1.0f, sum);
         invRestDensity = 1.0f / restDensity;
 
         particleCount = 0;
@@ -206,6 +206,29 @@ public final class CpuPbfSolver {
                 break;
             }
         }
+        if (preset == SimulationConfig.PRESET_DAM_BREAK
+                || preset == SimulationConfig.PRESET_DOUBLE_DAM
+                || preset == SimulationConfig.PRESET_OBSTACLE) {
+            float amp = spacing * 0.08f;
+            float clampPad = particleRadius * 1.02f;
+            for (int i = 0; i < particleCount; i++) {
+                int i4 = i * 4;
+                int h1 = (i ^ 0x9E3779B9) * 0x85EBCA6B;
+                h1 = (h1 ^ (h1 >>> 13)) * 0xC2B2AE35;
+                int h2h = (h1 ^ (h1 >>> 16)) * 0x27D4EB2D;
+                int h3 = (h2h ^ (h2h >>> 15)) * 0x165667B1;
+
+                float jx = (((h1 >>> 8) & 0xFFFF) / 32767.5f - 1.0f) * amp;
+                float jy = (((h2h >>> 8) & 0xFFFF) / 32767.5f - 1.0f) * amp;
+                float jz = (((h3 >>> 8) & 0xFFFF) / 32767.5f - 1.0f) * amp;
+
+                pos[i4] = Math.max(minX + clampPad, Math.min(maxX - clampPad, pos[i4] + jx));
+                pos[i4 + 1] = Math.max(minY + clampPad, Math.min(maxY - clampPad, pos[i4 + 1] + jy));
+                if (!is2D) {
+                    pos[i4 + 2] = Math.max(minZ + clampPad, Math.min(maxZ - clampPad, pos[i4 + 2] + jz));
+                }
+            }
+        }
         ensureCapacity(Math.max(1, particleCount));
         uploadVbos();
     }
@@ -239,6 +262,82 @@ public final class CpuPbfSolver {
                 }
             }
         }
+    }
+
+    private static void foldWallPlane(float dClearance, float gdx, float gdy, float gdz,
+                                      float dOffset, float h, float invH, float gammaW, float[] out) {
+        float dEff = Math.max(Math.max(dClearance, 0f) + dOffset, 0.25f * h);
+        if (dEff < h) {
+            float q = dEff * invH;
+            float omq2 = 1.0f - q * q;
+            float omq4 = (omq2 * omq2) * (omq2 * omq2);
+            float psiW = Math.min(gammaW * omq4, 0.65f);
+
+            float omq = 1.0f - q;
+            float gradMag = gammaW * (6.1f * invH) * (omq * omq);
+            float gwx = -gdx * gradMag;
+            float gwy = -gdy * gradMag;
+            float gwz = -gdz * gradMag;
+
+            float psi = out[0];
+            float oneMinusPsiW = 1.0f - psiW;
+            float oneMinusPsi = 1.0f - psi;
+            out[1] = out[1] * oneMinusPsiW + gwx * oneMinusPsi;
+            out[2] = out[2] * oneMinusPsiW + gwy * oneMinusPsi;
+            out[3] = out[3] * oneMinusPsiW + gwz * oneMinusPsi;
+            out[0] = psi + psiW - psi * psiW;
+        }
+    }
+
+    private void computeBoundaryContribution(float px, float py, float pz,
+                                             boolean obsOn, float obsX, float obsY, float obsR,
+                                             float[] out) {
+        out[0] = 0f; out[1] = 0f; out[2] = 0f; out[3] = 0f;
+        float s = Math.max(spacing, 1e-4f);
+        float invS = 1.0f / s;
+        float r = particleRadius;
+
+        float sx = px * invS, sy = py * invS, sz = pz * invS;
+        float a1 = 4.71f * sx + 2.31f * sz;
+        float a2 = 3.83f * sy - 4.19f * sx;
+        float a3 = is2D ? (3.13f * sx + 4.47f * sy) : (5.17f * sz - 3.41f * sy);
+        float xi = ((float) Math.sin(a1) + (float) Math.sin(a2) + (float) Math.sin(a3)) * (1.0f / 3.0f);
+        float c1 = (float) Math.cos(a1), c2 = (float) Math.cos(a2), c3 = (float) Math.cos(a3);
+
+        float gxXi, gyXi, gzXi;
+        if (is2D) {
+            gxXi = (4.71f * c1 - 4.19f * c2 + 3.13f * c3) * (1.0f / 3.0f);
+            gyXi = (3.83f * c2 + 4.47f * c3) * (1.0f / 3.0f);
+            gzXi = 0f;
+        } else {
+            gxXi = (4.71f * c1 - 4.19f * c2) * (1.0f / 3.0f);
+            gyXi = (3.83f * c2 - 3.41f * c3) * (1.0f / 3.0f);
+            gzXi = (2.31f * c1 + 5.17f * c3) * (1.0f / 3.0f);
+        }
+
+        float roughAmp = is2D ? 0.025f : 0.055f;
+        float dOffset = (1.0f - roughAmp * xi) * s;
+        float gbx = -gxXi * roughAmp, gby = -gyXi * roughAmp, gbz = -gzXi * roughAmp;
+        float gammaW = (is2D ? 1.42f : 1.20f) * (s * invH);
+
+        foldWallPlane((py - minY) - r, gbx, 1.0f + gby, gbz, dOffset, h, invH, gammaW, out);
+        foldWallPlane((maxY - py) - r, gbx, -1.0f + gby, gbz, dOffset, h, invH, gammaW, out);
+        foldWallPlane((px - minX) - r, 1.0f + gbx, gby, gbz, dOffset, h, invH, gammaW, out);
+        foldWallPlane((maxX - px) - r, -1.0f + gbx, gby, gbz, dOffset, h, invH, gammaW, out);
+        if (!is2D) {
+            foldWallPlane((pz - minZ) - r, gbx, gby, 1.0f + gbz, dOffset, h, invH, gammaW, out);
+            foldWallPlane((maxZ - pz) - r, gbx, gby, -1.0f + gbz, dOffset, h, invH, gammaW, out);
+        }
+
+        if (obsOn) {
+            float dx = px - obsX, dy = py - obsY, dz = is2D ? 0f : pz;
+            float dist = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
+            float nx = dist > 1e-6f ? dx / dist : 0f;
+            float ny = dist > 1e-6f ? dy / dist : 1.0f;
+            float nz = dist > 1e-6f ? dz / dist : 0f;
+            foldWallPlane(dist - (obsR + r), nx, ny, nz, s, h, invH, gammaW, out);
+        }
+        if (is2D) out[3] = 0f;
     }
 
     private static int hash(int cx, int cy, int cz) {
@@ -363,6 +462,7 @@ public final class CpuPbfSolver {
 
             for (int iter = 0; iter < 3; iter++) {
                 parallelFor(n, (s, e) -> {
+                    float[] bc = new float[4];
                     for (int i = s; i < e; i++) {
                         int i3 = i * 3;
                         float px = pred[i3], py = pred[i3 + 1], pz = pred[i3 + 2];
@@ -399,14 +499,10 @@ public final class CpuPbfSolver {
                             }
                         }
 
-                        float dFloor = py - bMinY;
-                        if (dFloor < h && dens < restDensity * 0.98f) {
-                            float rw = Math.max(spacing * 0.92f, dFloor + spacing * 0.92f);
-                            float df = Math.max(0f, h2 - rw * rw);
-                            dens = Math.min(restDensity * 0.98f, dens + poly6Factor * df * df * df * (is2D ? 2.2f : 4.2f));
-                        }
-
-                        sumSq += gix * gix + giy * giy + giz * giz;
+                        computeBoundaryContribution(px, py, pz, obsOn, obsX, obsY, obsR, bc);
+                        dens += restDensity * bc[0];
+                        gix += bc[1]; giy += bc[2]; giz += bc[3];
+                        sumSq += (bc[1] * bc[1] + bc[2] * bc[2] + bc[3] * bc[3]) + (gix * gix + giy * giy + giz * giz);
                         pos[i * 4 + 3] = dens;
                         float cI = Math.max(0f, dens * invRestDensity - 1.0f);
                         lambdas[i] = -cI / (sumSq + relaxEps);
@@ -414,6 +510,7 @@ public final class CpuPbfSolver {
                 });
 
                 parallelFor(n, (s, e) -> {
+                    float[] bc = new float[4];
                     for (int i = s; i < e; i++) {
                         int i3 = i * 3;
                         float px = pred[i3], py = pred[i3 + 1], pz = pred[i3 + 2];
@@ -422,6 +519,9 @@ public final class CpuPbfSolver {
                         int cx = (int) Math.floor(px * invH);
                         int cy = (int) Math.floor(py * invH);
                         int cz = is2D ? 0 : (int) Math.floor(pz * invH);
+
+                        computeBoundaryContribution(px, py, pz, obsOn, obsX, obsY, obsR, bc);
+                        float wallCohesionScale = Math.max(0.08f, Math.min(1.0f, 1.0f - bc[0] * 3.5f));
 
                         float dlx = 0f, dly = 0f, dlz = 0f;
                         for (int dz = zMin; dz <= zMax; dz++) {
@@ -451,7 +551,7 @@ public final class CpuPbfSolver {
                                                     float q = r / h, omq = 1f - q;
                                                     float sp = q * q * q * omq * omq * omq * 64.0f;
                                                     float kij = (2.0f * restDensity) / Math.max(rhoI + pos[j * 4 + 3], restDensity * 0.5f);
-                                                    float pull = (stCoeff * kij * sp) / r;
+                                                    float pull = (stCoeff * wallCohesionScale * kij * sp) / r;
                                                     dlx -= rx * pull; dly -= ry * pull; dlz -= rz * pull;
                                                 }
                                             }
@@ -460,6 +560,13 @@ public final class CpuPbfSolver {
                                     }
                                 }
                             }
+                        }
+
+                        if (lamI < -1e-7f) {
+                            float rep = 2.0f * lamI;
+                            dlx += bc[1] * rep;
+                            dly += bc[2] * rep;
+                            dlz += bc[3] * rep;
                         }
 
                         float dLen = (float) Math.sqrt(dlx * dlx + dly * dly + dlz * dlz);
@@ -502,10 +609,32 @@ public final class CpuPbfSolver {
                     float vy = (ny - oldP[i3 + 1]) * invDt;
                     float vz = is2D ? 0f : ((nz - oldP[i3 + 2]) * invDt);
 
-                    if (ny <= bMinY + 0.0015f) {
+                    float margin = Math.max(particleRadius * 0.20f, 0.002f);
+                    if (ny <= bMinY + margin) {
                         if (vy < 0f) vy = (vy < -0.12f) ? -vy * 0.12f : 0f;
-                        else if (vy < 0.22f) vy *= 0.08f;
-                        vx *= 0.98f; vz *= 0.98f;
+                        vx *= 0.99f; vz *= 0.99f;
+                    }
+                    if (ny >= bMaxY - margin && vy > 0f) {
+                        vy = (vy > 0.12f) ? -vy * 0.12f : 0f;
+                        vx *= 0.999f; vz *= 0.999f;
+                    }
+                    if (nx <= bMinX + margin && vx < 0f) {
+                        vx = (vx < -0.12f) ? -vx * 0.12f : 0f;
+                        vy *= 0.999f; vz *= 0.999f;
+                    }
+                    if (nx >= bMaxX - margin && vx > 0f) {
+                        vx = (vx > 0.12f) ? -vx * 0.12f : 0f;
+                        vy *= 0.999f; vz *= 0.999f;
+                    }
+                    if (!is2D) {
+                        if (nz <= bMinZ + margin && vz < 0f) {
+                            vz = (vz < -0.12f) ? -vz * 0.12f : 0f;
+                            vx *= 0.999f; vy *= 0.999f;
+                        }
+                        if (nz >= bMaxZ - margin && vz > 0f) {
+                            vz = (vz > 0.12f) ? -vz * 0.12f : 0f;
+                            vx *= 0.999f; vy *= 0.999f;
+                        }
                     }
                     float sp = (float) Math.sqrt(vx * vx + vy * vy + vz * vz);
                     if (sp > 8.5f) {

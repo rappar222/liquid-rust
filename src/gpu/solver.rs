@@ -33,6 +33,7 @@ pub struct GpuUniforms {
     pub counts: [u32; 4],
     pub colliders: [GpuColliderData; 16],
     pub chamber_info: [f32; 4],
+    pub boundary_params: [f32; 4],
 }
 
 #[repr(C)]
@@ -678,6 +679,7 @@ impl GpuSphSolver {
             ],
             colliders: gpu_colliders,
             chamber_info: ch_info,
+            boundary_params: [config.spacing, 0.0, 0.0, 0.0],
         };
 
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));

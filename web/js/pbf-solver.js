@@ -2,7 +2,7 @@
 // Implements Macklin & Müller (2013) + Akinci Cohesion + Flow-Gated Vorticity Confinement
 // Zero per-frame heap allocations for smooth 60 FPS execution
 
-import { Vec3, Aabb } from './math.js?v=20261112c';
+import { Vec3, Aabb } from './math.js?v=20261113b';
 
 export const ScenePreset = {
     DAM_BREAK: 'dam_break',
@@ -29,6 +29,7 @@ export class PbfSolver {
         this.curls = new Float32Array(this.maxParticles * 3);
         this.curlMags = new Float32Array(this.maxParticles);
         this.gradBuf = new Float32Array(3);
+        this.bcBuf = new Float32Array(4);
 
         // Simulation parameters (default: 2D Planar Mode, Draft quality)
         this.is2D = true;
@@ -372,6 +373,136 @@ export class PbfSolver {
                 break;
             }
         }
+
+        if (
+            preset === ScenePreset.DAM_BREAK ||
+            preset === ScenePreset.DOUBLE_DAM ||
+            preset === ScenePreset.OBSTACLE
+        ) {
+            this.applySpawnJitter();
+        }
+    }
+
+    applySpawnJitter() {
+        const amp = this.spacing * 0.08;
+        const pad = this.particleRadius * 1.02;
+        const bMin = this.bounds.min;
+        const bMax = this.bounds.max;
+        const n = this.particleCount;
+        for (let i = 0; i < n; i++) {
+            const i3 = i * 3;
+            let h1 = Math.imul(i ^ 0x9E3779B9, 0x85EBCA6B);
+            h1 = Math.imul(h1 ^ (h1 >>> 13), 0xC2B2AE35);
+            const h2 = Math.imul(h1 ^ (h1 >>> 16), 0x27D4EB2D);
+            const h3 = Math.imul(h2 ^ (h2 >>> 15), 0x165667B1);
+
+            const jx = (((h1 >>> 8) & 0xFFFF) / 32767.5 - 1.0) * amp;
+            const jy = (((h2 >>> 8) & 0xFFFF) / 32767.5 - 1.0) * amp;
+            const jz = (((h3 >>> 8) & 0xFFFF) / 32767.5 - 1.0) * amp;
+
+            this.positions[i3] = Math.min(bMax.x - pad, Math.max(bMin.x + pad, this.positions[i3] + jx));
+            this.positions[i3 + 1] = Math.min(bMax.y - pad, Math.max(bMin.y + pad, this.positions[i3 + 1] + jy));
+            if (!this.is2D) {
+                this.positions[i3 + 2] = Math.min(bMax.z - pad, Math.max(bMin.z + pad, this.positions[i3 + 2] + jz));
+            }
+        }
+    }
+
+    foldWallPlane(dClearance, gdx, gdy, gdz, dOffset, h, invH, gammaW, out) {
+        const dEff = Math.max(Math.max(dClearance, 0.0) + dOffset, 0.25 * h);
+        if (dEff < h) {
+            const q = dEff * invH;
+            const omq2 = 1.0 - q * q;
+            const omq4 = (omq2 * omq2) * (omq2 * omq2);
+            const psiW = Math.min(gammaW * omq4, 0.65);
+
+            const omq = 1.0 - q;
+            const gradMag = gammaW * (6.1 * invH) * (omq * omq);
+            const gwx = -gdx * gradMag;
+            const gwy = -gdy * gradMag;
+            const gwz = -gdz * gradMag;
+
+            const psi = out[0];
+            const oneMinusPsiW = 1.0 - psiW;
+            const oneMinusPsi = 1.0 - psi;
+            out[1] = out[1] * oneMinusPsiW + gwx * oneMinusPsi;
+            out[2] = out[2] * oneMinusPsiW + gwy * oneMinusPsi;
+            out[3] = out[3] * oneMinusPsiW + gwz * oneMinusPsi;
+            out[0] = psi + psiW - psi * psiW;
+        }
+    }
+
+    computeBoundaryContribution(px, py, pz, out) {
+        out[0] = 0.0;
+        out[1] = 0.0;
+        out[2] = 0.0;
+        out[3] = 0.0;
+
+        const h = Math.max(this.h, 1e-5);
+        const invH = 1.0 / h;
+        const s = Math.max(this.spacing, 1e-4);
+        const invS = 1.0 / s;
+        const is2D = this.is2D;
+        const r = this.particleRadius;
+
+        const sx = px * invS;
+        const sy = py * invS;
+        const sz = pz * invS;
+        const a1 = 4.71 * sx + 2.31 * sz;
+        const a2 = 3.83 * sy - 4.19 * sx;
+        const a3 = is2D ? (3.13 * sx + 4.47 * sy) : (5.17 * sz - 3.41 * sy);
+        const xi = (Math.sin(a1) + Math.sin(a2) + Math.sin(a3)) * (1.0 / 3.0);
+        const c1 = Math.cos(a1);
+        const c2 = Math.cos(a2);
+        const c3 = Math.cos(a3);
+
+        let gxXi, gyXi, gzXi;
+        if (is2D) {
+            gxXi = (4.71 * c1 - 4.19 * c2 + 3.13 * c3) * (1.0 / 3.0);
+            gyXi = (3.83 * c2 + 4.47 * c3) * (1.0 / 3.0);
+            gzXi = 0.0;
+        } else {
+            gxXi = (4.71 * c1 - 4.19 * c2) * (1.0 / 3.0);
+            gyXi = (3.83 * c2 - 3.41 * c3) * (1.0 / 3.0);
+            gzXi = (2.31 * c1 + 5.17 * c3) * (1.0 / 3.0);
+        }
+
+        const roughAmp = is2D ? 0.025 : 0.055;
+        const dOffset = (1.0 - roughAmp * xi) * s;
+        const gbx = -gxXi * roughAmp;
+        const gby = -gyXi * roughAmp;
+        const gbz = -gzXi * roughAmp;
+        const gammaW = (is2D ? 1.42 : 1.20) * (s * invH);
+
+        const bMin = this.bounds.min;
+        const bMax = this.bounds.max;
+
+        this.foldWallPlane((py - bMin.y) - r, gbx, 1.0 + gby, gbz, dOffset, h, invH, gammaW, out);
+        this.foldWallPlane((bMax.y - py) - r, gbx, -1.0 + gby, gbz, dOffset, h, invH, gammaW, out);
+        this.foldWallPlane((px - bMin.x) - r, 1.0 + gbx, gby, gbz, dOffset, h, invH, gammaW, out);
+        this.foldWallPlane((bMax.x - px) - r, -1.0 + gbx, gby, gbz, dOffset, h, invH, gammaW, out);
+        if (!is2D) {
+            this.foldWallPlane((pz - bMin.z) - r, gbx, gby, 1.0 + gbz, dOffset, h, invH, gammaW, out);
+            this.foldWallPlane((bMax.z - pz) - r, gbx, gby, -1.0 + gbz, dOffset, h, invH, gammaW, out);
+        }
+
+        if (this.obstacleEnabled) {
+            const ox = this.obstaclePos.x;
+            const oy = this.obstaclePos.y;
+            const oz = is2D ? 0.0 : this.obstaclePos.z;
+            const dx = px - ox;
+            const dy = py - oy;
+            const dz = is2D ? 0.0 : (pz - oz);
+            const dist = Math.hypot(dx, dy, dz);
+            const nx = dist > 1e-6 ? dx / dist : 0.0;
+            const ny = dist > 1e-6 ? dy / dist : 1.0;
+            const nz = dist > 1e-6 ? dz / dist : 0.0;
+            this.foldWallPlane(dist - (this.obstacleRadius + r), nx, ny, nz, s, h, invH, gammaW, out);
+        }
+
+        if (is2D) {
+            out[3] = 0.0;
+        }
     }
 
     hashCoords(cx, cy, cz) {
@@ -491,8 +622,9 @@ export class PbfSolver {
         // 2. Spatial Hash
         this.buildSpatialHash();
 
-        // 3. Iterative Constraint Solver + Akinci Free-Surface Cohesion
+        // 3. Iterative Constraint Solver + Akinci Free-Surface Cohesion + Boundary Support
         const gradBuf = this.gradBuf;
+        const bcBuf = this.bcBuf;
         const dtRef = 1.0 / 60.0;
         const dtRatio = Math.max(1.0, dtRef / Math.max(1e-5, dt));
         const cfmScale = dtRatio * dtRatio;
@@ -556,7 +688,15 @@ export class PbfSolver {
                     }
                 }
 
-                sumGradSq += gradIx * gradIx + gradIy * gradIy + gradIz * gradIz;
+                this.computeBoundaryContribution(px, py, pz, bcBuf);
+                const psiB = bcBuf[0];
+                const gbx = bcBuf[1], gby = bcBuf[2], gbz = bcBuf[3];
+
+                density += rho0 * psiB;
+                gradIx += gbx;
+                gradIy += gby;
+                gradIz += gbz;
+                sumGradSq += (gbx * gbx + gby * gby + gbz * gbz) + (gradIx * gradIx + gradIy * gradIy + gradIz * gradIz);
                 this.densities[i] = density;
 
                 const constraint = Math.max(0.0, density * invRho0 - 1.0);
@@ -571,6 +711,11 @@ export class PbfSolver {
                 const pz = this.predicted[i3 + 2];
                 const lambdaI = this.lambdas[i];
                 const rhoI = this.densities[i];
+
+                this.computeBoundaryContribution(px, py, pz, bcBuf);
+                const psiB = bcBuf[0];
+                const gbx = bcBuf[1], gby = bcBuf[2], gbz = bcBuf[3];
+                const wallCohesionScale = Math.min(1.0, Math.max(0.08, 1.0 - psiB * 3.5));
 
                 const cx = Math.floor(px * invH);
                 const cy = Math.floor(py * invH);
@@ -606,12 +751,12 @@ export class PbfSolver {
                                             delZ += gradBuf[2] * coeff;
                                         }
 
-                                        // Akinci bell-spline free-surface cohesion
+                                        // Akinci bell-spline free-surface cohesion (attenuated near solid walls)
                                         if (stCoeff > 0.0 && r > this.spacing * 0.45) {
                                             const q = r / h;
                                             const spline = q * q * q * (1.0 - q) * (1.0 - q) * (1.0 - q) * 64.0;
                                             const kij = (2.0 * rho0) / Math.max(rhoI + this.densities[j], rho0 * 0.5);
-                                            const pull = (stCoeff * kij * spline) / r;
+                                            const pull = (stCoeff * wallCohesionScale * kij * spline) / r;
                                             delX -= rx * pull;
                                             delY -= ry * pull;
                                             delZ -= rz * pull;
@@ -622,6 +767,13 @@ export class PbfSolver {
                             }
                         }
                     }
+                }
+
+                if (lambdaI < -1e-7) {
+                    const rep = 2.0 * lambdaI;
+                    delX += gbx * rep;
+                    delY += gby * rep;
+                    delZ += gbz * rep;
                 }
 
                 const deltaLen = Math.hypot(delX, delY, delZ);
@@ -650,11 +802,14 @@ export class PbfSolver {
         // 4. Update velocities & inelastic boundary damping
         const invDt = 1.0 / dt;
         const r = this.particleRadius;
+        const margin = Math.max(0.002, r * 0.20);
         const bMin = this.bounds.min;
         const bMax = this.bounds.max;
         const rest = this.restitution;
         const fric = this.boundaryFriction;
-        const restThreshold = 0.10;
+        const slipFloor = Math.min(1.0, Math.max(0.985, 1.0 - Math.max(0.0, 1.0 - fric) * dt * 1.5));
+        const slipWall = 0.999;
+        const restThreshold = 0.12;
 
         for (let i = 0; i < n; i++) {
             const i3 = i * 3;
@@ -662,39 +817,37 @@ export class PbfSolver {
             let vy = (this.predicted[i3 + 1] - this.positions[i3 + 1]) * invDt;
             let vz = is2D ? 0 : (this.predicted[i3 + 2] - this.positions[i3 + 2]) * invDt;
 
-            if (this.predicted[i3] <= bMin.x + r + 1e-4) {
-                if (vx < 0) vx = (vx < -restThreshold) ? -vx * rest : 0;
-                vy *= fric;
-                vz *= fric;
-            } else if (this.predicted[i3] >= bMax.x - r - 1e-4) {
-                if (vx > 0) vx = (vx > restThreshold) ? -vx * rest : 0;
-                vy *= fric;
-                vz *= fric;
+            if (this.predicted[i3] <= bMin.x + r + margin && vx < 0) {
+                vx = (vx < -restThreshold) ? -vx * rest : 0;
+                vy *= slipWall;
+                vz *= slipWall;
+            } else if (this.predicted[i3] >= bMax.x - r - margin && vx > 0) {
+                vx = (vx > restThreshold) ? -vx * rest : 0;
+                vy *= slipWall;
+                vz *= slipWall;
             }
 
-            if (this.predicted[i3 + 1] <= bMin.y + r + 1e-4) {
+            if (this.predicted[i3 + 1] <= bMin.y + r + margin) {
                 if (vy < 0) {
                     vy = (vy < -restThreshold) ? -vy * rest : 0;
-                } else if (vy > 0 && vy < 0.20 && this.predicted[i3 + 1] <= bMin.y + r + 0.001) {
-                    vy *= 0.1;
                 }
-                vx *= fric;
-                vz *= fric;
-            } else if (this.predicted[i3 + 1] >= bMax.y - r - 1e-4) {
-                if (vy > 0) vy = (vy > restThreshold) ? -vy * rest : 0;
-                vx *= fric;
-                vz *= fric;
+                vx *= slipFloor;
+                vz *= slipFloor;
+            } else if (this.predicted[i3 + 1] >= bMax.y - r - margin && vy > 0) {
+                vy = (vy > restThreshold) ? -vy * rest : 0;
+                vx *= slipWall;
+                vz *= slipWall;
             }
 
             if (!is2D) {
-                if (this.predicted[i3 + 2] <= bMin.z + r + 1e-4) {
-                    if (vz < 0) vz = (vz < -restThreshold) ? -vz * rest : 0;
-                    vx *= fric;
-                    vy *= fric;
-                } else if (this.predicted[i3 + 2] >= bMax.z - r - 1e-4) {
-                    if (vz > 0) vz = (vz > restThreshold) ? -vz * rest : 0;
-                    vx *= fric;
-                    vy *= fric;
+                if (this.predicted[i3 + 2] <= bMin.z + r + margin && vz < 0) {
+                    vz = (vz < -restThreshold) ? -vz * rest : 0;
+                    vx *= slipWall;
+                    vy *= slipWall;
+                } else if (this.predicted[i3 + 2] >= bMax.z - r - margin && vz > 0) {
+                    vz = (vz > restThreshold) ? -vz * rest : 0;
+                    vx *= slipWall;
+                    vy *= slipWall;
                 }
             }
 

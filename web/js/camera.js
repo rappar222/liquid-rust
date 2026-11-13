@@ -1,5 +1,5 @@
 // Orbit Camera Controller for LiquidRust Web
-import { Vec3, Mat4 } from './math.js?v=20261112c';
+import { Vec3, Mat4 } from './math.js?v=20261113b';
 
 export class Camera {
     constructor() {

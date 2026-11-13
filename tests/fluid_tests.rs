@@ -967,3 +967,64 @@ fn test_cli_surface_mesh_command_generation() {
     assert!(cmd.contains("--mesh-ior 1.580"), "Expected --mesh-ior 1.580 in {}", cmd);
     assert!(cmd.contains("--mesh-roughness 0.030"), "Expected --mesh-roughness 0.030 in {}", cmd);
 }
+
+#[test]
+fn test_boundary_contribution_prevents_edge_compression_and_wall_sticking() {
+    use liquid_rust::sph::{Chamber, ChamberShape, SimulationQuality};
+
+    let chamber = Chamber::new(ChamberShape::Box);
+    let bounds = chamber.compute_bounds();
+    let mut config = SolverConfig::default();
+    SimulationQuality::Draft.apply(&mut config, false);
+
+    // 1. Verify analytical boundary support at floor, 2-wall edge, and 3-wall corner
+    let r = config.particle_radius;
+    let s = config.spacing;
+    let h = config.smoothing_length;
+    let (psi_floor, grad_floor) = chamber.boundary_contribution(
+        Vec3::new(0.0, bounds.min.y + r, 0.0),
+        r,
+        s,
+        h,
+        &bounds,
+        false,
+    );
+    let (psi_edge, _) = chamber.boundary_contribution(
+        Vec3::new(bounds.min.x + r, bounds.min.y + r, 0.0),
+        r,
+        s,
+        h,
+        &bounds,
+        false,
+    );
+    let (psi_corner, _) = chamber.boundary_contribution(
+        Vec3::new(bounds.min.x + r, bounds.min.y + r, bounds.min.z + r),
+        r,
+        s,
+        h,
+        &bounds,
+        false,
+    );
+    assert!(psi_floor > 0.12 && psi_floor < 0.65, "psi_floor={}", psi_floor);
+    assert!(psi_edge > psi_floor, "edge must get stronger support than single wall: {} vs {}", psi_edge, psi_floor);
+    assert!(psi_corner > psi_edge, "3D corner must get stronger support than 2-wall edge: {} vs {}", psi_corner, psi_edge);
+    assert!(grad_floor.y < 0.0, "grad_psi_b on floor must point into solid floor (-Y), got {:?}", grad_floor);
+
+    // 2. Verify high-energy DoubleDamBreak splash leaves zero stuck particles high on walls
+    let mut solver = SphSolver::new(bounds, config);
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DoubleDamBreak);
+    for _ in 0..260 {
+        solver.step(1.0 / 60.0);
+    }
+
+    let stuck_high = solver
+        .particles
+        .iter()
+        .filter(|p| p.position.y > 0.52)
+        .count();
+    assert_eq!(
+        stuck_high, 0,
+        "No particles should stick high on walls/ceiling after splash settles, got {}",
+        stuck_high
+    );
+}

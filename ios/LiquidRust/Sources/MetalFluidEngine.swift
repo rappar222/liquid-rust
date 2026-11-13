@@ -538,6 +538,28 @@ final class MetalFluidEngine: NSObject, MTKViewDelegate {
             spawnBlock(minBounds.x + pad, minBounds.y + pad, z0, minBounds.x + pad + damW, minBounds.y + pad + damH, z1, 0, 0, 0)
         }
 
+        if cfg.preset == 0 || cfg.preset == 1 || cfg.preset == 3 {
+            let amp = spacing * 0.08
+            let clampPad = particleRadius * 1.02
+            for i in 0..<initPos.count {
+                let idx = UInt32(truncatingIfNeeded: i)
+                var h1 = (idx ^ 0x9E3779B9) &* 0x85EBCA6B
+                h1 = (h1 ^ (h1 >> 13)) &* 0xC2B2AE35
+                let h2h = (h1 ^ (h1 >> 16)) &* 0x27D4EB2D
+                let h3 = (h2h ^ (h2h >> 15)) &* 0x165667B1
+
+                let jx = (Float((h1 >> 8) & 0xFFFF) / 32767.5 - 1.0) * amp
+                let jy = (Float((h2h >> 8) & 0xFFFF) / 32767.5 - 1.0) * amp
+                let jz = (Float((h3 >> 8) & 0xFFFF) / 32767.5 - 1.0) * amp
+
+                initPos[i].x = min(maxBounds.x - clampPad, max(minBounds.x + clampPad, initPos[i].x + jx))
+                initPos[i].y = min(maxBounds.y - clampPad, max(minBounds.y + clampPad, initPos[i].y + jy))
+                if !active2D {
+                    initPos[i].z = min(maxBounds.z - clampPad, max(minBounds.z + clampPad, initPos[i].z + jz))
+                }
+            }
+        }
+
         particleCount = initPos.count
         let n = max(1, particleCount)
 
@@ -598,7 +620,7 @@ final class MetalFluidEngine: NSObject, MTKViewDelegate {
                 }
             }
         }
-        return max(sum * 0.96, 1.0)
+        return max(sum, 1.0)
     }
 
     func draw(in view: MTKView) {

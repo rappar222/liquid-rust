@@ -40,13 +40,94 @@ inline int cell_index(int3 c, int3 dim) {
     return (c.z * dim.y + c.y) * dim.x + c.x;
 }
 
-inline float bell_cohesion(float r, float h) {
-    if (r <= 0.0001f || r >= h) return 0.0f;
-    float q = r / h;
-    if (q < 0.5f) {
-        return 2.0f * pow(1.0f - q, 3.0f) * pow(q, 3.0f) - (1.0f / 64.0f);
+struct BoundaryContrib {
+    float  psi;
+    float3 grad;
+};
+
+inline BoundaryContrib fold_wall_metal(
+    BoundaryContrib bc,
+    float d_clearance,
+    float3 grad_d,
+    float d_offset,
+    float h,
+    float inv_h,
+    float gamma_w
+) {
+    float d_eff = max(max(d_clearance, 0.0f) + d_offset, 0.25f * h);
+    if (d_eff < h) {
+        float q = d_eff * inv_h;
+        float omq2 = 1.0f - q * q;
+        float omq4 = (omq2 * omq2) * (omq2 * omq2);
+        float psi_w = min(gamma_w * omq4, 0.65f);
+
+        float omq = 1.0f - q;
+        float grad_mag = gamma_w * (6.1f * inv_h) * (omq * omq);
+        float3 g_w = -grad_d * grad_mag;
+
+        bc.grad = bc.grad * (1.0f - psi_w) + g_w * (1.0f - bc.psi);
+        bc.psi = bc.psi + psi_w - bc.psi * psi_w;
     }
-    return pow(1.0f - q, 3.0f) * pow(q, 3.0f);
+    return bc;
+}
+
+inline BoundaryContrib boundary_contribution_metal(float3 pos, constant SimUniforms& u) {
+    float radius = u.bounds_max.w;
+    float h = max(u.kernel_p.x, 1e-5f);
+    float inv_h = 1.0f / h;
+    float s = max(u.extra.y, 1e-4f);
+    float inv_s = 1.0f / s;
+    bool is_2d = (u.counts.y != 0);
+
+    float px = pos.x * inv_s;
+    float py = pos.y * inv_s;
+    float pz = pos.z * inv_s;
+    float a1 = 4.71f * px + 2.31f * pz;
+    float a2 = 3.83f * py - 4.19f * px;
+    float a3 = is_2d ? (3.13f * px + 4.47f * py) : (5.17f * pz - 3.41f * py);
+    float xi = (sin(a1) + sin(a2) + sin(a3)) * (1.0f / 3.0f);
+    float c1 = cos(a1);
+    float c2 = cos(a2);
+    float c3 = cos(a3);
+    float3 grad_xi = is_2d
+        ? float3((4.71f * c1 - 4.19f * c2 + 3.13f * c3) * (1.0f / 3.0f), (3.83f * c2 + 4.47f * c3) * (1.0f / 3.0f), 0.0f)
+        : float3((4.71f * c1 - 4.19f * c2) * (1.0f / 3.0f), (3.83f * c2 - 3.41f * c3) * (1.0f / 3.0f), (2.31f * c1 + 5.17f * c3) * (1.0f / 3.0f));
+
+    float rough_amp = is_2d ? 0.025f : 0.055f;
+    float d_offset = (1.0f - rough_amp * xi) * s;
+    float3 grad_bump = -grad_xi * rough_amp;
+    float gamma_w = (is_2d ? 1.42f : 1.20f) * (s * inv_h);
+
+    BoundaryContrib bc;
+    bc.psi = 0.0f;
+    bc.grad = float3(0.0f);
+
+    float3 b_min = u.bounds_min.xyz;
+    float3 b_max = u.bounds_max.xyz;
+
+    bc = fold_wall_metal(bc, (pos.y - b_min.y) - radius, float3(0.0f, 1.0f, 0.0f) + grad_bump, d_offset, h, inv_h, gamma_w);
+    bc = fold_wall_metal(bc, (b_max.y - pos.y) - radius, float3(0.0f, -1.0f, 0.0f) + grad_bump, d_offset, h, inv_h, gamma_w);
+    bc = fold_wall_metal(bc, (pos.x - b_min.x) - radius, float3(1.0f, 0.0f, 0.0f) + grad_bump, d_offset, h, inv_h, gamma_w);
+    bc = fold_wall_metal(bc, (b_max.x - pos.x) - radius, float3(-1.0f, 0.0f, 0.0f) + grad_bump, d_offset, h, inv_h, gamma_w);
+    if (!is_2d) {
+        bc = fold_wall_metal(bc, (pos.z - b_min.z) - radius, float3(0.0f, 0.0f, 1.0f) + grad_bump, d_offset, h, inv_h, gamma_w);
+        bc = fold_wall_metal(bc, (b_max.z - pos.z) - radius, float3(0.0f, 0.0f, -1.0f) + grad_bump, d_offset, h, inv_h, gamma_w);
+    }
+
+    if (u.fluid.w > 0.5f) {
+        float3 obs_pos = u.obstacle.xyz;
+        if (is_2d) obs_pos.z = 0.0f;
+        float3 to_p = pos - obs_pos;
+        if (is_2d) to_p.z = 0.0f;
+        float dist = length(to_p);
+        float3 n = (dist > 1e-6f) ? (to_p / dist) : float3(0.0f, 1.0f, 0.0f);
+        bc = fold_wall_metal(bc, dist - (u.obstacle.w + radius), n, s, h, inv_h, gamma_w);
+    }
+
+    if (is_2d) {
+        bc.grad.z = 0.0f;
+    }
+    return bc;
 }
 
 // ============================================================================
@@ -152,6 +233,7 @@ kernel void pbf_density(
     float h = u.kernel_p.x;
     float h2 = u.kernel_p.y;
     float inv_rho0 = u.kernel_p.z;
+    float rho0 = u.kernel_p.w;
     float poly6 = u.factors.x;
     float spiky = u.factors.y;
     bool is_2d = (u.counts.y != 0);
@@ -181,7 +263,7 @@ kernel void pbf_density(
 
                             float r = sqrt(r2);
                             float hr = h - r;
-                            float3 grad_j = (r_vec * (spiky * hr * hr / r)) * inv_rho0;
+                            float3 grad_j = (r_vec * (-spiky * hr * hr / r)) * inv_rho0;
                             grad_i += grad_j;
                             sum_grad2 += dot(grad_j, grad_j);
                         }
@@ -192,19 +274,13 @@ kernel void pbf_density(
         }
     }
 
-    // Analytical mirror-floor kernel support prevents bottom crowding & popping
-    float floor_y = u.bounds_min.y + u.bounds_max.w;
-    float dy_floor = p_i.y - floor_y;
-    if (dy_floor < h) {
-        float r_wall = max(dy_floor + u.extra.y * 0.85f, u.extra.y * 0.5f);
-        if (r_wall < h) {
-            float diff_w = h2 - r_wall * r_wall;
-            rho += 0.55f * poly6 * diff_w * diff_w * diff_w;
-        }
-    }
+    // Half-space-calibrated Akinci boundary volume & curl-free pressure gradient across all walls
+    BoundaryContrib bc = boundary_contribution_metal(p_i, u);
+    rho += rho0 * bc.psi;
+    grad_i += bc.grad;
+    sum_grad2 += dot(bc.grad, bc.grad) + dot(grad_i, grad_i);
 
-    sum_grad2 += dot(grad_i, grad_i);
-    float c_val = max(rho * inv_rho0 - 1.0f, -0.04f);
+    float c_val = max(rho * inv_rho0 - 1.0f, 0.0f);
     float lambda_i = -c_val / (sum_grad2 + u.solver.x);
 
     pred_out[gid] = float4(p_i, lambda_i);
@@ -229,24 +305,30 @@ kernel void pbf_solve_collide(
     float4 self_pl = pred_in[gid];
     float3 p_i = self_pl.xyz;
     float lambda_i = self_pl.w;
+    float rho_i = pos_buf[gid].w;
 
     float h = u.kernel_p.x;
     float h2 = u.kernel_p.y;
     float inv_rho0 = u.kernel_p.z;
+    float rho0 = u.kernel_p.w;
     float poly6 = u.factors.x;
     float spiky = u.factors.y;
     float inv_wq = 1.0f / max(u.factors.z, 1e-6f);
     float tensile_k = u.factors.w;
     float st_coeff = u.fluid.y;
+    float spacing = max(u.extra.y, 1e-4f);
+    float cfm_scale = max(u.extra.z, 1.0f);
     bool is_2d = (u.counts.y != 0);
+
+    BoundaryContrib bc = boundary_contribution_metal(p_i, u);
+    float wall_cohesion_scale = clamp(1.0f - bc.psi * 3.5f, 0.08f, 1.0f);
 
     int3 dim = u.grid_dim.xyz;
     int3 ci = cell_coords(p_i, u);
     int3 c_min = max(ci - int3(1, 1, is_2d ? 0 : 1), int3(0));
     int3 c_max = min(ci + int3(1, 1, is_2d ? 0 : 1), dim - int3(1));
 
-    float3 dp = float3(0.0f);
-    float3 coh = float3(0.0f);
+    float3 delta = float3(0.0f);
 
     for (int cz = c_min.z; cz <= c_max.z; ++cz) {
         for (int cy = c_min.y; cy <= c_max.y; ++cy) {
@@ -264,21 +346,25 @@ kernel void pbf_solve_collide(
                             float lambda_sum = lambda_i + nb.w;
 
                             float s_corr = 0.0f;
-                            if (lambda_sum < 0.0f) {
+                            if (lambda_sum < -1e-6f && r > spacing * 0.80f) {
                                 float diff = h2 - r2;
-                                float w_ij = poly6 * diff * diff * diff;
-                                float ratio = w_ij * inv_wq;
-                                float ratio2 = ratio * ratio;
-                                s_corr = -tensile_k * ratio2 * ratio2;
+                                float ratio = min((poly6 * diff * diff * diff) * inv_wq, 1.5f);
+                                float r4 = ratio * ratio * ratio * ratio;
+                                s_corr = (-tensile_k * r4 * h2) / cfm_scale;
                             }
 
                             float hr = h - r;
                             float3 dir = r_vec / r;
-                            float3 grad_w = dir * (spiky * hr * hr);
-                            dp += grad_w * (lambda_sum + s_corr);
+                            float3 grad_w = -dir * (spiky * hr * hr);
+                            delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
 
-                            if (st_coeff > 1e-6f) {
-                                coh -= dir * bell_cohesion(r, h);
+                            if (st_coeff > 0.0f && r > spacing * 0.48f) {
+                                float q = r / h;
+                                float omq = 1.0f - q;
+                                float spline = (q * q * q) * (omq * omq * omq) * 64.0f;
+                                float rho_j = pos_buf[j].w;
+                                float k_ij = (2.0f * rho0) / max(rho_i + rho_j, rho0 * 0.5f);
+                                delta -= dir * (st_coeff * wall_cohesion_scale * k_ij * spline);
                             }
                         }
                     }
@@ -288,13 +374,16 @@ kernel void pbf_solve_collide(
         }
     }
 
-    float3 total_dp = dp * (inv_rho0 * 0.65f) + coh * st_coeff;
-    float disp_len = length(total_dp);
-    if (disp_len > u.solver.y) {
-        total_dp *= (u.solver.y / disp_len);
+    if (lambda_i < -1e-7f) {
+        delta += bc.grad * (2.0f * lambda_i);
     }
 
-    float3 new_p = p_i + total_dp;
+    float disp_len = length(delta);
+    if (disp_len > u.solver.y && disp_len > 1e-7f) {
+        delta *= (u.solver.y / disp_len);
+    }
+
+    float3 new_p = p_i + delta * 0.65f;
     if (is_2d) new_p.z = 0.0f;
 
     // Sphere Obstacle Projection
@@ -344,20 +433,42 @@ kernel void pbf_velocity_xsph(
     float3 vel = (new_p - old_p) * inv_dt;
 
     float rad = u.bounds_max.w;
-    float eps_w = 0.0015f;
+    float dt = max(u.gravity_dt.w, 1e-6f);
+    float margin = max(rad * 0.20f, 0.002f);
     float rest = u.solver.z;
-    float slip = 1.0f - u.solver.w;
+    float friction = u.solver.w;
+    float slip_floor = clamp(1.0f - max(1.0f - friction, 0.0f) * dt * 1.5f, 0.985f, 1.0f);
+    const float slip_wall = 0.999f;
+    const float rest_threshold = 0.12f;
 
     float3 b_min = u.bounds_min.xyz + float3(rad, rad, is_2d ? 0.0f : rad);
     float3 b_max = u.bounds_max.xyz - float3(rad, rad, is_2d ? 0.0f : rad);
 
-    if (new_p.x <= b_min.x + eps_w && vel.x < 0.0f) { vel.x = (vel.x > -0.25f) ? 0.0f : -vel.x * rest; vel.yz *= slip; }
-    if (new_p.x >= b_max.x - eps_w && vel.x > 0.0f) { vel.x = (vel.x <  0.25f) ? 0.0f : -vel.x * rest; vel.yz *= slip; }
-    if (new_p.y <= b_min.y + eps_w && vel.y < 0.0f) { vel.y = (vel.y > -0.35f) ? 0.0f : -vel.y * rest; vel.xz *= slip; }
-    if (new_p.y >= b_max.y - eps_w && vel.y > 0.0f) { vel.y = -vel.y * rest; vel.xz *= slip; }
+    if (new_p.y <= b_min.y + margin) {
+        if (vel.y < 0.0f) { vel.y = (vel.y < -rest_threshold) ? (-vel.y * rest) : 0.0f; }
+        vel.xz *= slip_floor;
+    }
+    if (new_p.y >= b_max.y - margin && vel.y > 0.0f) {
+        vel.y = (vel.y > rest_threshold) ? (-vel.y * rest) : 0.0f;
+        vel.xz *= slip_wall;
+    }
+    if (new_p.x <= b_min.x + margin && vel.x < 0.0f) {
+        vel.x = (vel.x < -rest_threshold) ? (-vel.x * rest) : 0.0f;
+        vel.yz *= slip_wall;
+    }
+    if (new_p.x >= b_max.x - margin && vel.x > 0.0f) {
+        vel.x = (vel.x > rest_threshold) ? (-vel.x * rest) : 0.0f;
+        vel.yz *= slip_wall;
+    }
     if (!is_2d) {
-        if (new_p.z <= b_min.z + eps_w && vel.z < 0.0f) { vel.z = (vel.z > -0.25f) ? 0.0f : -vel.z * rest; vel.xy *= slip; }
-        if (new_p.z >= b_max.z - eps_w && vel.z > 0.0f) { vel.z = (vel.z <  0.25f) ? 0.0f : -vel.z * rest; vel.xy *= slip; }
+        if (new_p.z <= b_min.z + margin && vel.z < 0.0f) {
+            vel.z = (vel.z < -rest_threshold) ? (-vel.z * rest) : 0.0f;
+            vel.xy *= slip_wall;
+        }
+        if (new_p.z >= b_max.z - margin && vel.z > 0.0f) {
+            vel.z = (vel.z > rest_threshold) ? (-vel.z * rest) : 0.0f;
+            vel.xy *= slip_wall;
+        }
     }
 
     // XSPH Viscosity

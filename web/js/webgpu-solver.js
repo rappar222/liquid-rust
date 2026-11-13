@@ -3,9 +3,9 @@
 // Includes Akinci free-surface cohesion, flow-gated vorticity confinement,
 // and single-encoder / single-pass substep batching for minimal driver overhead.
 
-import { Vec3, Aabb } from './math.js?v=20261112c';
-import { ScenePreset } from './pbf-solver.js?v=20261112c';
-import { PBF_COMPUTE_WGSL } from './pbf-shader.js?v=20261112c';
+import { Vec3, Aabb } from './math.js?v=20261113b';
+import { ScenePreset } from './pbf-solver.js?v=20261113b';
+import { PBF_COMPUTE_WGSL } from './pbf-shader.js?v=20261113b';
 
 export class WebGpuSolver {
     constructor(device) {
@@ -511,6 +511,35 @@ export class WebGpuSolver {
         }
 
         this.particleCount = Math.floor(particles.length / 8);
+
+        if (
+            preset === ScenePreset.DAM_BREAK ||
+            preset === ScenePreset.DOUBLE_DAM ||
+            preset === ScenePreset.OBSTACLE
+        ) {
+            const amp = s * 0.08;
+            const pad = r * 1.02;
+            const bMin = this.bounds.min;
+            const bMax = this.bounds.max;
+            for (let i = 0; i < this.particleCount; i++) {
+                const i8 = i * 8;
+                let h1 = Math.imul(i ^ 0x9E3779B9, 0x85EBCA6B);
+                h1 = Math.imul(h1 ^ (h1 >>> 13), 0xC2B2AE35);
+                const h2 = Math.imul(h1 ^ (h1 >>> 16), 0x27D4EB2D);
+                const h3 = Math.imul(h2 ^ (h2 >>> 15), 0x165667B1);
+
+                const jx = (((h1 >>> 8) & 0xFFFF) / 32767.5 - 1.0) * amp;
+                const jy = (((h2 >>> 8) & 0xFFFF) / 32767.5 - 1.0) * amp;
+                const jz = (((h3 >>> 8) & 0xFFFF) / 32767.5 - 1.0) * amp;
+
+                particles[i8] = Math.min(bMax.x - pad, Math.max(bMin.x + pad, particles[i8] + jx));
+                particles[i8 + 1] = Math.min(bMax.y - pad, Math.max(bMin.y + pad, particles[i8 + 1] + jy));
+                if (!this.is2D) {
+                    particles[i8 + 2] = Math.min(bMax.z - pad, Math.max(bMin.z + pad, particles[i8 + 2] + jz));
+                }
+            }
+        }
+
         if (this.particleCount > this.capacity) {
             this.allocateBuffers(Math.max(this.capacity * 2, this.particleCount + 1024));
         }

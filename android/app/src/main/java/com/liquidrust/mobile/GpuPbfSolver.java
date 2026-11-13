@@ -208,7 +208,7 @@ public final class GpuPbfSolver {
                 }
             }
         }
-        return Math.max(sum * 0.96f, 1.0f);
+        return Math.max(sum, 1.0f);
     }
 
     private void addParticle(float x, float y, float z, float vx, float vy, float vz) {
@@ -335,6 +335,30 @@ public final class GpuPbfSolver {
                 float damH = hBox * (tall ? 0.58f : 0.76f);
                 spawnBlock(minX + pad, minY + pad, z0, minX + pad + damW, minY + pad + damH, z1, 0f, 0f, 0f);
                 break;
+            }
+        }
+
+        if (preset == SimulationConfig.PRESET_DAM_BREAK
+                || preset == SimulationConfig.PRESET_DOUBLE_DAM
+                || preset == SimulationConfig.PRESET_OBSTACLE) {
+            float amp = spacing * 0.08f;
+            float clampPad = particleRadius * 1.02f;
+            for (int i = 0; i < particleCount; i++) {
+                int i4 = i * 4;
+                int h1 = (i ^ 0x9E3779B9) * 0x85EBCA6B;
+                h1 = (h1 ^ (h1 >>> 13)) * 0xC2B2AE35;
+                int h2h = (h1 ^ (h1 >>> 16)) * 0x27D4EB2D;
+                int h3 = (h2h ^ (h2h >>> 15)) * 0x165667B1;
+
+                float jx = (((h1 >>> 8) & 0xFFFF) / 32767.5f - 1.0f) * amp;
+                float jy = (((h2h >>> 8) & 0xFFFF) / 32767.5f - 1.0f) * amp;
+                float jz = (((h3 >>> 8) & 0xFFFF) / 32767.5f - 1.0f) * amp;
+
+                initPos[i4] = Math.max(minX + clampPad, Math.min(maxX - clampPad, initPos[i4] + jx));
+                initPos[i4 + 1] = Math.max(minY + clampPad, Math.min(maxY - clampPad, initPos[i4 + 1] + jy));
+                if (!is2D) {
+                    initPos[i4 + 2] = Math.max(minZ + clampPad, Math.min(maxZ - clampPad, initPos[i4 + 2] + jz));
+                }
             }
         }
     }

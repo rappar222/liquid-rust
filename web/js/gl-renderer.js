@@ -2,8 +2,8 @@
 // High-performance point sprite spheres with glossy Fresnel sky-rim, specular highlights,
 // true 3D spherical depth, studio floor grid, and zero per-frame JS heap allocations.
 
-import { ColorMap } from './color-map.js?v=20261112c';
-import { Mat4 } from './math.js?v=20261112c';
+import { ColorMap } from './color-map.js?v=20261113b';
+import { Mat4 } from './math.js?v=20261113b';
 
 export class GlRenderer {
     constructor(gl) {

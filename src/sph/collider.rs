@@ -108,7 +108,7 @@ impl Collider {
                         let normal_impulse = -(1.0 + eff_restitution) * vn * normal;
                         let mut new_rel = rel_vel + normal_impulse;
                         let vt = new_rel - normal * new_rel.dot(normal);
-                        new_rel -= vt * (1.0 - self.friction);
+                        new_rel -= vt * ((1.0 - self.friction) * 0.1);
                         *vel = self.velocity + new_rel;
                     }
                     return true;
@@ -166,7 +166,7 @@ impl Collider {
                         let normal_impulse = -(1.0 + eff_restitution) * vn * normal;
                         let mut new_rel = rel_vel + normal_impulse;
                         let vt = new_rel - normal * new_rel.dot(normal);
-                        new_rel -= vt * (1.0 - self.friction);
+                        new_rel -= vt * ((1.0 - self.friction) * 0.1);
                         *vel = self.velocity + new_rel;
                     }
                     return true;
@@ -198,7 +198,7 @@ impl Collider {
                         let normal_impulse = -(1.0 + eff_restitution) * vn * normal;
                         let mut new_rel = rel_vel + normal_impulse;
                         let vt = new_rel - normal * new_rel.dot(normal);
-                        new_rel -= vt * (1.0 - self.friction);
+                        new_rel -= vt * ((1.0 - self.friction) * 0.1);
                         *vel = self.velocity + new_rel;
                     }
                     return true;
@@ -209,5 +209,84 @@ impl Collider {
             }
         }
         false
+    }
+
+    /// Fold analytical boundary volume fraction & gradient from this solid obstacle into `(psi, grad)`.
+    #[inline]
+    pub fn fold_boundary_contribution(
+        &self,
+        pos: Vec3,
+        particle_radius: f32,
+        spacing: f32,
+        h: f32,
+        is_2d: bool,
+        psi: &mut f32,
+        grad: &mut Vec3,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let s = spacing.max(1e-4);
+        let inv_h = 1.0 / h.max(1e-5);
+        let gamma_w = (if is_2d { 1.42 } else { 1.20 }) * (s * inv_h);
+        let d_offset = s;
+
+        let mut apply = |d_clearance: f32, n_outward: Vec3| {
+            crate::sph::Chamber::fold_wall_plane(
+                psi,
+                grad,
+                d_clearance,
+                n_outward,
+                d_offset,
+                h,
+                inv_h,
+                gamma_w,
+            );
+        };
+
+        match &self.shape {
+            ColliderShape::Sphere { center, radius } => {
+                let diff = pos - *center;
+                let dist = diff.length();
+                if dist > 1e-6 {
+                    let d_c = dist - (*radius + particle_radius);
+                    if d_c < h {
+                        apply(d_c, diff / dist);
+                    }
+                }
+            }
+            ColliderShape::Box { aabb } => {
+                let inf_min = aabb.min - Vec3::splat(particle_radius);
+                let inf_max = aabb.max + Vec3::splat(particle_radius);
+                let clamped = pos.clamp(inf_min, inf_max);
+                let diff = pos - clamped;
+                let dist = diff.length();
+                if dist > 1e-6 && dist < h {
+                    apply(dist, diff / dist);
+                }
+            }
+            ColliderShape::Cylinder { center, radius, height } => {
+                let half_h = *height * 0.5 + particle_radius;
+                let eff_r = *radius + particle_radius;
+                if pos.y >= center.y - half_h - h && pos.y <= center.y + half_h + h {
+                    let dx = pos.x - center.x;
+                    let dz = pos.z - center.z;
+                    let r_xz = (dx * dx + dz * dz).sqrt();
+                    if r_xz > 1e-6 {
+                        let dr = (r_xz - eff_r).max(0.0);
+                        let dy = ((pos.y - center.y).abs() - half_h).max(0.0);
+                        let dist = (dr * dr + dy * dy).sqrt();
+                        if dist < h {
+                            let mut n = Vec3::new(dx / r_xz, 0.0, dz / r_xz);
+                            if dy > dr && dy > 1e-5 {
+                                n = Vec3::new(0.0, (pos.y - center.y).signum(), 0.0);
+                            }
+                            apply(dist, n);
+                        }
+                    }
+                }
+            }
+            ColliderShape::Mesh(_) => {}
+        }
     }
 }

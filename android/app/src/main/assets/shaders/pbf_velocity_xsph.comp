@@ -62,60 +62,47 @@ void main() {
     float radius = u_bounds_max.w;
     float restitution = u_solver.z;
     float friction = u_solver.w;
-    float margin = 0.0015;
+    float margin = max(radius * 0.20, 0.002);
     vec3 b_min = u_bounds_min.xyz;
     vec3 b_max = u_bounds_max.xyz;
     bool is_2d = (u_counts.y != 0);
 
-    float slip = clamp(1.0 - (1.0 - friction) * dt * 3.0, 0.95, 1.0);
+    float slip_floor = clamp(1.0 - max(1.0 - friction, 0.0) * dt * 1.5, 0.985, 1.0);
+    const float slip_wall = 0.999;
     const float rest_threshold = 0.12;
 
     if (new_pos.y <= b_min.y + radius + margin) {
         if (vel.y < 0.0) {
             vel.y = (vel.y < -rest_threshold) ? (-vel.y * restitution) : 0.0;
-        } else if (vel.y > 0.0 && vel.y < 0.22) {
-            vel.y *= 0.08;
         }
-        vel.x *= slip;
-        vel.z *= slip;
+        vel.x *= slip_floor;
+        vel.z *= slip_floor;
     }
-    if (new_pos.y >= b_max.y - radius - margin) {
-        if (vel.y > 0.0) {
-            vel.y = (vel.y > rest_threshold) ? (-vel.y * restitution) : 0.0;
-        } else if (vel.y < 0.0 && vel.y > -0.22) {
-            vel.y *= 0.08;
-        }
-        vel.x *= slip;
-        vel.z *= slip;
+    if (new_pos.y >= b_max.y - radius - margin && vel.y > 0.0) {
+        vel.y = (vel.y > rest_threshold) ? (-vel.y * restitution) : 0.0;
+        vel.x *= slip_wall;
+        vel.z *= slip_wall;
     }
-    if (new_pos.x <= b_min.x + radius + margin) {
-        if (vel.x < 0.0) {
-            vel.x = (vel.x < -rest_threshold) ? (-vel.x * restitution) : 0.0;
-        } else if (vel.x > 0.0 && vel.x < 0.22) {
-            vel.x *= 0.08;
-        }
-        vel.y *= slip;
-        vel.z *= slip;
+    if (new_pos.x <= b_min.x + radius + margin && vel.x < 0.0) {
+        vel.x = (vel.x < -rest_threshold) ? (-vel.x * restitution) : 0.0;
+        vel.y *= slip_wall;
+        vel.z *= slip_wall;
     }
-    if (new_pos.x >= b_max.x - radius - margin) {
-        if (vel.x > 0.0) {
-            vel.x = (vel.x > rest_threshold) ? (-vel.x * restitution) : 0.0;
-        } else if (vel.x < 0.0 && vel.x > -0.22) {
-            vel.x *= 0.08;
-        }
-        vel.y *= slip;
-        vel.z *= slip;
+    if (new_pos.x >= b_max.x - radius - margin && vel.x > 0.0) {
+        vel.x = (vel.x > rest_threshold) ? (-vel.x * restitution) : 0.0;
+        vel.y *= slip_wall;
+        vel.z *= slip_wall;
     }
     if (!is_2d) {
         if (new_pos.z <= b_min.z + radius + margin && vel.z < 0.0) {
             vel.z = (vel.z < -rest_threshold) ? (-vel.z * restitution) : 0.0;
-            vel.x *= slip;
-            vel.y *= slip;
+            vel.x *= slip_wall;
+            vel.y *= slip_wall;
         }
         if (new_pos.z >= b_max.z - radius - margin && vel.z > 0.0) {
             vel.z = (vel.z > rest_threshold) ? (-vel.z * restitution) : 0.0;
-            vel.x *= slip;
-            vel.y *= slip;
+            vel.x *= slip_wall;
+            vel.y *= slip_wall;
         }
     }
 

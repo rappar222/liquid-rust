@@ -562,6 +562,7 @@ impl LiquidApp {
         let camera = self.camera.clone();
         let color_mode = self.color_mode;
         let color_map = self.color_map;
+        let display_size_factor = self.display_size_factor;
         let enable_culling = self.enable_culling;
         let is_2d = self.is_2d;
         let use_gpu = self.use_gpu;
@@ -654,7 +655,7 @@ impl LiquidApp {
                     RenderMode::Particles => {
                         sw.render_frame(
                             &render_solver.particles,
-                            render_solver.config.particle_radius,
+                            render_solver.config.particle_radius * display_size_factor,
                             &render_solver.chamber,
                             render_solver.bounds,
                             &camera,

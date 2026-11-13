@@ -2,18 +2,18 @@
 // Dual engine: WebGPU Compute Shaders (primary) with WebGL 2.0 fallback,
 // Live Optical Material / Procedural Texture Shading, Natural Fluid Physics, and OS-Aware Native Downloads.
 
-import { Vec3, Ray } from './math.js?v=20261112c';
-import { Camera } from './camera.js?v=20261112c';
-import { PbfSolver, ScenePreset } from './pbf-solver.js?v=20261112c';
-import { GlRenderer } from './gl-renderer.js?v=20261112c';
-import { WebGpuSolver } from './webgpu-solver.js?v=20261112c';
-import { WebGpuRenderer } from './webgpu-renderer.js?v=20261112c';
+import { Vec3, Ray } from './math.js?v=20261113b';
+import { Camera } from './camera.js?v=20261113b';
+import { PbfSolver, ScenePreset } from './pbf-solver.js?v=20261113b';
+import { GlRenderer } from './gl-renderer.js?v=20261113b';
+import { WebGpuSolver } from './webgpu-solver.js?v=20261113b';
+import { WebGpuRenderer } from './webgpu-renderer.js?v=20261113b';
 
 const RELEASE_LATEST = 'https://github.com/rappar222/liquid-rust/releases/latest';
 const RELEASE_DL = `${RELEASE_LATEST}/download`;
-const RELEASE_V031_DL = 'https://github.com/rappar222/liquid-rust/releases/download/v0.3.1';
-const ANDROID_APK_URL = 'https://github.com/rappar222/liquid-rust/releases/download/v0.3.1/liquid-rust-android.apk';
-const IOS_IPA_URL = 'https://github.com/rappar222/liquid-rust/releases/download/v0.3.1/liquid-rust-ios.ipa';
+const RELEASE_V032_DL = 'https://github.com/rappar222/liquid-rust/releases/download/v0.3.2';
+const ANDROID_APK_URL = 'https://github.com/rappar222/liquid-rust/releases/download/v0.3.2/liquid-rust-android.apk';
+const IOS_IPA_URL = 'https://github.com/rappar222/liquid-rust/releases/download/v0.3.2/liquid-rust-ios.ipa';
 
 const MATERIAL_PRESETS = {
     water:   { shallow: '#38bdf8', deep: '#0c3b8a', ior: 1.333, roughness: 0.045, specular: 1.35, refraction: 0.42, metallic: 0.00, foam: 0.35 },
@@ -641,7 +641,7 @@ class LiquidApp {
                 primaryHref = `${RELEASE_DL}/liquid-rust-linux-aarch64.tar.gz`;
                 headerLabel = '⬇ Linux ARM64';
                 alts = [
-                    { label: '.rpm (aarch64)', href: `${RELEASE_V031_DL}/liquid-rust-0.3.1-1.aarch64.rpm` },
+                    { label: '.rpm (aarch64)', href: `${RELEASE_V032_DL}/liquid-rust-0.3.2-1.aarch64.rpm` },
                     { label: 'x86_64 AppImage', href: `${RELEASE_DL}/liquid-rust-x86_64.AppImage` },
                     { label: 'All Releases', href: RELEASE_LATEST },
                 ];
@@ -650,7 +650,7 @@ class LiquidApp {
                 if (/ubuntu|debian|mint|pop!_os/.test(uaLow)) {
                     osLabel = 'Ubuntu / Debian x64';
                     primaryLabel = '⬇ Download Ubuntu (.deb)';
-                    primaryHref = `${RELEASE_V031_DL}/liquid-rust_0.3.1_amd64.deb`;
+                    primaryHref = `${RELEASE_V032_DL}/liquid-rust_0.3.2_amd64.deb`;
                     alts = [
                         { label: 'AppImage', href: `${RELEASE_DL}/liquid-rust-x86_64.AppImage` },
                         { label: 'Android .apk', href: ANDROID_APK_URL },
@@ -659,7 +659,7 @@ class LiquidApp {
                 } else if (/fedora|rhel|centos|rocky|alma/.test(uaLow)) {
                     osLabel = 'Fedora / RHEL x64';
                     primaryLabel = '⬇ Download Fedora (.rpm)';
-                    primaryHref = `${RELEASE_V031_DL}/liquid-rust-0.3.1-1.x86_64.rpm`;
+                    primaryHref = `${RELEASE_V032_DL}/liquid-rust-0.3.2-1.x86_64.rpm`;
                     alts = [
                         { label: 'AppImage', href: `${RELEASE_DL}/liquid-rust-x86_64.AppImage` },
                         { label: 'Android .apk', href: ANDROID_APK_URL },
@@ -670,8 +670,8 @@ class LiquidApp {
                     primaryLabel = '⬇ Download Linux (AppImage)';
                     primaryHref = `${RELEASE_DL}/liquid-rust-x86_64.AppImage`;
                     alts = [
-                        { label: '.deb', href: `${RELEASE_V031_DL}/liquid-rust_0.3.1_amd64.deb` },
-                        { label: '.rpm', href: `${RELEASE_V031_DL}/liquid-rust-0.3.1-1.x86_64.rpm` },
+                        { label: '.deb', href: `${RELEASE_V032_DL}/liquid-rust_0.3.2_amd64.deb` },
+                        { label: '.rpm', href: `${RELEASE_V032_DL}/liquid-rust-0.3.2-1.x86_64.rpm` },
                         { label: 'Android .apk', href: ANDROID_APK_URL },
                         { label: 'All Releases', href: RELEASE_LATEST },
                     ];

@@ -1,6 +1,6 @@
 [package]
 name = "liquid-rust"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 authors = ["Radu <rappar222>"]
 description = "High-performance 3D SPH Fluid Simulation in Rust with real-time visualization and PLY export"
@@ -25,6 +25,7 @@ serde_json = "1.0"
 flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+rfd = "0.15"
 
 [package.metadata.generate-rpm]
 name = "liquid-rust"

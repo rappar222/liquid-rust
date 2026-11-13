@@ -76,9 +76,17 @@ impl Collider {
     }
 
     pub fn load_obj(path: impl AsRef<Path>, position: Vec3, scale: f32) -> Result<Self, String> {
-        let mut mesh = TriangleMesh::from_obj_file(path)?;
-        mesh.center_origin();
-        mesh.set_transform(position, scale, Vec3::ZERO);
+        Self::load_obj_transformed(path, position, scale, Vec3::ZERO)
+    }
+
+    pub fn load_obj_transformed(
+        path: impl AsRef<Path>,
+        position: Vec3,
+        scale: f32,
+        rotation: Vec3,
+    ) -> Result<Self, String> {
+        let mut mesh = TriangleMesh::load_obj_normalized(path)?;
+        mesh.set_transform(position, scale, rotation);
         Ok(Self::mesh(Arc::new(mesh)))
     }
 

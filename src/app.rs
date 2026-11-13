@@ -447,21 +447,37 @@ impl LiquidApp {
             if has_mesh_collider {
                 let radius = self.solver.config.particle_radius;
                 let colliders = &self.solver.colliders;
-                let mut any_mesh_hit = false;
-                for p in &mut self.solver.particles {
-                    for col in colliders {
-                        if let ColliderShape::Mesh(_) = &col.shape {
-                            any_mesh_hit |= col.resolve(&mut p.position, &mut p.velocity, radius);
+                let is_2d = self.is_2d;
+                let b_min = self.solver.bounds.min + Vec3::splat(radius);
+                let b_max = self.solver.bounds.max - Vec3::splat(radius);
+                let any_mesh_hit = self
+                    .solver
+                    .particles
+                    .par_iter_mut()
+                    .map(|p| {
+                        let mut p_hit = false;
+                        for col in colliders {
+                            if let ColliderShape::Mesh(_) = &col.shape {
+                                p_hit |= col.resolve(&mut p.position, &mut p.velocity, radius);
+                            }
                         }
-                    }
-                }
+                        if p_hit {
+                            p.position = p.position.clamp(b_min, b_max);
+                            if is_2d {
+                                p.position.z = 0.0;
+                                p.velocity.z = 0.0;
+                            }
+                        }
+                        p_hit
+                    })
+                    .reduce(|| false, |a, b| a || b);
                 if any_mesh_hit {
                     if let Some(ref mut gpu) = self.gpu_solver {
                         gpu.sync_particles(
                             self.solver.bounds,
                             &self.solver.config,
                             &self.solver.particles,
-                            true,
+                            false,
                         );
                     }
                 }
@@ -998,10 +1014,25 @@ impl LiquidApp {
                 ColliderShape::Mesh(mesh) => {
                     let path = mesh.source_path.as_deref().unwrap_or("model.obj");
                     let p = mesh.position;
-                    parts.push(format!(
-                        "--obstacle \"obj:{}:{:.2},{:.2},{:.2}:{:.2}\"",
-                        path, p.x, p.y, p.z, mesh.scale
-                    ));
+                    let r = mesh.rotation;
+                    if r.length_squared() > 1e-6 {
+                        parts.push(format!(
+                            "--obstacle \"obj:{}:{:.2},{:.2},{:.2}:{:.2}:{:.1},{:.1},{:.1}\"",
+                            path,
+                            p.x,
+                            p.y,
+                            p.z,
+                            mesh.scale,
+                            r.x.to_degrees(),
+                            r.y.to_degrees(),
+                            r.z.to_degrees()
+                        ));
+                    } else {
+                        parts.push(format!(
+                            "--obstacle \"obj:{}:{:.2},{:.2},{:.2}:{:.2}\"",
+                            path, p.x, p.y, p.z, mesh.scale
+                        ));
+                    }
                 }
             }
         }
@@ -1419,50 +1450,167 @@ impl LiquidApp {
                     }
                 });
 
+                let sim_bounds = self.solver.bounds;
+                let b_center = sim_bounds.center();
+                let b_size = sim_bounds.size();
+                let default_span = if self.is_2d {
+                    b_size.x.min(b_size.y)
+                } else {
+                    b_size.x.min(b_size.y).min(b_size.z)
+                };
+                let default_mesh_scale = (default_span * 0.28).clamp(0.15, 0.65);
+                let default_mesh_pos = Vec3::new(
+                    b_center.x,
+                    sim_bounds.min.y + b_size.y * 0.35,
+                    if self.is_2d { 0.0 } else { b_center.z },
+                );
+
                 let mut to_remove_col: Option<usize> = None;
                 for (idx, collider) in self.solver.colliders.iter_mut().enumerate() {
                     ui.separator();
+                    let tri_badge = if let ColliderShape::Mesh(m) = &collider.shape {
+                        Some(m.triangle_count())
+                    } else {
+                        None
+                    };
+                    let mut reset_mesh_transform = false;
+
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut collider.enabled, "");
                         ui.strong(&collider.name);
-                        if ui.small_button("✕").clicked() {
-                            to_remove_col = Some(idx);
+                        if let Some(tris) = tri_badge {
+                            ui.small(
+                                egui::RichText::new(format!("({} tris)", tris))
+                                    .color(egui::Color32::from_rgb(138, 152, 172)),
+                            );
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Remove obstacle")
+                                .clicked()
+                            {
+                                to_remove_col = Some(idx);
+                            }
+                            if tri_badge.is_some()
+                                && ui
+                                    .small_button("↺")
+                                    .on_hover_text("Reset position, scale & rotation")
+                                    .clicked()
+                            {
+                                reset_mesh_transform = true;
+                            }
+                        });
                     });
+
                     if collider.enabled {
                         match &mut collider.shape {
                             ColliderShape::Sphere { center, radius } => {
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X:"));
-                                    ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y:"));
-                                    if !self.is_2d {
-                                        ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z:"));
-                                    } else {
-                                        center.z = 0.0;
-                                    }
-                                });
-                                ui.add(egui::Slider::new(radius, 0.02..=0.8).text("Radius"));
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut center.x,
+                                        sim_bounds.min.x..=sim_bounds.max.x,
+                                    )
+                                    .text("Move X")
+                                    .suffix(" m")
+                                    .clamping(egui::SliderClamping::Edits),
+                                );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut center.y,
+                                        sim_bounds.min.y..=sim_bounds.max.y,
+                                    )
+                                    .text("Move Y")
+                                    .suffix(" m")
+                                    .clamping(egui::SliderClamping::Edits),
+                                );
+                                if !self.is_2d {
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut center.z,
+                                            sim_bounds.min.z..=sim_bounds.max.z,
+                                        )
+                                        .text("Move Z")
+                                        .suffix(" m")
+                                        .clamping(egui::SliderClamping::Edits),
+                                    );
+                                } else {
+                                    center.z = 0.0;
+                                }
+                                ui.add(
+                                    egui::Slider::new(radius, 0.02..=0.8)
+                                        .text("Scale (Radius)")
+                                        .suffix(" m")
+                                        .clamping(egui::SliderClamping::Edits),
+                                );
                             }
                             ColliderShape::Box { aabb } => {
                                 let mut center = aabb.center();
                                 let mut extents = aabb.size();
                                 let mut changed = false;
-                                ui.horizontal(|ui| {
-                                    changed |= ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X:")).changed();
-                                    changed |= ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y:")).changed();
-                                    if !self.is_2d {
-                                        changed |= ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z:")).changed();
-                                    } else {
-                                        center.z = 0.0;
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    changed |= ui.add(egui::DragValue::new(&mut extents.x).speed(0.01).prefix("W:")).changed();
-                                    changed |= ui.add(egui::DragValue::new(&mut extents.y).speed(0.01).prefix("H:")).changed();
-                                    if !self.is_2d {
-                                        changed |= ui.add(egui::DragValue::new(&mut extents.z).speed(0.01).prefix("D:")).changed();
-                                    }
-                                });
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut center.x,
+                                            sim_bounds.min.x..=sim_bounds.max.x,
+                                        )
+                                        .text("Move X")
+                                        .suffix(" m")
+                                        .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut center.y,
+                                            sim_bounds.min.y..=sim_bounds.max.y,
+                                        )
+                                        .text("Move Y")
+                                        .suffix(" m")
+                                        .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+                                if !self.is_2d {
+                                    changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut center.z,
+                                                sim_bounds.min.z..=sim_bounds.max.z,
+                                            )
+                                            .text("Move Z")
+                                            .suffix(" m")
+                                            .clamping(egui::SliderClamping::Edits),
+                                        )
+                                        .changed();
+                                } else {
+                                    center.z = 0.0;
+                                }
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut extents.x, 0.04..=1.6)
+                                            .text("Width")
+                                            .suffix(" m")
+                                            .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut extents.y, 0.04..=1.6)
+                                            .text("Height")
+                                            .suffix(" m")
+                                            .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+                                if !self.is_2d {
+                                    changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut extents.z, 0.04..=1.6)
+                                                .text("Depth")
+                                                .suffix(" m")
+                                                .clamping(egui::SliderClamping::Edits),
+                                        )
+                                        .changed();
+                                }
                                 if changed {
                                     let h = extents * 0.5;
                                     *aabb = Aabb::new(center - h, center + h);
@@ -1473,34 +1621,160 @@ impl LiquidApp {
                                 radius,
                                 height,
                             } => {
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::DragValue::new(&mut center.x).speed(0.01).prefix("X:"));
-                                    ui.add(egui::DragValue::new(&mut center.y).speed(0.01).prefix("Y:"));
-                                    if !self.is_2d {
-                                        ui.add(egui::DragValue::new(&mut center.z).speed(0.01).prefix("Z:"));
-                                    } else {
-                                        center.z = 0.0;
-                                    }
-                                });
-                                ui.add(egui::Slider::new(radius, 0.02..=0.6).text("Radius"));
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut center.x,
+                                        sim_bounds.min.x..=sim_bounds.max.x,
+                                    )
+                                    .text("Move X")
+                                    .suffix(" m")
+                                    .clamping(egui::SliderClamping::Edits),
+                                );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut center.y,
+                                        sim_bounds.min.y..=sim_bounds.max.y,
+                                    )
+                                    .text("Move Y")
+                                    .suffix(" m")
+                                    .clamping(egui::SliderClamping::Edits),
+                                );
                                 if !self.is_2d {
-                                    ui.add(egui::Slider::new(height, 0.05..=1.2).text("Height"));
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut center.z,
+                                            sim_bounds.min.z..=sim_bounds.max.z,
+                                        )
+                                        .text("Move Z")
+                                        .suffix(" m")
+                                        .clamping(egui::SliderClamping::Edits),
+                                    );
+                                } else {
+                                    center.z = 0.0;
+                                }
+                                ui.add(
+                                    egui::Slider::new(radius, 0.02..=0.8)
+                                        .text("Radius")
+                                        .suffix(" m")
+                                        .clamping(egui::SliderClamping::Edits),
+                                );
+                                if !self.is_2d {
+                                    ui.add(
+                                        egui::Slider::new(height, 0.05..=1.6)
+                                            .text("Height")
+                                            .suffix(" m")
+                                            .clamping(egui::SliderClamping::Edits),
+                                    );
                                 }
                             }
                             ColliderShape::Mesh(mesh_arc) => {
-                                if let Some(mesh) = std::sync::Arc::get_mut(mesh_arc) {
-                                    let mut changed = false;
-                                    ui.horizontal(|ui| {
-                                        changed |= ui.add(egui::DragValue::new(&mut mesh.position.x).speed(0.01).prefix("X:")).changed();
-                                        changed |= ui.add(egui::DragValue::new(&mut mesh.position.y).speed(0.01).prefix("Y:")).changed();
-                                        if !self.is_2d {
-                                            changed |= ui.add(egui::DragValue::new(&mut mesh.position.z).speed(0.01).prefix("Z:")).changed();
-                                        }
-                                    });
-                                    changed |= ui.add(egui::Slider::new(&mut mesh.scale, 0.02..=2.5).text("Scale")).changed();
-                                    if changed {
-                                        mesh.update_transform();
-                                    }
+                                let mesh = std::sync::Arc::make_mut(mesh_arc);
+                                let mut changed = false;
+
+                                if reset_mesh_transform {
+                                    mesh.position = default_mesh_pos;
+                                    mesh.scale = default_mesh_scale;
+                                    mesh.rotation = Vec3::ZERO;
+                                    changed = true;
+                                }
+
+                                // Move sliders (X, Y, Z)
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut mesh.position.x,
+                                            sim_bounds.min.x..=sim_bounds.max.x,
+                                        )
+                                        .text("Move X")
+                                        .suffix(" m")
+                                        .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut mesh.position.y,
+                                            sim_bounds.min.y..=sim_bounds.max.y,
+                                        )
+                                        .text("Move Y")
+                                        .suffix(" m")
+                                        .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+                                if !self.is_2d {
+                                    changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut mesh.position.z,
+                                                sim_bounds.min.z..=sim_bounds.max.z,
+                                            )
+                                            .text("Move Z")
+                                            .suffix(" m")
+                                            .clamping(egui::SliderClamping::Edits),
+                                        )
+                                        .changed();
+                                } else {
+                                    changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut mesh.position.z, -0.6..=0.6)
+                                                .text("Slice Z")
+                                                .suffix(" m")
+                                                .clamping(egui::SliderClamping::Edits),
+                                        )
+                                        .changed();
+                                }
+
+                                // Scale slider (normalized: 1.0 = 1.0 meter bounding size)
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut mesh.scale, 0.04..=2.20)
+                                            .text("Scale")
+                                            .suffix(" m")
+                                            .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+
+                                // Rotate sliders (Pitch X, Yaw Y, Roll Z in degrees)
+                                let mut pitch_deg = mesh.rotation.x.to_degrees();
+                                let mut yaw_deg = mesh.rotation.y.to_degrees();
+                                let mut roll_deg = mesh.rotation.z.to_degrees();
+                                let mut rot_changed = false;
+                                rot_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut pitch_deg, -180.0..=180.0)
+                                            .text("Rotate X")
+                                            .suffix("°")
+                                            .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+                                rot_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut yaw_deg, -180.0..=180.0)
+                                            .text("Rotate Y")
+                                            .suffix("°")
+                                            .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+                                rot_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut roll_deg, -180.0..=180.0)
+                                            .text("Rotate Z")
+                                            .suffix("°")
+                                            .clamping(egui::SliderClamping::Edits),
+                                    )
+                                    .changed();
+
+                                if rot_changed {
+                                    mesh.rotation = Vec3::new(
+                                        pitch_deg.to_radians(),
+                                        yaw_deg.to_radians(),
+                                        roll_deg.to_radians(),
+                                    );
+                                    changed = true;
+                                }
+
+                                if changed {
+                                    mesh.update_transform();
                                 }
                             }
                         }
@@ -2869,7 +3143,21 @@ impl LiquidApp {
             self.status_message = "OBJ error: file path is empty".to_string();
             return;
         }
-        match Collider::load_obj(trimmed, Vec3::new(0.0, 0.5, 0.0), 0.4) {
+        let b_center = self.solver.bounds.center();
+        let b_size = self.solver.bounds.size();
+        let min_span = if self.is_2d {
+            b_size.x.min(b_size.y)
+        } else {
+            b_size.x.min(b_size.y).min(b_size.z)
+        };
+        let initial_scale = (min_span * 0.28).clamp(0.15, 0.65);
+        let initial_pos = Vec3::new(
+            b_center.x,
+            self.solver.bounds.min.y + b_size.y * 0.35,
+            if self.is_2d { 0.0 } else { b_center.z },
+        );
+
+        match Collider::load_obj(trimmed, initial_pos, initial_scale) {
             Ok(mut col) => {
                 let id = self.next_collider_id;
                 self.next_collider_id += 1;
@@ -2878,8 +3166,16 @@ impl LiquidApp {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or(trimmed);
+                let tri_count = if let ColliderShape::Mesh(ref m) = col.shape {
+                    m.triangle_count()
+                } else {
+                    0
+                };
                 col.name = format!("OBJ #{} ({})", id, file_label);
-                self.status_message = format!("Loaded OBJ: {}", trimmed);
+                self.status_message = format!(
+                    "Loaded OBJ '{}' ({} triangles, scaled to {:.2}m)",
+                    file_label, tri_count, initial_scale
+                );
                 self.solver.colliders.push(col);
             }
             Err(e) => {

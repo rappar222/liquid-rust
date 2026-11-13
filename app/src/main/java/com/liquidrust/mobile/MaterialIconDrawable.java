@@ -29,6 +29,7 @@ public final class MaterialIconDrawable extends Drawable {
     public static final int ICON_MODE_3D = 11;
     public static final int ICON_CHECK = 12;
     public static final int ICON_CHEVRON_DOWN = 13;
+    public static final int ICON_UPDATE = 14;
 
     private int iconType;
     private int tintColor;
@@ -236,6 +237,25 @@ public final class MaterialIconDrawable extends Drawable {
                 path.moveTo(5.2f, 12.5f);
                 path.lineTo(9.8f, 17.0f);
                 path.lineTo(18.8f, 7.4f);
+                canvas.drawPath(path, strokePaint);
+                break;
+            }
+            case ICON_UPDATE: {
+                // Crisp Material system-update / download-into-tray arrow icon
+                strokePaint.setStrokeWidth(2.15f);
+                canvas.drawLine(12.0f, 4.2f, 12.0f, 14.8f, strokePaint);
+                path.moveTo(8.0f, 11.0f);
+                path.lineTo(12.0f, 15.0f);
+                path.lineTo(16.0f, 11.0f);
+                canvas.drawPath(path, strokePaint);
+
+                path.reset();
+                path.moveTo(5.0f, 15.2f);
+                path.lineTo(5.0f, 18.2f);
+                path.quadTo(5.0f, 19.5f, 6.3f, 19.5f);
+                path.lineTo(17.7f, 19.5f);
+                path.quadTo(19.0f, 19.5f, 19.0f, 18.2f);
+                path.lineTo(19.0f, 15.2f);
                 canvas.drawPath(path, strokePaint);
                 break;
             }

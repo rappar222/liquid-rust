@@ -61,10 +61,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15-intel
             target: aarch64-apple-darwin
             artifact: liquid-rust-macos-arm64.tar.gz
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: liquid-rust-macos-x86_64.tar.gz
     steps:

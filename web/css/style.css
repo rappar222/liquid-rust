@@ -108,6 +108,38 @@ body, html {
     border-radius: 4px;
 }
 
+.version-tag {
+    font-size: 0.68rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    color: var(--accent-cyan);
+    background: rgba(58, 216, 247, 0.12);
+    border: 1px solid rgba(58, 216, 247, 0.35);
+    padding: 1px 6px;
+    border-radius: var(--radius-xs);
+    text-decoration: none;
+    transition: all var(--transition-fast);
+}
+
+.version-tag:hover {
+    background: rgba(58, 216, 247, 0.25);
+    border-color: var(--accent-cyan);
+    color: #fff;
+}
+
+.card-version-pill {
+    font-size: 0.62rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    color: var(--accent-cyan);
+    background: rgba(58, 216, 247, 0.15);
+    border: 1px solid rgba(58, 216, 247, 0.3);
+    padding: 1px 5px;
+    border-radius: 4px;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+
 .badge-backend {
     font-size: 0.68rem;
     padding: 2px 7px;

@@ -1,9 +1,9 @@
-/target
-Cargo.lock
-exports/
-*.ply
-*.mp4
-/dist/
-/*.tar.gz
+build/
+app/build/
+.gradle/
+.idea/
+local.properties
+*.iml
+*.jks
+*.idsig
 .DS_Store
-renders/

@@ -23,6 +23,7 @@ export class GlRenderer {
 
         layout(location = 0) in vec3 a_pos;
         layout(location = 1) in vec4 a_color;
+        layout(location = 2) in vec3 a_surf_vel;
 
         uniform mat4 u_view;
         uniform mat4 u_proj;
@@ -33,10 +34,14 @@ export class GlRenderer {
         out vec4 v_color;
         out vec3 v_pos_eye;
         out vec3 v_world_pos;
+        out float v_surf_mask;
+        out vec2 v_vel_xy;
 
         void main() {
             v_color = a_color;
             v_world_pos = a_pos;
+            v_surf_mask = a_surf_vel.x;
+            v_vel_xy = a_surf_vel.yz;
             vec4 eye_pos = u_view * vec4(a_pos, 1.0);
             v_pos_eye = eye_pos.xyz;
             gl_Position = u_proj * eye_pos;
@@ -53,6 +58,8 @@ export class GlRenderer {
         in vec4 v_color;
         in vec3 v_pos_eye;
         in vec3 v_world_pos;
+        in float v_surf_mask;
+        in vec2 v_vel_xy;
 
         uniform mat4 u_proj;
         uniform float u_point_radius;
@@ -71,6 +78,39 @@ export class GlRenderer {
 
         out vec4 fragColor;
 
+        vec2 hash22(ivec2 p) {
+            uvec2 q = uvec2(p) * uvec2(1597334677u, 3812015801u);
+            uint n = (q.x ^ q.y) * 2798796415u;
+            uint n2 = ((n >> 13u) ^ n) * 2246822519u;
+            return vec2(float(n & 65535u), float((n2 >> 8u) & 65535u)) * (1.0 / 65535.0);
+        }
+
+        float worley_caustic(vec2 u_coord, float t_anim) {
+            ivec2 ip = ivec2(floor(u_coord));
+            vec2 fp = u_coord - vec2(ip);
+            float d1 = 8.0;
+            float d2 = 8.0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    ivec2 o = ivec2(dx, dy);
+                    vec2 j = hash22(ip + o);
+                    vec2 r = vec2(o) + 0.5 + 0.36 * vec2(
+                        sin(t_anim * 1.5 + 6.2831853 * j.x),
+                        cos(t_anim * 1.3 + 6.2831853 * j.y)
+                    ) - fp;
+                    float d = dot(r, r);
+                    if (d < d1) {
+                        d2 = d1;
+                        d1 = d;
+                    } else if (d < d2) {
+                        d2 = d;
+                    }
+                }
+            }
+            float edge = sqrt(d2) - sqrt(d1);
+            return pow(clamp(1.0 - edge * 2.4, 0.0, 1.0), 2.3);
+        }
+
         void main() {
             vec2 coord = gl_PointCoord * 2.0 - 1.0;
             float r2 = dot(coord, coord);
@@ -80,7 +120,7 @@ export class GlRenderer {
 
             float z = sqrt(max(1.0 - r2, 0.0));
             vec3 n = vec3(coord.x, -coord.y, z);
-            vec3 surf_pos = v_world_pos + n * u_point_radius;
+            vec3 surf_pos = v_world_pos + n * (u_point_radius * 1.35);
 
             if (u_is_2d == 0) {
                 vec3 sphere_pos_eye = v_pos_eye + vec3(coord.x * u_point_radius, -coord.y * u_point_radius, z * u_point_radius);
@@ -94,33 +134,58 @@ export class GlRenderer {
 
             float caustic_boost = 0.0;
             float foam_tex = 0.0;
-            float grid_mod = 1.0;
+            float tex_shade = 1.0;
+            float flow_surf = clamp(v_surf_mask + speed_t * 0.65, 0.0, 1.0);
 
             if (u_tex_mode != 0 && tex_str > 0.005) {
                 if (u_tex_mode == 1) {
-                    float w1 = cos(surf_pos.x * 28.0 + surf_pos.y * 19.0 - t_anim * 3.8);
-                    float w2 = sin(surf_pos.z * 26.0 - surf_pos.x * 16.0 + t_anim * 3.1);
-                    n = normalize(n + vec3(w1, w2, 0.0) * (tex_str * 0.42));
-                    caustic_boost = max(w1 * w2, 0.0) * tex_str * 0.20;
+                    float warp = 0.55 * sin(surf_pos.x * 6.5 + surf_pos.z * 5.0 - t_anim * 2.8)
+                               + 0.30 * cos(surf_pos.x * 12.5 - surf_pos.z * 9.5 + t_anim * 2.1);
+                    float wave_band = sin(surf_pos.y * 24.0 + warp * 2.2 - t_anim * 1.8);
+                    float wave_fine = sin(surf_pos.y * 52.0 - warp * 3.1 + surf_pos.x * 18.0 + t_anim * 3.4);
+                    float dx_w = cos(surf_pos.x * 52.0 + surf_pos.y * 18.0 - t_anim * 4.2) * 0.45
+                               + sin(surf_pos.x * 31.0 - surf_pos.y * 44.0 + t_anim * 3.3) * 0.35;
+                    float dy_w = wave_band * 0.55 + wave_fine * 0.35;
+                    float bump_gain = tex_str * (0.24 + 0.26 * flow_surf);
+                    n = normalize(n + vec3(dx_w, dy_w, 0.0) * bump_gain);
+                    tex_shade = 1.0 + (wave_band * 0.11 + wave_fine * 0.04) * tex_str;
+                    float crest = smoothstep(0.25, 0.95, wave_band * 0.65 + wave_fine * 0.35);
+                    caustic_boost = crest * tex_str * (0.16 + 0.36 * flow_surf);
                 } else if (u_tex_mode == 2) {
-                    vec3 p = surf_pos * 18.0;
-                    float c1 = abs(sin(p.x + sin(p.y * 1.3 + t_anim * 2.4)) * cos(p.y + cos(p.z * 1.4 - t_anim * 1.9)));
-                    float web = pow(1.0 - clamp(c1, 0.0, 1.0), 3.0);
-                    caustic_boost = web * tex_str * 0.85;
-                    n = normalize(n + vec3(sin(p.x * 1.7), cos(p.y * 1.7), 0.0) * (tex_str * 0.25));
+                    vec2 uv_c = vec2(
+                        surf_pos.x * 5.6 + surf_pos.y * 1.1 + surf_pos.z * 2.6 + sin(surf_pos.y * 4.0 + t_anim * 1.2) * 0.18,
+                        surf_pos.y * 5.6 - surf_pos.x * 0.8 + surf_pos.z * 3.1 + cos(surf_pos.x * 4.0 - t_anim * 1.0) * 0.18
+                    );
+                    float c_main = worley_caustic(uv_c, t_anim);
+                    float c_fine = worley_caustic(uv_c * 1.85 + vec2(3.7, -2.1), t_anim * 1.35);
+                    float caustic = c_main * 0.74 + c_fine * 0.26;
+                    caustic_boost = caustic * tex_str * 0.78;
+                    n = normalize(n + vec3(c_main - 0.35, c_fine - 0.35, 0.0) * (tex_str * 0.20));
                 } else if (u_tex_mode == 3) {
-                    vec3 p = surf_pos * 24.0 + vec3(t_anim * 1.5, -t_anim * 0.8, t_anim * 1.2);
-                    float f = (sin(p.x) * cos(p.y) + sin(p.y * 1.7 + p.z) + cos(p.z * 2.3 - p.x)) * 0.333 + 0.5;
-                    foam_tex = clamp((f - 0.38) * 2.6, 0.0, 1.0) * tex_str * (0.28 + 0.72 * speed_t);
-                    n = normalize(n + vec3(f - 0.5, (1.0 - f) - 0.5, 0.0) * (tex_str * 0.22));
+                    vec3 bp = surf_pos * 36.0 + vec3(t_anim * 1.1, -t_anim * 0.7, t_anim * 0.9);
+                    float bub = (sin(bp.x) * cos(bp.y) + sin(bp.y * 1.6 + bp.z) + cos(bp.z * 2.1 - bp.x)) * 0.333 + 0.5;
+                    float micro = smoothstep(0.22, 0.72, bub);
+                    float aeration = clamp(v_surf_mask * 0.90 + smoothstep(0.16, 0.72, speed_t) * 0.95, 0.0, 1.0);
+                    foam_tex = micro * aeration * clamp(tex_str * 1.35, 0.0, 1.0);
+                    n = normalize(n + vec3(bub - 0.5, 0.5 - bub, 0.0) * (foam_tex * 0.35));
                 } else if (u_tex_mode == 4) {
-                    float gx = abs(fract(surf_pos.x * 8.0) - 0.5);
-                    float gy = abs(fract(surf_pos.y * 8.0) - 0.5);
-                    float gz = abs(fract(surf_pos.z * 8.0) - 0.5);
-                    float line = max(1.0 - min(gx, gy) * 14.0, 1.0 - gz * 14.0);
-                    float line_c = clamp(line, 0.0, 1.0) * tex_str;
-                    grid_mod = 1.0 - tex_str * 0.14;
-                    caustic_boost = line_c * 0.45;
+                    vec2 refr_xy = v_world_pos.xy + n.xy * (u_point_radius * 2.1) - v_vel_xy * 0.035 + vec2(
+                        0.012 * sin(v_world_pos.y * 10.0 - t_anim * 2.2),
+                        0.012 * cos(v_world_pos.x * 10.0 + t_anim * 1.9)
+                    );
+                    float freq = 5.5;
+                    float gx = 0.5 - abs(fract(refr_xy.x * freq) - 0.5);
+                    float gy = 0.5 - abs(fract(refr_xy.y * freq) - 0.5);
+                    float line_d = min(gx, gy);
+                    if (u_is_2d == 0) {
+                        float rz = v_world_pos.z + n.z * (u_point_radius * 1.2);
+                        float gz = 0.5 - abs(fract(rz * freq) - 0.5);
+                        line_d = min(line_d, gz);
+                    }
+                    float line_mask = 1.0 - smoothstep(0.018, 0.062, line_d);
+                    float checker = mod(floor(refr_xy.x * freq) + floor(refr_xy.y * freq), 2.0);
+                    tex_shade = 1.0 - tex_str * (0.09 * checker);
+                    caustic_boost = line_mask * (0.55 * tex_str);
                 }
             }
 
@@ -134,9 +199,10 @@ export class GlRenderer {
                 base_color = mix(base_color, vec3(0.94, 0.98, 1.0), crest_foam * 0.72);
             }
 
-            base_color = base_color * grid_mod + mix(u_shallow_color, vec3(0.96, 0.99, 1.0), 0.35) * caustic_boost;
+            vec3 boost_col = mix(u_shallow_color, vec3(0.92, 0.99, 1.0), 0.28) * caustic_boost;
+            base_color = base_color * tex_shade + boost_col;
             if (foam_tex > 0.005) {
-                base_color = mix(base_color, vec3(0.95, 0.98, 1.0), clamp(foam_tex, 0.0, 0.85));
+                base_color = mix(base_color, vec3(0.94, 0.98, 1.0), clamp(foam_tex, 0.0, 0.88));
             }
 
             vec3 rgb = base_color;
@@ -167,7 +233,8 @@ export class GlRenderer {
 
                 rgb = mix(body_lit, sky_env * mix(vec3(1.0), base_color, metallic), clamp(fresnel * (0.75 + 0.25 * metallic), 0.0, 0.96))
                     + spec
-                    + sss_tint;
+                    + sss_tint
+                    + boost_col * 0.22;
             }
             fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
         }
@@ -267,12 +334,15 @@ export class GlRenderer {
         gl.bindVertexArray(this.particleVao);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.particleVbo);
 
-        const stride = 28;
+        const stride = 40;
         gl.enableVertexAttribArray(0);
         gl.vertexAttribPointer(0, 3, gl.FLOAT, false, stride, 0);
 
         gl.enableVertexAttribArray(1);
         gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 12);
+
+        gl.enableVertexAttribArray(2);
+        gl.vertexAttribPointer(2, 3, gl.FLOAT, false, stride, 28);
 
         this.lineVao = gl.createVertexArray();
         this.lineVbo = gl.createBuffer();
@@ -286,7 +356,7 @@ export class GlRenderer {
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
         this.particleVertexCapacity = 8000;
-        this.particleVertexData = new Float32Array(this.particleVertexCapacity * 7);
+        this.particleVertexData = new Float32Array(this.particleVertexCapacity * 10);
     }
 
     render(solver, camera, viewportWidth, viewportHeight, opts = {}) {
@@ -431,7 +501,7 @@ export class GlRenderer {
         const shallow = opts.shallowColor ?? [0.22, 0.74, 0.97];
         const deep = opts.deepColor ?? [0.05, 0.24, 0.54];
         const texMode = opts.texMode ?? 1;
-        const texStrength = opts.texStrength ?? 0.28;
+        const texStrength = opts.texStrength ?? 0.50;
         const ior = opts.ior ?? 1.333;
         const roughness = opts.roughness ?? 0.045;
         const specular = opts.specular ?? 1.35;
@@ -447,7 +517,7 @@ export class GlRenderer {
 
         if (n > this.particleVertexCapacity) {
             this.particleVertexCapacity = n * 2;
-            this.particleVertexData = new Float32Array(this.particleVertexCapacity * 7);
+            this.particleVertexData = new Float32Array(this.particleVertexCapacity * 10);
         }
 
         const data = this.particleVertexData;
@@ -455,23 +525,24 @@ export class GlRenderer {
         const vel = solver.velocities;
         const dens = solver.densities;
         const pres = solver.pressures;
+        const invRho0 = 1.0 / Math.max(solver.restDensity, 1.0);
 
         for (let i = 0; i < n; i++) {
             const i3 = i * 3;
-            const i7 = i * 7;
+            const i10 = i * 10;
 
-            data[i7] = pos[i3];
-            data[i7 + 1] = pos[i3 + 1];
-            data[i7 + 2] = pos[i3 + 2];
+            data[i10] = pos[i3];
+            data[i10 + 1] = pos[i3 + 1];
+            data[i10 + 2] = pos[i3 + 2];
 
             const vx = vel[i3], vy = vel[i3 + 1], vz = vel[i3 + 2];
             const speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
             const speedT = Math.min(1.0, speed / 2.8);
 
             if (cMode === 3) {
-                data[i7 + 3] = shallow[0];
-                data[i7 + 4] = shallow[1];
-                data[i7 + 5] = shallow[2];
+                data[i10 + 3] = shallow[0];
+                data[i10 + 4] = shallow[1];
+                data[i10 + 5] = shallow[2];
             } else {
                 let t = 0.0;
                 if (cMode === 0) {
@@ -483,11 +554,18 @@ export class GlRenderer {
                     t = Math.min(1.0, dev * 4.0);
                 }
                 const rgb = ColorMap.sample(colorMapType, t);
-                data[i7 + 3] = rgb[0];
-                data[i7 + 4] = rgb[1];
-                data[i7 + 5] = rgb[2];
+                data[i10 + 3] = rgb[0];
+                data[i10 + 4] = rgb[1];
+                data[i10 + 5] = rgb[2];
             }
-            data[i7 + 6] = speedT;
+            data[i10 + 6] = speedT;
+
+            const rhoRatio = dens[i] * invRho0;
+            const st = Math.max(0.0, Math.min(1.0, (rhoRatio - 0.62) / (0.89 - 0.62)));
+            const surfMask = 1.0 - st * st * (3.0 - 2.0 * st);
+            data[i10 + 7] = surfMask;
+            data[i10 + 8] = vx;
+            data[i10 + 9] = vy;
         }
 
         gl.useProgram(this.particleProgram);
@@ -525,7 +603,7 @@ export class GlRenderer {
 
         gl.bindVertexArray(this.particleVao);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.particleVbo);
-        gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, n * 7), gl.DYNAMIC_DRAW);
+        gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, n * 10), gl.DYNAMIC_DRAW);
 
         gl.drawArrays(gl.POINTS, 0, n);
 

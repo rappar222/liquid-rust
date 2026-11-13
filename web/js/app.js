@@ -2,12 +2,12 @@
 // Dual engine: WebGPU Compute Shaders (primary) with WebGL 2.0 fallback,
 // Live Optical Material / Procedural Texture Shading, Natural Fluid Physics, and OS-Aware Native Downloads.
 
-import { Vec3, Ray } from './math.js?v=20261113b';
-import { Camera } from './camera.js?v=20261113b';
-import { PbfSolver, ScenePreset } from './pbf-solver.js?v=20261113b';
-import { GlRenderer } from './gl-renderer.js?v=20261113b';
-import { WebGpuSolver } from './webgpu-solver.js?v=20261113b';
-import { WebGpuRenderer } from './webgpu-renderer.js?v=20261113b';
+import { Vec3, Ray } from './math.js?v=20261113e';
+import { Camera } from './camera.js?v=20261113e';
+import { PbfSolver, ScenePreset } from './pbf-solver.js?v=20261113e';
+import { GlRenderer } from './gl-renderer.js?v=20261113e';
+import { WebGpuSolver } from './webgpu-solver.js?v=20261113e';
+import { WebGpuRenderer } from './webgpu-renderer.js?v=20261113f';
 
 const RELEASE_LATEST = 'https://github.com/rappar222/liquid-rust/releases/latest';
 const RELEASE_DL = `${RELEASE_LATEST}/download`;
@@ -61,7 +61,7 @@ class LiquidApp {
             shallowColor: hexToRgb('#38bdf8'),
             deepColor: hexToRgb('#0c3b8a'),
             texMode: 1,
-            texStrength: 0.28,
+            texStrength: 0.50,
             ior: 1.333,
             roughness: 0.045,
             specular: 1.35,

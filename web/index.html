@@ -6,6 +6,422 @@
     <meta name="color-scheme" content="dark">
     <title>LiquidRust Studio — Real-Time 2D/3D Fluid Simulator</title>
     <link rel="stylesheet" href="css/style.css?v=20261113c">
+    <style>
+        /* Scoped WebGPU Compatibility & Activation Assistant (PC Users Only) */
+        #webgpu-guide-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 1000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background: rgba(6, 9, 15, 0.76);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            font-family: var(--font, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+        }
+
+        #webgpu-guide-overlay.is-open {
+            display: flex;
+        }
+
+        .wgpu-modal {
+            width: 100%;
+            max-width: 620px;
+            max-height: calc(100vh - 40px);
+            display: flex;
+            flex-direction: column;
+            background: rgba(14, 18, 28, 0.96);
+            border: 1px solid rgba(58, 216, 247, 0.35);
+            border-radius: 12px;
+            box-shadow: 0 24px 64px rgba(0, 0, 0, 0.72);
+            color: var(--text-primary, #eef3fb);
+            overflow: hidden;
+            user-select: text;
+            -webkit-user-select: text;
+        }
+
+        .wgpu-modal.is-incompatible {
+            border-color: rgba(239, 68, 68, 0.7);
+            box-shadow: 0 24px 64px rgba(127, 29, 29, 0.45);
+        }
+
+        .wgpu-modal-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 16px 20px;
+            background: rgba(255, 255, 255, 0.03);
+            border-bottom: 1px solid rgba(148, 175, 214, 0.14);
+        }
+
+        .wgpu-modal.is-incompatible .wgpu-modal-header {
+            background: rgba(239, 68, 68, 0.12);
+            border-bottom-color: rgba(239, 68, 68, 0.35);
+        }
+
+        .wgpu-title-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .wgpu-title {
+            font-size: 1.05rem;
+            font-weight: 700;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .wgpu-modal.is-incompatible .wgpu-title {
+            color: #fecaca;
+        }
+
+        .wgpu-env-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .wgpu-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 8px;
+            border-radius: 5px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            font-family: var(--mono, monospace);
+            background: rgba(58, 216, 247, 0.12);
+            border: 1px solid rgba(58, 216, 247, 0.32);
+            color: #7ee7fc;
+        }
+
+        .wgpu-chip.warn {
+            background: rgba(255, 159, 46, 0.14);
+            border-color: rgba(255, 159, 46, 0.38);
+            color: #ffc57a;
+        }
+
+        .wgpu-chip.danger {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: rgba(248, 113, 113, 0.6);
+            color: #fca5a5;
+        }
+
+        .wgpu-close-btn {
+            flex-shrink: 0;
+            width: 30px;
+            height: 30px;
+            border-radius: 7px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.15rem;
+            line-height: 1;
+            color: var(--text-secondary, #98a7c2);
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(148, 175, 214, 0.18);
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.15s ease, color 0.15s ease;
+        }
+
+        .wgpu-close-btn:hover {
+            background: rgba(255, 255, 255, 0.12);
+            color: #ffffff;
+        }
+
+        .wgpu-modal-body {
+            padding: 18px 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(148, 175, 214, 0.25) transparent;
+        }
+
+        .wgpu-red-warning {
+            padding: 13px 15px;
+            border-radius: 9px;
+            background: rgba(220, 38, 38, 0.16);
+            border: 1px solid rgba(248, 113, 113, 0.65);
+            color: #fee2e2;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .wgpu-red-warning strong {
+            color: #ff6b6b;
+            font-size: 0.92rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .wgpu-red-warning p {
+            font-size: 0.82rem;
+            line-height: 1.5;
+            color: #fecaca;
+        }
+
+        .wgpu-diag-note {
+            padding: 10px 13px;
+            border-radius: 8px;
+            background: rgba(255, 159, 46, 0.1);
+            border: 1px solid rgba(255, 159, 46, 0.34);
+            color: #fde6c4;
+            font-size: 0.8rem;
+            line-height: 1.48;
+        }
+
+        .wgpu-section-title {
+            font-size: 0.82rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--accent-cyan, #3ad8f7);
+        }
+
+        .wgpu-steps {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            counter-reset: wgpu-step;
+        }
+
+        .wgpu-step {
+            position: relative;
+            padding: 11px 13px 11px 42px;
+            border-radius: 8px;
+            background: rgba(19, 25, 38, 0.85);
+            border: 1px solid rgba(148, 175, 214, 0.15);
+            font-size: 0.82rem;
+            line-height: 1.52;
+            color: var(--text-primary, #eef3fb);
+        }
+
+        .wgpu-step::before {
+            counter-increment: wgpu-step;
+            content: counter(wgpu-step);
+            position: absolute;
+            left: 12px;
+            top: 11px;
+            width: 21px;
+            height: 21px;
+            border-radius: 50%;
+            background: rgba(31, 142, 241, 0.25);
+            border: 1px solid rgba(58, 216, 247, 0.5);
+            color: #7ee7fc;
+            font-size: 0.72rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .wgpu-step-title {
+            font-weight: 700;
+            color: #ffffff;
+            margin-bottom: 3px;
+        }
+
+        .wgpu-step-desc {
+            color: var(--text-secondary, #98a7c2);
+        }
+
+        .wgpu-step-desc b, .wgpu-step-desc strong {
+            color: #eef3fb;
+        }
+
+        .wgpu-code-row {
+            margin-top: 7px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 6px 9px;
+            border-radius: 6px;
+            background: rgba(7, 10, 16, 0.88);
+            border: 1px solid rgba(58, 216, 247, 0.24);
+        }
+
+        .wgpu-code-row code {
+            font-family: var(--mono, monospace);
+            font-size: 0.76rem;
+            color: #6ce5ff;
+            word-break: break-all;
+            user-select: all;
+            -webkit-user-select: all;
+        }
+
+        .wgpu-copy-btn {
+            flex-shrink: 0;
+            padding: 4px 9px;
+            border-radius: 5px;
+            font-size: 0.71rem;
+            font-weight: 600;
+            color: #93e8ff;
+            background: rgba(31, 142, 241, 0.2);
+            border: 1px solid rgba(58, 216, 247, 0.36);
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.14s ease, border-color 0.14s ease;
+        }
+
+        .wgpu-copy-btn:hover {
+            background: rgba(31, 142, 241, 0.36);
+            border-color: #3ad8f7;
+            color: #ffffff;
+        }
+
+        .wgpu-copy-btn.copied {
+            background: rgba(62, 240, 158, 0.22);
+            border-color: rgba(62, 240, 158, 0.55);
+            color: #6ef7b5;
+        }
+
+        .wgpu-compat-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 8px;
+        }
+
+        .wgpu-compat-card {
+            padding: 9px 11px;
+            border-radius: 7px;
+            background: rgba(19, 25, 38, 0.85);
+            border: 1px solid rgba(148, 175, 214, 0.16);
+            font-size: 0.77rem;
+            line-height: 1.42;
+            color: var(--text-secondary, #98a7c2);
+        }
+
+        .wgpu-compat-card strong {
+            display: block;
+            color: #ffffff;
+            margin-bottom: 2px;
+        }
+
+        .wgpu-compat-card a {
+            display: inline-block;
+            margin-top: 4px;
+            color: #6ce5ff;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .wgpu-compat-card a:hover {
+            text-decoration: underline;
+        }
+
+        .wgpu-switch-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding-top: 6px;
+            border-top: 1px solid rgba(148, 175, 214, 0.1);
+            font-size: 0.75rem;
+            color: var(--text-secondary, #98a7c2);
+        }
+
+        .wgpu-modal-footer {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+            gap: 9px;
+            padding: 13px 20px;
+            background: rgba(7, 10, 16, 0.65);
+            border-top: 1px solid rgba(148, 175, 214, 0.14);
+        }
+
+        .wgpu-btn {
+            padding: 8px 14px;
+            border-radius: 7px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            user-select: none;
+            border: 1px solid transparent;
+            transition: transform 0.1s ease, background 0.15s ease, border-color 0.15s ease;
+        }
+
+        .wgpu-btn:hover {
+            transform: translateY(-1px);
+        }
+
+        .wgpu-btn-primary {
+            background: linear-gradient(135deg, #1677d8, #249df5);
+            border-color: rgba(90, 195, 255, 0.45);
+            color: #ffffff;
+        }
+
+        .wgpu-btn-secondary {
+            background: rgba(255, 255, 255, 0.06);
+            border-color: rgba(148, 175, 214, 0.24);
+            color: #eef3fb;
+        }
+
+        .wgpu-btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.12);
+        }
+
+        /* Minimized persistent banner/pill when user dismisses modal */
+        #webgpu-guide-pill {
+            position: fixed;
+            right: 14px;
+            bottom: 14px;
+            z-index: 60;
+            display: none;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 9px;
+            background: rgba(14, 18, 28, 0.94);
+            border: 1px solid rgba(255, 159, 46, 0.55);
+            box-shadow: 0 8px 26px rgba(0, 0, 0, 0.55);
+            color: #fde6c4;
+            font-family: var(--font, sans-serif);
+            font-size: 0.78rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.12s ease, border-color 0.12s ease;
+        }
+
+        #webgpu-guide-pill.is-visible {
+            display: inline-flex;
+        }
+
+        #webgpu-guide-pill:hover {
+            transform: translateY(-1px);
+        }
+
+        #webgpu-guide-pill.is-incompatible {
+            background: rgba(127, 29, 29, 0.92);
+            border-color: rgba(248, 113, 113, 0.8);
+            color: #fee2e2;
+        }
+
+        #webgpu-guide-pill .wgpu-pill-action {
+            text-decoration: underline;
+            color: #7ee7fc;
+        }
+
+        #webgpu-guide-pill.is-incompatible .wgpu-pill-action {
+            color: #ffffff;
+        }
+    </style>
 </head>
 <body>
     <canvas id="glcanvas"></canvas>
@@ -307,9 +723,9 @@
                         <div class="slider-group">
                             <div class="slider-label">
                                 <span>Texture Bump / Pattern</span>
-                                <span id="val-mat-tex" class="badge">0.28</span>
+                                <span id="val-mat-tex" class="badge">0.50</span>
                             </div>
-                            <input type="range" id="mat-tex-strength" min="0.00" max="1.00" step="0.02" value="0.28">
+                            <input type="range" id="mat-tex-strength" min="0.00" max="1.00" step="0.02" value="0.50">
                         </div>
 
                         <div class="slider-group">
@@ -386,6 +802,722 @@
         </div>
     </aside>
 
-    <script type="module" src="js/app.js?v=20261113d"></script>
+    <script type="module" src="js/app.js?v=20261113f"></script>
+
+    <!-- PC WebGPU Detection, Browser Tutorial & Incompatible Warning -->
+    <div id="webgpu-guide-overlay" role="dialog" aria-modal="true" aria-labelledby="wgpu-guide-title">
+        <div id="wgpu-modal-card" class="wgpu-modal">
+            <div class="wgpu-modal-header">
+                <div class="wgpu-title-wrap">
+                    <h2 id="wgpu-guide-title" class="wgpu-title">⚡ WebGPU Not Active</h2>
+                    <div id="wgpu-env-row" class="wgpu-env-row"></div>
+                </div>
+                <button id="wgpu-close-btn" class="wgpu-close-btn" type="button" title="Minimize" aria-label="Close">×</button>
+            </div>
+            <div id="wgpu-modal-body" class="wgpu-modal-body"></div>
+            <div class="wgpu-modal-footer">
+                <button id="wgpu-dismiss-btn" class="wgpu-btn wgpu-btn-secondary" type="button">Continue in WebGL 2.0</button>
+                <button id="wgpu-reload-btn" class="wgpu-btn wgpu-btn-primary" type="button">🔄 Reload &amp; Retry WebGPU</button>
+            </div>
+        </div>
+    </div>
+
+    <button id="webgpu-guide-pill" type="button" title="Open WebGPU compatibility details">
+        <span id="wgpu-pill-text">⚡ WebGPU Inactive</span>
+        <span class="wgpu-pill-action">How to Enable</span>
+    </button>
+
+    <script>
+    (() => {
+        'use strict';
+
+        function isPcUser() {
+            const ua = navigator.userAgent || '';
+            const plat = navigator.platform || '';
+            const uad = navigator.userAgentData;
+            const uadPlat = (uad && uad.platform) ? uad.platform : '';
+            const maxTouch = navigator.maxTouchPoints || 0;
+
+            if (uad && uad.mobile === true) return false;
+            if (/android|iphone|ipad|ipod|blackberry|iemobile|opera mini|windows phone|silk|kindle|playbook|tablet|oculus|quest/i.test(ua)) {
+                return false;
+            }
+            if (/mac/i.test(uadPlat || plat) && maxTouch > 1) return false;
+            return true;
+        }
+
+        if (!isPcUser()) return;
+
+        function el(tag, attrs, children) {
+            const node = document.createElement(tag);
+            if (attrs) {
+                for (const [k, v] of Object.entries(attrs)) {
+                    if (k === 'className') node.className = v;
+                    else if (k === 'textContent') node.textContent = v;
+                    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v);
+                    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+                }
+            }
+            if (children) {
+                for (const child of (Array.isArray(children) ? children : [children])) {
+                    if (child === null || child === undefined) continue;
+                    node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+                }
+            }
+            return node;
+        }
+
+        function withTimeout(promise, ms) {
+            return Promise.race([
+                promise,
+                new Promise((resolve) => setTimeout(() => resolve(null), ms)),
+            ]);
+        }
+
+        async function detectBrowser() {
+            const ua = navigator.userAgent || '';
+            const plat = navigator.platform || '';
+            const uad = navigator.userAgentData;
+            let high = null;
+            let isBrave = false;
+
+            if (uad && typeof uad.getHighEntropyValues === 'function') {
+                try {
+                    high = await withTimeout(uad.getHighEntropyValues(['fullVersionList', 'platform']), 250);
+                } catch { /* ignore */ }
+            }
+            if (navigator.brave && typeof navigator.brave.isBrave === 'function') {
+                try {
+                    isBrave = Boolean(await withTimeout(navigator.brave.isBrave(), 250));
+                } catch { /* ignore */ }
+            }
+
+            const brands = (high && high.fullVersionList) || (uad && uad.brands) || [];
+            const uadPlat = (high && high.platform) || (uad && uad.platform) || '';
+            const rawOs = `${uadPlat} ${plat} ${ua}`.toLowerCase();
+
+            let os = 'Desktop';
+            if (rawOs.includes('cros') || rawOs.includes('chrome os')) os = 'ChromeOS';
+            else if (rawOs.includes('win')) os = 'Windows';
+            else if (rawOs.includes('mac') || rawOs.includes('darwin')) os = 'macOS';
+            else if (rawOs.includes('linux') || rawOs.includes('x11')) os = 'Linux';
+
+            const parseMajor = (re) => {
+                const m = ua.match(re);
+                return m ? parseInt(m[1], 10) : 0;
+            };
+            const brandVer = (re) => {
+                const b = brands.find((item) => re.test(item.brand || ''));
+                if (!b || !b.version) return 0;
+                return parseInt(String(b.version).split('.')[0], 10) || 0;
+            };
+
+            const chromiumVer = parseMajor(/Chrome\/(\d+)/i) || brandVer(/Chromium/i);
+
+            // 1. Retired / Non-WebGPU Desktop Browsers
+            if (/MSIE\s|Trident\//i.test(ua)) {
+                return {
+                    id: 'ie', name: 'Internet Explorer', version: parseMajor(/(?:MSIE |rv:)(\d+)/i),
+                    os, compatible: false,
+                    incompatReason: 'Internet Explorer is retired and does not support WebGPU.',
+                };
+            }
+            if (/Edge\/(\d+)/i.test(ua) && !/Edg\//i.test(ua)) {
+                return {
+                    id: 'edge-legacy', name: 'Microsoft Edge (Legacy)', version: parseMajor(/Edge\/(\d+)/i),
+                    os, compatible: false,
+                    incompatReason: 'Legacy EdgeHTML does not support WebGPU. Update to modern Chromium-based Microsoft Edge (113+).',
+                };
+            }
+
+            const unsupportedEngines = [
+                { re: /Epiphany/i, id: 'epiphany', name: 'GNOME Web (Epiphany)', reason: 'GNOME Web (WebKitGTK) does not support WebGPU.' },
+                { re: /PaleMoon/i, id: 'palemoon', name: 'Pale Moon', reason: 'Pale Moon (Goanna engine) does not support WebGPU.' },
+                { re: /Basilisk/i, id: 'basilisk', name: 'Basilisk', reason: 'Basilisk (Goanna engine) does not support WebGPU.' },
+                { re: /SeaMonkey/i, id: 'seamonkey', name: 'SeaMonkey', reason: 'SeaMonkey does not support WebGPU.' },
+                { re: /Falkon/i, id: 'falkon', name: 'Falkon', reason: 'Falkon (QtWebEngine) does not expose WebGPU support by default.' },
+                { re: /Konqueror/i, id: 'konqueror', name: 'Konqueror', reason: 'Konqueror does not support WebGPU.' },
+                { re: /Midori/i, id: 'midori', name: 'Midori', reason: 'Midori does not support WebGPU.' },
+            ];
+            for (const item of unsupportedEngines) {
+                if (item.re.test(ua)) {
+                    return { id: item.id, name: item.name, version: 0, os, compatible: false, incompatReason: item.reason };
+                }
+            }
+
+            // 2. Brave
+            if (isBrave || /Brave/i.test(ua) || brandVer(/Brave/i) > 0) {
+                const ver = chromiumVer || brandVer(/Brave/i);
+                const compatible = !ver || ver >= 113;
+                return {
+                    id: 'brave', name: 'Brave', version: ver, os, compatible,
+                    incompatReason: compatible ? '' : `Brave (Chromium ${ver}) is too old. WebGPU requires Chromium 113 or newer.`,
+                };
+            }
+
+            // 3. Microsoft Edge
+            if (/Edg\/(\d+)/i.test(ua) || brandVer(/Microsoft Edge/i) > 0) {
+                const ver = parseMajor(/Edg\/(\d+)/i) || brandVer(/Microsoft Edge/i);
+                const compatible = ver >= 113;
+                return {
+                    id: 'edge', name: 'Microsoft Edge', version: ver, os, compatible,
+                    incompatReason: compatible ? '' : `Microsoft Edge ${ver} does not support WebGPU. Please update to Edge 113 or newer.`,
+                };
+            }
+
+            // 4. Opera / Opera GX
+            if (/OPR\/(\d+)|Opera/i.test(ua) || brandVer(/Opera/i) > 0) {
+                const ver = parseMajor(/OPR\/(\d+)/i) || parseMajor(/Opera\/(\d+)/i) || brandVer(/Opera/i);
+                const isGx = /OPR.*GX|Opera GX/i.test(ua);
+                const compatible = chromiumVer ? chromiumVer >= 113 : ver >= 99;
+                return {
+                    id: 'opera', name: isGx ? 'Opera GX' : 'Opera', version: ver, os, compatible,
+                    incompatReason: compatible ? '' : `${isGx ? 'Opera GX' : 'Opera'} ${ver || ''} is outdated. Update to Opera 99+ (Chromium 113+) for WebGPU.`,
+                };
+            }
+
+            // 5. Vivaldi
+            if (/Vivaldi\/([\d.]+)/i.test(ua) || brandVer(/Vivaldi/i) > 0) {
+                const ver = parseMajor(/Vivaldi\/(\d+)/i) || brandVer(/Vivaldi/i);
+                const compatible = chromiumVer ? chromiumVer >= 113 : ver >= 6;
+                return {
+                    id: 'vivaldi', name: 'Vivaldi', version: ver, os, compatible,
+                    incompatReason: compatible ? '' : `Vivaldi ${ver || ''} is outdated. Update to Vivaldi 6.1+ (Chromium 113+) for WebGPU.`,
+                };
+            }
+
+            // 6. Yandex / Whale
+            if (/YaBrowser\/(\d+)/i.test(ua)) {
+                const ver = parseMajor(/YaBrowser\/(\d+)/i);
+                const compatible = !chromiumVer || chromiumVer >= 113;
+                return {
+                    id: 'yandex', name: 'Yandex Browser', version: ver, os, compatible,
+                    incompatReason: compatible ? '' : `Yandex Browser (Chromium ${chromiumVer}) is too old for WebGPU.`,
+                };
+            }
+            if (/Whale\/(\d+)/i.test(ua)) {
+                const ver = parseMajor(/Whale\/(\d+)/i);
+                const compatible = !chromiumVer || chromiumVer >= 113;
+                return {
+                    id: 'whale', name: 'Naver Whale', version: ver, os, compatible,
+                    incompatReason: compatible ? '' : `Naver Whale (Chromium ${chromiumVer}) is too old for WebGPU.`,
+                };
+            }
+
+            // 7. Firefox & Gecko Derivatives
+            if (/Firefox\/(\d+)/i.test(ua) || /LibreWolf|Waterfox|Zen/i.test(ua)) {
+                const ver = parseMajor(/Firefox\/(\d+)/i);
+                let name = 'Mozilla Firefox';
+                if (/LibreWolf/i.test(ua)) name = 'LibreWolf';
+                else if (/Waterfox/i.test(ua)) name = 'Waterfox';
+                else if (/Zen/i.test(ua)) name = 'Zen Browser';
+                const compatible = ver >= 113;
+                return {
+                    id: 'firefox', name, version: ver, os, compatible,
+                    incompatReason: compatible ? '' : `${name} ${ver || ''} does not support WebGPU. Update to Firefox 113+ (141+ recommended).`,
+                };
+            }
+
+            // 8. Apple Safari
+            if (/Safari\/(\d+)/i.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox/i.test(ua)) {
+                const ver = parseMajor(/Version\/(\d+)/i);
+                const isMac = os === 'macOS';
+                const compatible = isMac && (ver === 0 || ver >= 17);
+                let incompatReason = '';
+                if (!isMac) {
+                    incompatReason = `Safari on ${os} is discontinued and does not support WebGPU.`;
+                } else if (ver > 0 && ver < 17) {
+                    incompatReason = `Safari ${ver} does not support WebGPU. Update to Safari 17+ (macOS Sonoma or newer).`;
+                }
+                return { id: 'safari', name: 'Safari', version: ver, os, compatible, incompatReason };
+            }
+
+            // 9. Google Chrome / Chromium
+            if (/Chrome\/(\d+)/i.test(ua) || brandVer(/Google Chrome|Chromium/i) > 0) {
+                const isGoogleChrome = brandVer(/Google Chrome/i) > 0;
+                const isChromium = brandVer(/Chromium/i) > 0 && !isGoogleChrome;
+                const ver = chromiumVer || brandVer(/Google Chrome|Chromium/i);
+                const name = isChromium ? 'Chromium' : 'Google Chrome';
+                const compatible = ver >= 113;
+                return {
+                    id: isChromium ? 'chromium' : 'chrome',
+                    name,
+                    version: ver,
+                    os,
+                    compatible,
+                    incompatReason: compatible ? '' : `${name} ${ver} does not support WebGPU. Please update to version 113 or newer.`,
+                };
+            }
+
+            // 10. Unrecognized Browser
+            return {
+                id: 'unknown', name: 'Unrecognized Browser', version: 0, os, compatible: false,
+                incompatReason: 'Your current browser was not recognized as a WebGPU-compatible desktop browser.',
+            };
+        }
+
+        function makeCodeRow(text) {
+            const copyBtn = el('button', { className: 'wgpu-copy-btn', type: 'button', textContent: 'Copy' });
+            copyBtn.addEventListener('click', async () => {
+                let ok = false;
+                try {
+                    if (navigator.clipboard && window.isSecureContext) {
+                        await navigator.clipboard.writeText(text);
+                        ok = true;
+                    }
+                } catch { /* fallback below */ }
+                if (!ok) {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    try { ok = document.execCommand('copy'); } catch { ok = false; }
+                    ta.remove();
+                }
+                copyBtn.textContent = ok ? 'Copied ✓' : 'Select & Copy';
+                if (ok) {
+                    copyBtn.classList.add('copied');
+                    setTimeout(() => {
+                        copyBtn.textContent = 'Copy';
+                        copyBtn.classList.remove('copied');
+                    }, 1800);
+                }
+            });
+            return el('div', { className: 'wgpu-code-row' }, [
+                el('code', { textContent: text }),
+                copyBtn,
+            ]);
+        }
+
+        function buildTutorialSteps(browserId, os, reason) {
+            const schemeMap = {
+                chrome: 'chrome',
+                chromium: 'chrome',
+                edge: 'edge',
+                brave: 'brave',
+                opera: 'opera',
+                vivaldi: 'vivaldi',
+                yandex: 'browser',
+                whale: 'whale',
+            };
+            const steps = [];
+
+            if (reason === 'insecure-context' && browserId !== 'safari') {
+                const origin = window.location.origin || 'http://your-host';
+                const scheme = schemeMap[browserId] || 'chrome';
+                steps.push({
+                    title: 'Use a Secure Context (HTTPS or localhost)',
+                    desc: `WebGPU is blocked on plain HTTP network URLs (${origin}). Open this app via HTTPS or http://localhost.`,
+                    code: browserId === 'firefox'
+                        ? null
+                        : `${scheme}://flags/#unsafely-treat-insecure-origin-as-secure`,
+                    extraDesc: browserId === 'firefox'
+                        ? 'Firefox requires HTTPS or http://localhost for navigator.gpu.'
+                        : `Or for local testing only: paste the flag above into your address bar, add ${origin}, set to Enabled, and relaunch.`,
+                });
+            }
+
+            if (schemeMap[browserId]) {
+                const s = schemeMap[browserId];
+                const labelMap = {
+                    chrome: 'Google Chrome',
+                    chromium: 'Chromium',
+                    edge: 'Microsoft Edge',
+                    brave: 'Brave',
+                    opera: 'Opera',
+                    vivaldi: 'Vivaldi',
+                    yandex: 'Yandex Browser',
+                    whale: 'Naver Whale',
+                };
+                const bName = labelMap[browserId] || 'Browser';
+
+                steps.push({
+                    title: 'Enable Graphics / Hardware Acceleration',
+                    desc: `Copy this settings URL, paste it into a new ${bName} tab's address bar, and turn ON "Use graphics acceleration when available" (or "Use hardware acceleration when available").`,
+                    code: browserId === 'vivaldi' ? 'vivaldi://settings/webpages/' : `${s}://settings/system`,
+                });
+
+                steps.push({
+                    title: 'Enable the WebGPU Flag',
+                    desc: 'Copy and paste this flags URL into the address bar, press Enter, and change the highlighted dropdown from Default/Disabled to Enabled.',
+                    code: `${s}://flags/#enable-unsafe-webgpu`,
+                });
+
+                if (os === 'Linux') {
+                    steps.push({
+                        title: 'Enable Vulkan & GPU Override (Linux)',
+                        desc: 'On Linux, WebGPU also requires Vulkan acceleration. Paste the URL below and set it to Enabled. If your GPU is blocklisted, also enable the GPU blocklist override.',
+                        code: `${s}://flags/#enable-vulkan`,
+                        code2: `${s}://flags/#ignore-gpu-blocklist`,
+                    });
+                } else if (reason === 'no-adapter') {
+                    steps.push({
+                        title: 'Override GPU Blocklist & Check Drivers',
+                        desc: 'Your browser has the WebGPU API, but failed to initialize a GPU adapter. Paste this flag into the address bar, set it to Enabled, and make sure your GPU drivers are up to date.',
+                        code: `${s}://flags/#ignore-gpu-blocklist`,
+                    });
+                }
+
+                if (browserId === 'brave') {
+                    steps.push({
+                        title: 'Check Brave Shields Fingerprinting',
+                        desc: 'If Brave still blocks GPU initialization, click the Brave Shields lion icon in the address bar and set Fingerprinting Blocking to Standard (not Strict) for this site.',
+                    });
+                }
+
+                steps.push({
+                    title: `Relaunch ${bName} & Reload`,
+                    desc: `Click the Relaunch / Restart button at the bottom of ${bName} to apply changes, then return here and click "Reload & Retry WebGPU".`,
+                });
+                return steps;
+            }
+
+            if (browserId === 'firefox') {
+                steps.push({
+                    title: 'Verify Hardware Acceleration is On',
+                    desc: 'Paste this into the address bar → General → Performance → ensure "Use hardware acceleration when available" is checked.',
+                    code: 'about:preferences#general',
+                });
+                steps.push({
+                    title: 'Open Firefox Advanced Configuration',
+                    desc: 'Paste about:config into the address bar, press Enter, and click "Accept the Risk and Continue".',
+                    code: 'about:config',
+                });
+                steps.push({
+                    title: 'Enable WebGPU & WebRender Preferences',
+                    desc: 'Search for the preference below and toggle it to true (double-click or click the toggle button). Also verify gfx.webrender.all is true.',
+                    code: 'dom.webgpu.enabled',
+                    code2: reason === 'no-adapter' || os === 'Linux' || os === 'macOS' ? 'dom.webgpu.force-enabled' : null,
+                    extraDesc: (reason === 'no-adapter' || os === 'Linux' || os === 'macOS')
+                        ? 'If WebGPU still fails on Linux/macOS, also set dom.webgpu.force-enabled to true (or try Firefox Nightly / Chrome / Edge).'
+                        : null,
+                });
+                steps.push({
+                    title: 'Restart Firefox Completely',
+                    desc: 'Close all Firefox windows, reopen Firefox, and reload this page.',
+                });
+                return steps;
+            }
+
+            if (browserId === 'safari') {
+                steps.push({
+                    title: 'Show Developer & Feature Flags in Safari',
+                    desc: 'In the top macOS menu bar, click Safari → Settings… (⌘,), open the Advanced tab, and check "Show features for web developers" (or "Show Develop menu in menu bar" in Safari 17.0).',
+                });
+                steps.push({
+                    title: 'Open the Feature Flags Tab',
+                    desc: 'Stay in Safari Settings and click the Feature Flags tab (on older Safari versions, use Develop → Experimental Features in the top menu bar).',
+                });
+                steps.push({
+                    title: 'Turn On WebGPU',
+                    desc: 'Search for "WebGPU" in the Feature Flags search box and check the WebGPU checkbox.',
+                    code: 'WebGPU',
+                });
+                steps.push({
+                    title: 'Quit & Reopen Safari',
+                    desc: 'Press ⌘Q to completely quit Safari, reopen it, and reload this page.',
+                });
+                return steps;
+            }
+
+            return steps;
+        }
+
+        const TUTORIAL_OPTIONS = [
+            { id: 'chrome', label: 'Google Chrome' },
+            { id: 'edge', label: 'Microsoft Edge' },
+            { id: 'firefox', label: 'Mozilla Firefox' },
+            { id: 'safari', label: 'Safari (macOS)' },
+            { id: 'brave', label: 'Brave' },
+            { id: 'opera', label: 'Opera / Opera GX' },
+            { id: 'vivaldi', label: 'Vivaldi' },
+            { id: 'chromium', label: 'Chromium' },
+        ];
+
+        let state = {
+            browser: null,
+            reason: 'no-api',
+            selectedGuideId: null,
+            initialized: false,
+            dismissed: false,
+        };
+
+        const overlay = document.getElementById('webgpu-guide-overlay');
+        const modalCard = document.getElementById('wgpu-modal-card');
+        const guideTitle = document.getElementById('wgpu-guide-title');
+        const envRow = document.getElementById('wgpu-env-row');
+        const modalBody = document.getElementById('wgpu-modal-body');
+        const pill = document.getElementById('webgpu-guide-pill');
+        const pillText = document.getElementById('wgpu-pill-text');
+        const dismissBtn = document.getElementById('wgpu-dismiss-btn');
+        const closeBtn = document.getElementById('wgpu-close-btn');
+        const reloadBtn = document.getElementById('wgpu-reload-btn');
+
+        function renderGuide() {
+            const b = state.browser;
+            if (!b) return;
+
+            const isIncompatible = !b.compatible;
+            modalCard.classList.toggle('is-incompatible', isIncompatible);
+            pill.classList.toggle('is-incompatible', isIncompatible);
+
+            const verStr = b.version ? ` v${b.version}` : '';
+            guideTitle.textContent = isIncompatible
+                ? '⛔ Browser Not Compatible with WebGPU'
+                : '⚡ WebGPU is Not Active on Your PC';
+
+            envRow.innerHTML = '';
+            envRow.appendChild(el('span', {
+                className: `wgpu-chip ${isIncompatible ? 'danger' : ''}`,
+                textContent: `Browser: ${b.name}${verStr}`,
+            }));
+            envRow.appendChild(el('span', {
+                className: 'wgpu-chip',
+                textContent: `OS: ${b.os}`,
+            }));
+            const reasonText = !isIncompatible
+                ? (state.reason === 'insecure-context'
+                    ? 'HTTPS / localhost required'
+                    : state.reason === 'no-adapter'
+                        ? 'GPU adapter unavailable'
+                        : 'WebGPU disabled')
+                : 'Incompatible Browser';
+            envRow.appendChild(el('span', {
+                className: `wgpu-chip ${isIncompatible ? 'danger' : 'warn'}`,
+                textContent: reasonText,
+            }));
+
+            modalBody.innerHTML = '';
+
+            if (isIncompatible) {
+                modalBody.appendChild(el('div', { className: 'wgpu-red-warning', role: 'alert' }, [
+                    el('strong', { textContent: `⛔ Warning: ${b.name}${verStr} is not compatible with WebGPU` }),
+                    el('p', {
+                        textContent: `${b.incompatReason} LiquidRust Studio cannot use WebGPU compute acceleration in this browser and will run in WebGL 2.0 fallback mode (if supported).`,
+                    }),
+                ]));
+
+                modalBody.appendChild(el('div', { className: 'wgpu-section-title', textContent: 'Switch to a Compatible Desktop Browser' }));
+                modalBody.appendChild(el('div', { className: 'wgpu-compat-list' }, [
+                    el('div', { className: 'wgpu-compat-card' }, [
+                        el('strong', { textContent: 'Google Chrome 113+' }),
+                        el('span', { textContent: 'Windows, macOS, Linux, ChromeOS' }),
+                        el('a', { href: 'https://www.google.com/chrome/', target: '_blank', rel: 'noopener noreferrer', textContent: 'Download Chrome ↗' }),
+                    ]),
+                    el('div', { className: 'wgpu-compat-card' }, [
+                        el('strong', { textContent: 'Microsoft Edge 113+' }),
+                        el('span', { textContent: 'Windows, macOS, Linux' }),
+                        el('a', { href: 'https://www.microsoft.com/edge', target: '_blank', rel: 'noopener noreferrer', textContent: 'Download Edge ↗' }),
+                    ]),
+                    el('div', { className: 'wgpu-compat-card' }, [
+                        el('strong', { textContent: b.os === 'macOS' ? 'Safari 17+ / Firefox 141+' : 'Mozilla Firefox 141+' }),
+                        el('span', { textContent: b.os === 'macOS' ? 'Built into macOS Sonoma+' : 'Windows (141+), Linux/macOS via config' }),
+                        el('a', { href: 'https://www.mozilla.org/firefox/new/', target: '_blank', rel: 'noopener noreferrer', textContent: 'Download Firefox ↗' }),
+                    ]),
+                ]));
+
+                pillText.textContent = `⛔ ${b.name}${verStr} Incompatible with WebGPU`;
+                pill.querySelector('.wgpu-pill-action').textContent = 'View Warning';
+            } else {
+                const diagMsg = state.reason === 'insecure-context'
+                    ? `You are viewing this app over an insecure HTTP URL (${window.location.origin}). Browsers disable WebGPU unless served over HTTPS or localhost.`
+                    : state.reason === 'no-adapter'
+                        ? `Your browser supports WebGPU, but failed to acquire a GPU adapter. This usually means hardware acceleration is turned off, your GPU is on the browser blocklist, or your graphics drivers need an update.`
+                        : `WebGPU is currently disabled in ${b.name}. Follow the step-by-step tutorial below to activate it for maximum fluid simulation speed.`;
+
+                modalBody.appendChild(el('div', { className: 'wgpu-diag-note', textContent: diagMsg }));
+
+                const activeGuideId = state.selectedGuideId || b.id;
+                const steps = buildTutorialSteps(activeGuideId, b.os, state.reason);
+                const guideLabel = (TUTORIAL_OPTIONS.find((o) => o.id === activeGuideId) || {}).label || b.name;
+
+                modalBody.appendChild(el('div', {
+                    className: 'wgpu-section-title',
+                    textContent: `Step-by-Step Activation Guide (${guideLabel})`,
+                }));
+
+                const list = el('ol', { className: 'wgpu-steps' });
+                for (const s of steps) {
+                    const stepEl = el('li', { className: 'wgpu-step' }, [
+                        el('div', { className: 'wgpu-step-title', textContent: s.title }),
+                        el('div', { className: 'wgpu-step-desc', textContent: s.desc }),
+                    ]);
+                    if (s.code) stepEl.appendChild(makeCodeRow(s.code));
+                    if (s.code2) stepEl.appendChild(makeCodeRow(s.code2));
+                    if (s.extraDesc) {
+                        stepEl.appendChild(el('div', {
+                            className: 'wgpu-step-desc',
+                            style: 'margin-top:6px;',
+                            textContent: s.extraDesc,
+                        }));
+                    }
+                    list.appendChild(stepEl);
+                }
+                modalBody.appendChild(list);
+
+                const select = el('select', { id: 'wgpu-browser-switcher', 'aria-label': 'Switch browser tutorial' });
+                const options = TUTORIAL_OPTIONS.some((o) => o.id === activeGuideId)
+                    ? TUTORIAL_OPTIONS
+                    : [{ id: activeGuideId, label: b.name }, ...TUTORIAL_OPTIONS];
+                for (const opt of options) {
+                    const o = el('option', { value: opt.id, textContent: opt.label });
+                    if (opt.id === activeGuideId) o.selected = true;
+                    select.appendChild(o);
+                }
+                select.addEventListener('change', (e) => {
+                    state.selectedGuideId = e.target.value;
+                    renderGuide();
+                });
+
+                modalBody.appendChild(el('div', { className: 'wgpu-switch-row' }, [
+                    el('span', { textContent: 'Wrong browser detected? Switch guide:' }),
+                    select,
+                ]));
+
+                pillText.textContent = '⚡ WebGPU Not Active';
+                pill.querySelector('.wgpu-pill-action').textContent = 'Activate Guide';
+            }
+
+            const hasCanvas = Boolean(document.getElementById('glcanvas'));
+            dismissBtn.textContent = hasCanvas ? 'Continue in WebGL 2.0' : 'Dismiss';
+        }
+
+        function openModal() {
+            state.dismissed = false;
+            overlay.classList.add('is-open');
+            pill.classList.remove('is-visible');
+        }
+
+        function closeModal() {
+            state.dismissed = true;
+            overlay.classList.remove('is-open');
+            pill.classList.add('is-visible');
+        }
+
+        closeBtn.addEventListener('click', closeModal);
+        dismissBtn.addEventListener('click', closeModal);
+        reloadBtn.addEventListener('click', () => window.location.reload());
+        pill.addEventListener('click', openModal);
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) closeModal();
+        });
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && overlay.classList.contains('is-open')) closeModal();
+        });
+
+        // Keep overlay/pill mounted even if WebGL 2.0 also fails and app.js replaces document.body
+        const bodyObserver = new MutationObserver(() => {
+            if (!state.initialized) {
+                checkAppBadge();
+                return;
+            }
+            let detached = false;
+            if (!document.body.contains(overlay)) {
+                document.body.appendChild(overlay);
+                detached = true;
+            }
+            if (!document.body.contains(pill)) {
+                document.body.appendChild(pill);
+                detached = true;
+            }
+            if (detached) renderGuide();
+        });
+        bodyObserver.observe(document.body, { childList: true });
+
+        async function activateGuide(reason) {
+            if (state.initialized) return;
+            state.initialized = true;
+            state.reason = reason;
+            state.browser = await detectBrowser();
+            state.selectedGuideId = state.browser.compatible ? state.browser.id : null;
+
+            const badge = document.getElementById('badge-backend');
+            if (badge) {
+                badge.style.cursor = 'pointer';
+                badge.title = `${badge.textContent} — Click for WebGPU setup info`;
+                badge.addEventListener('click', openModal);
+            }
+
+            renderGuide();
+            openModal();
+        }
+
+        function inferFailureReason() {
+            if (!window.isSecureContext) return 'insecure-context';
+            if (!('gpu' in navigator)) return 'no-api';
+            return 'no-adapter';
+        }
+
+        async function probeWebGpuFallback() {
+            if (!window.isSecureContext) return 'insecure-context';
+            if (!('gpu' in navigator)) return 'no-api';
+            try {
+                const adapter = (await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }))
+                    || (await navigator.gpu.requestAdapter());
+                if (!adapter) return 'no-adapter';
+                const dev = await adapter.requestDevice();
+                if (!dev) return 'no-adapter';
+                if (typeof dev.destroy === 'function') dev.destroy();
+                return null;
+            } catch {
+                return 'no-adapter';
+            }
+        }
+
+        function checkAppBadge() {
+            if (window.app && window.app.backend === 'webgl') {
+                activateGuide(inferFailureReason());
+                return 'done';
+            }
+            if (window.app && window.app.backend === 'webgpu') {
+                return 'done';
+            }
+            const badge = document.getElementById('badge-backend');
+            if (!badge) {
+                // Canvas/header wiped due to total WebGPU+WebGL failure
+                activateGuide(inferFailureReason());
+                return 'done';
+            }
+            if (badge.classList.contains('webgl')) {
+                activateGuide(inferFailureReason());
+                return 'done';
+            }
+            if (badge.classList.contains('webgpu') && badge.textContent.includes('·')) {
+                return 'done';
+            }
+            return 'pending';
+        }
+
+        if (checkAppBadge() === 'pending') {
+            const badge = document.getElementById('badge-backend');
+            let settled = false;
+
+            const finish = () => {
+                settled = true;
+                badgeObserver.disconnect();
+            };
+
+            const badgeObserver = new MutationObserver(() => {
+                if (!settled && checkAppBadge() === 'done') finish();
+            });
+            if (badge) {
+                badgeObserver.observe(badge, { attributes: true, childList: true, characterData: true, subtree: true });
+            }
+
+            setTimeout(async () => {
+                if (settled) return;
+                if (checkAppBadge() === 'done') {
+                    finish();
+                    return;
+                }
+                const reason = await probeWebGpuFallback();
+                finish();
+                if (reason) activateGuide(reason);
+            }, 1500);
+        }
+    })();
+    </script>
 </body>
 </html>

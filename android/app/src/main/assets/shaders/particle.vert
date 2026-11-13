@@ -16,6 +16,8 @@ out vec3 v_pos_eye;
 out vec3 v_world_pos;
 out float v_metric_t;
 out float v_speed_t;
+out float v_surf_mask;
+out vec2 v_vel_xy;
 
 void main() {
     const vec2 corners[4] = vec2[4](
@@ -28,9 +30,13 @@ void main() {
     vec2 uv = corners[gl_VertexID];
     v_uv = uv;
     v_world_pos = a_pos_rho.xyz;
+    v_vel_xy = a_vel_pres.xy;
 
     float speed = length(a_vel_pres.xyz);
     v_speed_t = min(speed / 2.8, 1.0);
+
+    float rho_ratio = a_pos_rho.w * u_inv_rho0;
+    v_surf_mask = 1.0 - smoothstep(0.62, 0.89, rho_ratio);
 
     if (u_color_mode == 0) {
         v_metric_t = min(speed / 2.5, 1.0);

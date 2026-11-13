@@ -794,6 +794,8 @@ struct VertexOutput {
     @location(2) pos_eye: vec3<f32>,
     @location(3) world_pos: vec3<f32>,
     @location(4) speed_t: f32,
+    @location(5) surf_mask: f32,
+    @location(6) vel_xy: vec2<f32>,
 };
 
 @vertex
@@ -818,14 +820,16 @@ fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -
     out.uv = corner;
     out.pos_eye = eye_pos;
     out.world_pos = world_pos;
+    out.vel_xy = p.vel_dens.xy;
 
     let speed = length(p.vel_dens.xyz);
-    let speed_t = clamp(speed / 2.5, 0.0, 1.0);
+    let speed_t = clamp(speed / 2.8, 0.0, 1.0);
     out.speed_t = speed_t;
 
     let mode = camera.color_mode.x;
     let rho0 = max(camera.light_dir.w, 10.0);
     let rho = p.vel_dens.w;
+    out.surf_mask = 1.0 - smoothstep(0.62, 0.89, rho / rho0);
 
     if (mode == 1u) {
         let constraint = max(rho / rho0 - 1.0, 0.0);
@@ -904,6 +908,39 @@ struct FragmentOutput {
     @builtin(frag_depth) depth: f32,
 };
 
+fn hash22_wgsl(p: vec2<i32>) -> vec2<f32> {
+    let q = bitcast<vec2<u32>>(p) * vec2<u32>(1597334677u, 3812015801u);
+    let n = (q.x ^ q.y) * 2798796415u;
+    let n2 = ((n >> 13u) ^ n) * 2246822519u;
+    return vec2<f32>(f32(n & 65535u), f32((n2 >> 8u) & 65535u)) * (1.0 / 65535.0);
+}
+
+fn worley_caustic_wgsl(u_coord: vec2<f32>, t_anim: f32) -> f32 {
+    let ip = vec2<i32>(floor(u_coord));
+    let fp = u_coord - vec2<f32>(ip);
+    var d1 = 8.0;
+    var d2 = 8.0;
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let o = vec2<i32>(dx, dy);
+            let j = hash22_wgsl(ip + o);
+            let r = vec2<f32>(o) + vec2<f32>(0.5, 0.5) + 0.36 * vec2<f32>(
+                sin(t_anim * 1.5 + 6.2831853 * j.x),
+                cos(t_anim * 1.3 + 6.2831853 * j.y)
+            ) - fp;
+            let d = dot(r, r);
+            if (d < d1) {
+                d2 = d1;
+                d1 = d;
+            } else if (d < d2) {
+                d2 = d;
+            }
+        }
+    }
+    let edge = sqrt(d2) - sqrt(d1);
+    return pow(clamp(1.0 - edge * 2.4, 0.0, 1.0), 2.3);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> FragmentOutput {
     let r2 = dot(in.uv, in.uv);
@@ -916,42 +953,68 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
     let tex_mode = camera.color_mode.z;
     let tex_str = clamp(camera.shallow_color.w, 0.0, 1.0);
     let t_anim = camera.deep_color.w;
-    let surf_pos = in.world_pos + n * camera.params.x;
+    let radius = camera.params.x;
+    let is_2d = camera.params.z > 0.5;
+    let surf_pos = in.world_pos + n * (radius * 1.35);
 
     var caustic_boost = 0.0;
     var foam_tex = 0.0;
-    var grid_mod = 1.0;
+    var tex_shade = 1.0;
+    let flow_surf = clamp(in.surf_mask + in.speed_t * 0.65, 0.0, 1.0);
 
     if (tex_mode != 0u && tex_str > 0.005) {
         if (tex_mode == 1u) {
-            // Capillary Ripples
-            let w1 = cos(surf_pos.x * 28.0 + surf_pos.y * 19.0 - t_anim * 3.8);
-            let w2 = sin(surf_pos.z * 26.0 - surf_pos.x * 16.0 + t_anim * 3.1);
-            let bump = vec3<f32>(w1, w2, 0.0) * (tex_str * 0.42);
-            n = normalize(n + bump);
-            caustic_boost = max(w1 * w2, 0.0) * tex_str * 0.20;
+            // Silky Undulating Water Ripples
+            let warp = 0.55 * sin(surf_pos.x * 6.5 + surf_pos.z * 5.0 - t_anim * 2.8)
+                     + 0.30 * cos(surf_pos.x * 12.5 - surf_pos.z * 9.5 + t_anim * 2.1);
+            let wave_band = sin(surf_pos.y * 24.0 + warp * 2.2 - t_anim * 1.8);
+            let wave_fine = sin(surf_pos.y * 52.0 - warp * 3.1 + surf_pos.x * 18.0 + t_anim * 3.4);
+            let dx_w = cos(surf_pos.x * 52.0 + surf_pos.y * 18.0 - t_anim * 4.2) * 0.45
+                     + sin(surf_pos.x * 31.0 - surf_pos.y * 44.0 + t_anim * 3.3) * 0.35;
+            let dy_w = wave_band * 0.55 + wave_fine * 0.35;
+            let bump_gain = tex_str * (0.24 + 0.26 * flow_surf);
+            n = normalize(n + vec3<f32>(dx_w, dy_w, 0.0) * bump_gain);
+            tex_shade = 1.0 + (wave_band * 0.11 + wave_fine * 0.04) * tex_str;
+            let crest = smoothstep(0.25, 0.95, wave_band * 0.65 + wave_fine * 0.35);
+            caustic_boost = crest * tex_str * (0.16 + 0.36 * flow_surf);
         } else if (tex_mode == 2u) {
-            // Shimmering Voronoi-style interference caustics
-            let p = surf_pos * 18.0;
-            let c1 = abs(sin(p.x + sin(p.y * 1.3 + t_anim * 2.4)) * cos(p.y + cos(p.z * 1.4 - t_anim * 1.9)));
-            let web = pow(1.0 - clamp(c1, 0.0, 1.0), 3.0);
-            caustic_boost = web * tex_str * 0.85;
-            n = normalize(n + vec3<f32>(sin(p.x * 1.7), cos(p.y * 1.7), 0.0) * (tex_str * 0.25));
+            // Cellular Voronoi Pool Caustics
+            let uv_c = vec2<f32>(
+                surf_pos.x * 5.6 + surf_pos.y * 1.1 + surf_pos.z * 2.6 + sin(surf_pos.y * 4.0 + t_anim * 1.2) * 0.18,
+                surf_pos.y * 5.6 - surf_pos.x * 0.8 + surf_pos.z * 3.1 + cos(surf_pos.x * 4.0 - t_anim * 1.0) * 0.18
+            );
+            let c_main = worley_caustic_wgsl(uv_c, t_anim);
+            let c_fine = worley_caustic_wgsl(uv_c * 1.85 + vec2<f32>(3.7, -2.1), t_anim * 1.35);
+            let caustic = c_main * 0.74 + c_fine * 0.26;
+            caustic_boost = caustic * tex_str * 0.78;
+            n = normalize(n + vec3<f32>(c_main - 0.35, c_fine - 0.35, 0.0) * (tex_str * 0.20));
         } else if (tex_mode == 3u) {
-            // Cellular Crest Foam
-            let p = surf_pos * 24.0 + vec3<f32>(t_anim * 1.5, -t_anim * 0.8, t_anim * 1.2);
-            let f = (sin(p.x) * cos(p.y) + sin(p.y * 1.7 + p.z) + cos(p.z * 2.3 - p.x)) * 0.333 + 0.5;
-            foam_tex = clamp((f - 0.38) * 2.6, 0.0, 1.0) * tex_str * (0.28 + 0.72 * in.speed_t);
-            n = normalize(n + vec3<f32>(f - 0.5, (1.0 - f) - 0.5, 0.0) * (tex_str * 0.22));
+            // Natural Aerated Seafoam
+            let bp = surf_pos * 36.0 + vec3<f32>(t_anim * 1.1, -t_anim * 0.7, t_anim * 0.9);
+            let bub = (sin(bp.x) * cos(bp.y) + sin(bp.y * 1.6 + bp.z) + cos(bp.z * 2.1 - bp.x)) * 0.333 + 0.5;
+            let micro = smoothstep(0.22, 0.72, bub);
+            let aeration = clamp(in.surf_mask * 0.90 + smoothstep(0.16, 0.72, in.speed_t) * 0.95, 0.0, 1.0);
+            foam_tex = micro * aeration * clamp(tex_str * 1.35, 0.0, 1.0);
+            n = normalize(n + vec3<f32>(bub - 0.5, 0.5 - bub, 0.0) * (foam_tex * 0.35));
         } else if (tex_mode == 4u) {
-            // Studio UV Contour Grid
-            let gx = abs(fract(surf_pos.x * 8.0) - 0.5);
-            let gy = abs(fract(surf_pos.y * 8.0) - 0.5);
-            let gz = abs(fract(surf_pos.z * 8.0) - 0.5);
-            let line = max(1.0 - min(gx, gy) * 14.0, 1.0 - gz * 14.0);
-            let line_c = clamp(line, 0.0, 1.0) * tex_str;
-            grid_mod = 1.0 - tex_str * 0.14;
-            caustic_boost = line_c * 0.45;
+            // Refracted Pool-Tile Grid
+            let refr_xy = in.world_pos.xy + n.xy * (radius * 2.1) - in.vel_xy * 0.035 + vec2<f32>(
+                0.012 * sin(in.world_pos.y * 10.0 - t_anim * 2.2),
+                0.012 * cos(in.world_pos.x * 10.0 + t_anim * 1.9)
+            );
+            let freq = 5.5;
+            let gx = 0.5 - abs(fract(refr_xy.x * freq) - 0.5);
+            let gy = 0.5 - abs(fract(refr_xy.y * freq) - 0.5);
+            var line_d = min(gx, gy);
+            if (!is_2d) {
+                let rz = in.world_pos.z + n.z * (radius * 1.2);
+                let gz = 0.5 - abs(fract(rz * freq) - 0.5);
+                line_d = min(line_d, gz);
+            }
+            let line_mask = 1.0 - smoothstep(0.018, 0.062, line_d);
+            let checker = f32((i32(floor(refr_xy.x * freq)) + i32(floor(refr_xy.y * freq))) & 1i);
+            tex_shade = 1.0 - tex_str * (0.09 * checker);
+            caustic_boost = line_mask * (0.55 * tex_str);
         }
     }
 
@@ -981,9 +1044,10 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
         }
     }
 
-    base_color = base_color * grid_mod + mix(shallow, vec3<f32>(0.96, 0.99, 1.0), 0.35) * caustic_boost;
+    let boost_col = mix(shallow, vec3<f32>(0.92, 0.99, 1.0), 0.28) * caustic_boost;
+    base_color = base_color * tex_shade + boost_col;
     if (foam_tex > 0.005) {
-        base_color = mix(base_color, vec3<f32>(0.95, 0.98, 1.0), clamp(foam_tex, 0.0, 0.85));
+        base_color = mix(base_color, vec3<f32>(0.94, 0.98, 1.0), clamp(foam_tex, 0.0, 0.88));
     }
 
     let is_lit = camera.params.w > 0.5;
@@ -1018,15 +1082,14 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
 
         rgb = mix(body_lit, sky_env * mix(vec3<f32>(1.0), base_color, metallic), clamp(fresnel * (0.75 + 0.25 * metallic), vec3<f32>(0.0), vec3<f32>(0.96)))
             + spec
-            + sss_tint;
+            + sss_tint
+            + boost_col * 0.22;
     }
 
     var out: FragmentOutput;
     out.color = vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 
-    let is_2d = camera.params.z > 0.5;
     if (!is_2d) {
-        let radius = camera.params.x;
         let sphere_pos_eye = in.pos_eye + vec3<f32>(0.0, 0.0, z * radius);
         let clip_pos = camera.proj * vec4<f32>(sphere_pos_eye, 1.0);
         out.depth = clamp(clip_pos.z / clip_pos.w, 0.0, 1.0);

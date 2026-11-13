@@ -7,6 +7,8 @@ in vec3 v_pos_eye;
 in vec3 v_world_pos;
 in float v_metric_t;
 in float v_speed_t;
+in float v_surf_mask;
+in vec2 v_vel_xy;
 
 uniform mat4 u_proj;
 uniform float u_radius;
@@ -73,6 +75,39 @@ vec3 colormap_fire(float t) {
     return mix(c2, c3, (t - 0.72) / 0.28);
 }
 
+vec2 hash22(ivec2 p) {
+    uvec2 q = uvec2(p) * uvec2(1597334677u, 3812015801u);
+    uint n = (q.x ^ q.y) * 2798796415u;
+    uint n2 = ((n >> 13u) ^ n) * 2246822519u;
+    return vec2(float(n & 65535u), float((n2 >> 8u) & 65535u)) * (1.0 / 65535.0);
+}
+
+float worley_caustic(vec2 u, float t_anim) {
+    ivec2 ip = ivec2(floor(u));
+    vec2 fp = u - vec2(ip);
+    float d1 = 8.0;
+    float d2 = 8.0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 o = ivec2(dx, dy);
+            vec2 j = hash22(ip + o);
+            vec2 r = vec2(o) + 0.5 + 0.36 * vec2(
+                sin(t_anim * 1.5 + 6.2831853 * j.x),
+                cos(t_anim * 1.3 + 6.2831853 * j.y)
+            ) - fp;
+            float d = dot(r, r);
+            if (d < d1) {
+                d2 = d1;
+                d1 = d;
+            } else if (d < d2) {
+                d2 = d;
+            }
+        }
+    }
+    float edge = sqrt(d2) - sqrt(d1);
+    return pow(clamp(1.0 - edge * 2.4, 0.0, 1.0), 2.3);
+}
+
 void main() {
     float r2 = dot(v_uv, v_uv);
     if (r2 > 1.0) {
@@ -95,44 +130,61 @@ void main() {
     float caustic_boost = 0.0;
     float tex_shade = 1.0;
     float foam_tex = 0.0;
+    float flow_surf = clamp(v_surf_mask + v_speed_t * 0.65, 0.0, 1.0);
 
     if (u_tex_mode != 0 && tex_str > 0.005) {
         if (u_tex_mode == 1) {
-            // Capillary Ripples: animated multi-wave crests & troughs
-            float w1 = sin(surf_pos.x * 22.0 + surf_pos.y * 15.0 - t_anim * 4.2);
-            float w2 = cos(surf_pos.z * 20.0 - surf_pos.x * 14.0 + surf_pos.y * 12.0 + t_anim * 3.4);
-            float ripple = 0.5 * (w1 + w2);
-            n = normalize(n + vec3(w1, w2, 0.0) * (tex_str * 0.85));
-            tex_shade = 1.0 + ripple * (0.45 * tex_str);
-            caustic_boost = pow(max(ripple, 0.0), 1.8) * (0.95 * tex_str);
+            // Silky Undulating Water Ripples: gentle wave currents + capillary droplet shimmer + sunlit surface crests
+            float warp = 0.55 * sin(surf_pos.x * 6.5 + surf_pos.z * 5.0 - t_anim * 2.8)
+                       + 0.30 * cos(surf_pos.x * 12.5 - surf_pos.z * 9.5 + t_anim * 2.1);
+            float wave_band = sin(surf_pos.y * 24.0 + warp * 2.2 - t_anim * 1.8);
+            float wave_fine = sin(surf_pos.y * 52.0 - warp * 3.1 + surf_pos.x * 18.0 + t_anim * 3.4);
+            float dx_w = cos(surf_pos.x * 52.0 + surf_pos.y * 18.0 - t_anim * 4.2) * 0.45
+                       + sin(surf_pos.x * 31.0 - surf_pos.y * 44.0 + t_anim * 3.3) * 0.35;
+            float dy_w = wave_band * 0.55 + wave_fine * 0.35;
+            float bump_gain = tex_str * (0.24 + 0.26 * flow_surf);
+            n = normalize(n + vec3(dx_w, dy_w, 0.0) * bump_gain);
+            tex_shade = 1.0 + (wave_band * 0.11 + wave_fine * 0.04) * tex_str;
+            float crest = smoothstep(0.25, 0.95, wave_band * 0.65 + wave_fine * 0.35);
+            caustic_boost = crest * tex_str * (0.16 + 0.36 * flow_surf);
         } else if (u_tex_mode == 2) {
-            // Luminous Refractive Caustic Web
-            vec3 p = surf_pos * 13.5;
-            float c1 = abs(sin(p.x + sin(p.y * 1.4 + t_anim * 2.6)) * cos(p.y + cos(p.z * 1.5 - t_anim * 2.1)));
-            float web = pow(1.0 - clamp(c1, 0.0, 1.0), 2.4);
-            tex_shade = 1.0 - tex_str * 0.42;
-            caustic_boost = web * (1.35 * tex_str);
-            n = normalize(n + vec3(sin(p.x * 1.9), cos(p.y * 1.9), 0.0) * (tex_str * 0.45));
+            // Cellular Voronoi Pool Caustics: authentic curved light web
+            vec2 uv_c = vec2(
+                surf_pos.x * 5.6 + surf_pos.y * 1.1 + surf_pos.z * 2.6 + sin(surf_pos.y * 4.0 + t_anim * 1.2) * 0.18,
+                surf_pos.y * 5.6 - surf_pos.x * 0.8 + surf_pos.z * 3.1 + cos(surf_pos.x * 4.0 - t_anim * 1.0) * 0.18
+            );
+            float c_main = worley_caustic(uv_c, t_anim);
+            float c_fine = worley_caustic(uv_c * 1.85 + vec2(3.7, -2.1), t_anim * 1.35);
+            float caustic = c_main * 0.74 + c_fine * 0.26;
+            caustic_boost = caustic * tex_str * 0.78;
+            n = normalize(n + vec3(c_main - 0.35, c_fine - 0.35, 0.0) * (tex_str * 0.20));
         } else if (u_tex_mode == 3) {
-            // Aerated Seafoam: cellular white foam patches visible across liquid
-            vec3 p = surf_pos * 19.0 + vec3(t_anim * 1.8, -t_anim * 0.9, t_anim * 1.4);
-            float f = (sin(p.x) * cos(p.y) + sin(p.y * 1.7 + p.z) + cos(p.z * 2.3 - p.x)) * 0.333 + 0.5;
-            float cell = smoothstep(0.32, 0.72, f);
-            foam_tex = cell * clamp(tex_str * 1.35, 0.0, 1.0) * (0.55 + 0.45 * v_speed_t);
-            n = normalize(n + vec3(f - 0.5, (1.0 - f) - 0.5, 0.0) * (tex_str * 0.40));
+            // Natural Aerated Seafoam: buoyant frothy whitecap bubbles on free surface & splashing waves
+            vec3 bp = surf_pos * 36.0 + vec3(t_anim * 1.1, -t_anim * 0.7, t_anim * 0.9);
+            float bub = (sin(bp.x) * cos(bp.y) + sin(bp.y * 1.6 + bp.z) + cos(bp.z * 2.1 - bp.x)) * 0.333 + 0.5;
+            float micro = smoothstep(0.22, 0.72, bub);
+            float aeration = clamp(v_surf_mask * 0.90 + smoothstep(0.16, 0.72, v_speed_t) * 0.95, 0.0, 1.0);
+            foam_tex = micro * aeration * clamp(tex_str * 1.35, 0.0, 1.0);
+            n = normalize(n + vec3(bub - 0.5, 0.5 - bub, 0.0) * (foam_tex * 0.35));
         } else if (u_tex_mode == 4) {
-            // High-Contrast Spatial Lagrangian Grid (advects cleanly in 2D & 3D)
+            // Refracted Pool-Tile Grid: background optical grid dynamically refracted through water droplets & flow
+            vec2 refr_xy = v_world_pos.xy + n.xy * (u_radius * 2.1) - v_vel_xy * 0.035 + vec2(
+                0.012 * sin(v_world_pos.y * 10.0 - t_anim * 2.2),
+                0.012 * cos(v_world_pos.x * 10.0 + t_anim * 1.9)
+            );
             float freq = 5.5;
-            float gx = abs(fract(surf_pos.x * freq) - 0.5);
-            float gy = abs(fract(surf_pos.y * freq) - 0.5);
-            float line_xy = max(smoothstep(0.42, 0.49, gx), smoothstep(0.42, 0.49, gy));
+            float gx = 0.5 - abs(fract(refr_xy.x * freq) - 0.5);
+            float gy = 0.5 - abs(fract(refr_xy.y * freq) - 0.5);
+            float line_d = min(gx, gy);
 #ifdef MODE_3D
-            float gz = abs(fract(surf_pos.z * freq) - 0.5);
-            line_xy = max(line_xy, smoothstep(0.42, 0.49, gz));
+            float rz = v_world_pos.z + n.z * (u_radius * 1.2);
+            float gz = 0.5 - abs(fract(rz * freq) - 0.5);
+            line_d = min(line_d, gz);
 #endif
-            float checker = mod(floor(surf_pos.x * freq) + floor(surf_pos.y * freq), 2.0);
-            tex_shade = 1.0 - tex_str * (0.28 + 0.22 * checker);
-            caustic_boost = line_xy * (1.25 * tex_str);
+            float line_mask = 1.0 - smoothstep(0.018, 0.062, line_d);
+            float checker = mod(floor(refr_xy.x * freq) + floor(refr_xy.y * freq), 2.0);
+            tex_shade = 1.0 - tex_str * (0.09 * checker);
+            caustic_boost = line_mask * (0.55 * tex_str);
         }
     }
 
@@ -151,10 +203,10 @@ void main() {
         else base_color = colormap_ocean(v_metric_t);
     }
 
-    vec3 boost_col = mix(u_shallow_color, vec3(0.96, 0.99, 1.0), 0.55) * caustic_boost;
+    vec3 boost_col = mix(u_shallow_color, vec3(0.92, 0.99, 1.0), 0.28) * caustic_boost;
     base_color = base_color * tex_shade + boost_col;
     if (foam_tex > 0.005) {
-        base_color = mix(base_color, vec3(0.96, 0.99, 1.0), clamp(foam_tex, 0.0, 0.90));
+        base_color = mix(base_color, vec3(0.94, 0.98, 1.0), clamp(foam_tex, 0.0, 0.88));
     }
 
     vec3 rgb = base_color;
@@ -186,7 +238,7 @@ void main() {
         rgb = mix(body_lit, sky_env * mix(vec3(1.0), base_color, metallic), clamp(fresnel * (0.75 + 0.25 * metallic), 0.0, 0.96))
             + spec
             + sss_tint
-            + boost_col * 0.45;
+            + boost_col * 0.22;
     }
 
     fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);

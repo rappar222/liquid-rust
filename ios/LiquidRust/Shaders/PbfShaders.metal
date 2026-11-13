@@ -656,6 +656,8 @@ struct ParticleVertOut {
     float3 world_pos;
     float  metric_t;
     float  speed_t;
+    float  surf_mask;
+    float2 vel_xy;
 };
 
 vertex ParticleVertOut particle_vert(
@@ -679,9 +681,13 @@ vertex ParticleVertOut particle_vert(
     float2 uv = corners[vid];
     out.uv = uv;
     out.world_pos = pos_rho.xyz;
+    out.vel_xy = vel_pres.xy;
 
     float speed = length(vel_pres.xyz);
     out.speed_t = min(speed / 2.8f, 1.0f);
+
+    float rho_ratio = pos_rho.w * u.params.y;
+    out.surf_mask = 1.0f - smoothstep(0.62f, 0.89f, rho_ratio);
 
     int color_mode = u.modes.x;
     if (color_mode == 0) {
@@ -750,6 +756,39 @@ inline float3 colormap_fire(float t) {
     return mix(c2, c3, (t - 0.72f) / 0.28f);
 }
 
+inline float2 hash22_metal(int2 p) {
+    uint2 q = uint2(p) * uint2(1597334677u, 3812015801u);
+    uint n = (q.x ^ q.y) * 2798796415u;
+    uint n2 = ((n >> 13u) ^ n) * 2246822519u;
+    return float2(float(n & 65535u), float((n2 >> 8u) & 65535u)) * (1.0f / 65535.0f);
+}
+
+inline float worley_caustic_metal(float2 u_coord, float t_anim) {
+    int2 ip = int2(floor(u_coord));
+    float2 fp = u_coord - float2(ip);
+    float d1 = 8.0f;
+    float d2 = 8.0f;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 o = int2(dx, dy);
+            float2 j = hash22_metal(ip + o);
+            float2 r = float2(o) + 0.5f + 0.36f * float2(
+                sin(t_anim * 1.5f + 6.2831853f * j.x),
+                cos(t_anim * 1.3f + 6.2831853f * j.y)
+            ) - fp;
+            float d = dot(r, r);
+            if (d < d1) {
+                d2 = d1;
+                d1 = d;
+            } else if (d < d2) {
+                d2 = d;
+            }
+        }
+    }
+    float edge = sqrt(d2) - sqrt(d1);
+    return pow(saturate(1.0f - edge * 2.4f), 2.3f);
+}
+
 inline float4 shade_particle_core(ParticleVertOut in, float z, constant RenderUniforms& u, bool is_3d_mode) {
     float radius = u.params.x;
     float tex_str = saturate(u.params.z);
@@ -766,44 +805,61 @@ inline float4 shade_particle_core(ParticleVertOut in, float z, constant RenderUn
     float caustic_boost = 0.0f;
     float foam_tex = 0.0f;
     float tex_shade = 1.0f;
+    float flow_surf = saturate(in.surf_mask + in.speed_t * 0.65f);
 
     if (tex_mode != 0 && tex_str > 0.005f) {
         if (tex_mode == 1) {
-            // Capillary Ripples
-            float w1 = sin(surf_pos.x * 22.0f + surf_pos.y * 15.0f - t_anim * 4.2f);
-            float w2 = cos(surf_pos.z * 20.0f - surf_pos.x * 14.0f + surf_pos.y * 12.0f + t_anim * 3.4f);
-            float ripple = 0.5f * (w1 + w2);
-            n = normalize(n + float3(w1, w2, 0.0f) * (tex_str * 0.85f));
-            tex_shade = 1.0f + ripple * (0.45f * tex_str);
-            caustic_boost = pow(max(ripple, 0.0f), 1.8f) * (0.95f * tex_str);
+            // Silky Undulating Water Ripples
+            float warp = 0.55f * sin(surf_pos.x * 6.5f + surf_pos.z * 5.0f - t_anim * 2.8f)
+                       + 0.30f * cos(surf_pos.x * 12.5f - surf_pos.z * 9.5f + t_anim * 2.1f);
+            float wave_band = sin(surf_pos.y * 24.0f + warp * 2.2f - t_anim * 1.8f);
+            float wave_fine = sin(surf_pos.y * 52.0f - warp * 3.1f + surf_pos.x * 18.0f + t_anim * 3.4f);
+            float dx_w = cos(surf_pos.x * 52.0f + surf_pos.y * 18.0f - t_anim * 4.2f) * 0.45f
+                       + sin(surf_pos.x * 31.0f - surf_pos.y * 44.0f + t_anim * 3.3f) * 0.35f;
+            float dy_w = wave_band * 0.55f + wave_fine * 0.35f;
+            float bump_gain = tex_str * (0.24f + 0.26f * flow_surf);
+            n = normalize(n + float3(dx_w, dy_w, 0.0f) * bump_gain);
+            tex_shade = 1.0f + (wave_band * 0.11f + wave_fine * 0.04f) * tex_str;
+            float crest = smoothstep(0.25f, 0.95f, wave_band * 0.65f + wave_fine * 0.35f);
+            caustic_boost = crest * tex_str * (0.16f + 0.36f * flow_surf);
         } else if (tex_mode == 2) {
-            // Luminous Refractive Caustic Web
-            float3 p = surf_pos * 13.5f;
-            float c1 = abs(sin(p.x + sin(p.y * 1.4f + t_anim * 2.6f)) * cos(p.y + cos(p.z * 1.5f - t_anim * 2.1f)));
-            float web = pow(1.0f - saturate(c1), 2.4f);
-            tex_shade = 1.0f - tex_str * 0.42f;
-            caustic_boost = web * (1.35f * tex_str);
-            n = normalize(n + float3(sin(p.x * 1.9f), cos(p.y * 1.9f), 0.0f) * (tex_str * 0.45f));
+            // Cellular Voronoi Pool Caustics
+            float2 uv_c = float2(
+                surf_pos.x * 5.6f + surf_pos.y * 1.1f + surf_pos.z * 2.6f + sin(surf_pos.y * 4.0f + t_anim * 1.2f) * 0.18f,
+                surf_pos.y * 5.6f - surf_pos.x * 0.8f + surf_pos.z * 3.1f + cos(surf_pos.x * 4.0f - t_anim * 1.0f) * 0.18f
+            );
+            float c_main = worley_caustic_metal(uv_c, t_anim);
+            float c_fine = worley_caustic_metal(uv_c * 1.85f + float2(3.7f, -2.1f), t_anim * 1.35f);
+            float caustic = c_main * 0.74f + c_fine * 0.26f;
+            caustic_boost = caustic * tex_str * 0.78f;
+            n = normalize(n + float3(c_main - 0.35f, c_fine - 0.35f, 0.0f) * (tex_str * 0.20f));
         } else if (tex_mode == 3) {
-            // Aerated Seafoam
-            float3 p = surf_pos * 19.0f + float3(t_anim * 1.8f, -t_anim * 0.9f, t_anim * 1.4f);
-            float f = (sin(p.x) * cos(p.y) + sin(p.y * 1.7f + p.z) + cos(p.z * 2.3f - p.x)) * 0.333f + 0.5f;
-            float cell = smoothstep(0.32f, 0.72f, f);
-            foam_tex = cell * saturate(tex_str * 1.35f) * (0.55f + 0.45f * in.speed_t);
-            n = normalize(n + float3(f - 0.5f, (1.0f - f) - 0.5f, 0.0f) * (tex_str * 0.40f));
+            // Natural Aerated Seafoam
+            float3 bp = surf_pos * 36.0f + float3(t_anim * 1.1f, -t_anim * 0.7f, t_anim * 0.9f);
+            float bub = (sin(bp.x) * cos(bp.y) + sin(bp.y * 1.6f + bp.z) + cos(bp.z * 2.1f - bp.x)) * 0.333f + 0.5f;
+            float micro = smoothstep(0.22f, 0.72f, bub);
+            float aeration = saturate(in.surf_mask * 0.90f + smoothstep(0.16f, 0.72f, in.speed_t) * 0.95f);
+            foam_tex = micro * aeration * saturate(tex_str * 1.35f);
+            n = normalize(n + float3(bub - 0.5f, 0.5f - bub, 0.0f) * (foam_tex * 0.35f));
         } else if (tex_mode == 4) {
-            // Spatial Lagrangian Grid
+            // Refracted Pool-Tile Grid
+            float2 refr_xy = in.world_pos.xy + n.xy * (radius * 2.1f) - in.vel_xy * 0.035f + float2(
+                0.012f * sin(in.world_pos.y * 10.0f - t_anim * 2.2f),
+                0.012f * cos(in.world_pos.x * 10.0f + t_anim * 1.9f)
+            );
             float freq = 5.5f;
-            float gx = abs(fract(surf_pos.x * freq) - 0.5f);
-            float gy = abs(fract(surf_pos.y * freq) - 0.5f);
-            float line_xy = max(smoothstep(0.42f, 0.49f, gx), smoothstep(0.42f, 0.49f, gy));
+            float gx = 0.5f - abs(fract(refr_xy.x * freq) - 0.5f);
+            float gy = 0.5f - abs(fract(refr_xy.y * freq) - 0.5f);
+            float line_d = min(gx, gy);
             if (is_3d_mode) {
-                float gz = abs(fract(surf_pos.z * freq) - 0.5f);
-                line_xy = max(line_xy, smoothstep(0.42f, 0.49f, gz));
+                float rz = in.world_pos.z + n.z * (radius * 1.2f);
+                float gz = 0.5f - abs(fract(rz * freq) - 0.5f);
+                line_d = min(line_d, gz);
             }
-            float checker = float((int(floor(surf_pos.x * freq)) + int(floor(surf_pos.y * freq))) & 1);
-            tex_shade = 1.0f - tex_str * (0.28f + 0.22f * checker);
-            caustic_boost = line_xy * (1.25f * tex_str);
+            float line_mask = 1.0f - smoothstep(0.018f, 0.062f, line_d);
+            float checker = float((int(floor(refr_xy.x * freq)) + int(floor(refr_xy.y * freq))) & 1);
+            tex_shade = 1.0f - tex_str * (0.09f * checker);
+            caustic_boost = line_mask * (0.55f * tex_str);
         }
     }
 
@@ -825,10 +881,10 @@ inline float4 shade_particle_core(ParticleVertOut in, float z, constant RenderUn
         else base_color = colormap_ocean(in.metric_t);
     }
 
-    float3 boost_col = mix(shallow_col, float3(0.96f, 0.99f, 1.0f), 0.55f) * caustic_boost;
+    float3 boost_col = mix(shallow_col, float3(0.92f, 0.99f, 1.0f), 0.28f) * caustic_boost;
     base_color = base_color * tex_shade + boost_col;
     if (foam_tex > 0.005f) {
-        base_color = mix(base_color, float3(0.96f, 0.99f, 1.0f), clamp(foam_tex, 0.0f, 0.90f));
+        base_color = mix(base_color, float3(0.94f, 0.98f, 1.0f), clamp(foam_tex, 0.0f, 0.88f));
     }
 
     float3 rgb = base_color;
@@ -861,7 +917,7 @@ inline float4 shade_particle_core(ParticleVertOut in, float z, constant RenderUn
         rgb = mix(body_lit, sky_env * mix(float3(1.0f), base_color, metallic), clamp(fresnel * (0.75f + 0.25f * metallic), 0.0f, 0.96f))
             + spec
             + sss_tint
-            + boost_col * 0.45f;
+            + boost_col * 0.22f;
     }
 
     return float4(saturate(rgb), 1.0f);

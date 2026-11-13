@@ -719,13 +719,24 @@ class LiquidApp {
         window.addEventListener('resize', () => this.resize());
 
         window.addEventListener('keydown', (e) => {
-            if (e.key === 'Shift') this.isShiftHeld = true;
+            if (e.key === 'Shift') {
+                this.isShiftHeld = true;
+                if (this.solver && this.solver.is2D) {
+                    this.solver.mouseForceMode = 0;
+                }
+            }
         });
 
         window.addEventListener('keyup', (e) => {
             if (e.key === 'Shift') {
                 this.isShiftHeld = false;
-                if (this.solver) this.solver.mouseForceMode = 0;
+                if (this.solver) {
+                    if (this.solver.is2D && this.isPointerDown) {
+                        this.solver.mouseForceMode = (this.pointerButton === 0) ? 1 : -1;
+                    } else {
+                        this.solver.mouseForceMode = 0;
+                    }
+                }
             }
         });
 
@@ -737,9 +748,19 @@ class LiquidApp {
             this.lastPointerX = e.clientX;
             this.lastPointerY = e.clientY;
 
-            if (this.isShiftHeld && this.solver) {
-                this.solver.mouseForceMode = (e.button === 0) ? 1 : -1;
-                this.updateMouseRay(e.clientX, e.clientY);
+            if (this.solver) {
+                const is2D = !!this.solver.is2D;
+                // In 2D mode: direct click interacts (Left = attract, Right = repel).
+                // In 2D mode: holding Shift switches to camera pan instead.
+                // In 3D mode: holding Shift engages fluid interaction; no shift orbits/pans.
+                const shouldInteract = is2D ? !this.isShiftHeld : this.isShiftHeld;
+
+                if (shouldInteract) {
+                    this.solver.mouseForceMode = (e.button === 0) ? 1 : -1;
+                    this.updateMouseRay(e.clientX, e.clientY);
+                } else {
+                    this.solver.mouseForceMode = 0;
+                }
             }
         });
 
@@ -749,8 +770,12 @@ class LiquidApp {
         });
 
         window.addEventListener('mousemove', (e) => {
-            if (this.isShiftHeld && this.solver) {
-                this.updateMouseRay(e.clientX, e.clientY);
+            if (this.solver) {
+                const is2D = !!this.solver.is2D;
+                const shouldInteract = is2D ? !this.isShiftHeld : this.isShiftHeld;
+                if (shouldInteract) {
+                    this.updateMouseRay(e.clientX, e.clientY);
+                }
             }
 
             if (!this.isPointerDown || !this.solver) return;
@@ -760,13 +785,17 @@ class LiquidApp {
             this.lastPointerX = e.clientX;
             this.lastPointerY = e.clientY;
 
-            if (this.isShiftHeld) return;
+            const is2D = !!this.solver.is2D;
 
-            if (this.solver.is2D) {
-                if (this.pointerButton === 0 || this.pointerButton === 2) {
+            if (is2D) {
+                // In 2D: Shift + Drag pans the camera; normal Drag interacts with liquid
+                if (this.isShiftHeld || this.pointerButton === 1) {
                     this.camera.pan(dx, dy);
                 }
             } else {
+                // In 3D: normal Drag orbits/pans; Shift + Drag interacts with liquid
+                if (this.isShiftHeld) return;
+
                 if (this.pointerButton === 0) {
                     this.camera.rotate(dx * 0.006, -dy * 0.006);
                 } else if (this.pointerButton === 1 || this.pointerButton === 2) {

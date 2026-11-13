@@ -89,18 +89,40 @@ final class InteractiveMTKView: MTKView {
     }
 
     private var lastSinglePt: CGPoint = .zero
+    private var singleTouchOrbitsCamera: Bool = false
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let engine = engine else { return }
         let allCount = event?.allTouches?.count ?? touches.count
         if allCount >= 2 {
             engine.cfg.activeTouchForceMode = 0
+            singleTouchOrbitsCamera = false
             return
         }
         guard let t = touches.first else { return }
         let loc = t.location(in: self)
         lastSinglePt = loc
-        applySingleTouch(loc: loc, prev: loc, engine: engine)
+
+        let w = Float(bounds.width)
+        let h = Float(bounds.height)
+        let tool = engine.cfg.touchTool
+        if tool == 0 || tool == 1 {
+            let hitBox = engine.camera.computeTouchRay(
+                xPx: Float(loc.x), yPx: Float(loc.y),
+                viewWidth: w, viewHeight: h,
+                is2D: engine.cfg.is2D, cfg: engine.cfg
+            )
+            if !engine.cfg.is2D && !hitBox {
+                singleTouchOrbitsCamera = true
+                engine.cfg.activeTouchForceMode = 0
+            } else {
+                singleTouchOrbitsCamera = false
+                engine.cfg.activeTouchForceMode = (tool == 0) ? 1 : -1
+            }
+        } else {
+            singleTouchOrbitsCamera = !engine.cfg.is2D
+            engine.cfg.activeTouchForceMode = 0
+        }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -108,6 +130,7 @@ final class InteractiveMTKView: MTKView {
         let allCount = event?.allTouches?.count ?? touches.count
         if allCount >= 2 {
             engine.cfg.activeTouchForceMode = 0
+            singleTouchOrbitsCamera = false
             return
         }
         guard let t = touches.first else { return }
@@ -118,13 +141,24 @@ final class InteractiveMTKView: MTKView {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         engine?.cfg.activeTouchForceMode = 0
+        singleTouchOrbitsCamera = false
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         engine?.cfg.activeTouchForceMode = 0
+        singleTouchOrbitsCamera = false
     }
 
     private func applySingleTouch(loc: CGPoint, prev: CGPoint, engine: MetalFluidEngine) {
+        if singleTouchOrbitsCamera {
+            engine.cfg.activeTouchForceMode = 0
+            let scale = Float(contentScaleFactor)
+            let dx = Float(loc.x - prev.x) * scale
+            let dy = Float(loc.y - prev.y) * scale
+            engine.camera.orbit(dYaw: -dx * 0.0045, dPitch: dy * 0.0045)
+            return
+        }
+
         let w = Float(bounds.width)
         let h = Float(bounds.height)
         let tool = engine.cfg.touchTool

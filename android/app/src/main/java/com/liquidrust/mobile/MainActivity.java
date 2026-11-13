@@ -3,6 +3,7 @@ package com.liquidrust.mobile;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.content.Context;
+import android.content.pm.ActivityInfo;
 import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Canvas;
@@ -509,6 +510,10 @@ public final class MainActivity extends Activity implements SensorEventListener,
         if (swTiltGravity != null && swTiltGravity.isChecked() != enabled) {
             swTiltGravity.setChecked(enabled, true);
         }
+        // Prevent auto-rotation into landscape/portrait while tilting phone in gyro mode
+        setRequestedOrientation(enabled
+            ? ActivityInfo.SCREEN_ORIENTATION_LOCKED
+            : ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
         updateSensorRegistration();
     }
 
@@ -1071,7 +1076,7 @@ public final class MainActivity extends Activity implements SensorEventListener,
         }
 
         TextView tvTexStr = new TextView(this);
-        addM3Slider(cardTex, "Pattern Depth", "0.28", tvTexStr, 0, 100, 28, val -> {
+        addM3Slider(cardTex, "Pattern Depth", "0.55", tvTexStr, 0, 100, 55, val -> {
             float v = val / 100.0f;
             cfg.texStrength = v;
             tvTexStr.setText(String.format(Locale.US, "%.2f", v));

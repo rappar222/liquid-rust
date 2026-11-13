@@ -33,6 +33,7 @@ public final class FluidSurfaceView extends GLSurfaceView {
     private float lastMidX = 0f;
     private float lastMidY = 0f;
     private boolean wasMultiTouch = false;
+    private boolean singleTouchOrbitsCamera = false;
 
     public FluidSurfaceView(Context context, SimulationConfig cfg, FluidRenderer.TelemetryListener listener) {
         super(context);
@@ -131,6 +132,7 @@ public final class FluidSurfaceView extends GLSurfaceView {
 
         if (pointerCount >= 2) {
             cfg.activeTouchForceMode = 0;
+            singleTouchOrbitsCamera = false;
             float mx = (event.getX(0) + event.getX(1)) * 0.5f;
             float my = (event.getY(0) + event.getY(1)) * 0.5f;
 
@@ -149,6 +151,7 @@ public final class FluidSurfaceView extends GLSurfaceView {
         if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
             cfg.activeTouchForceMode = 0;
             wasMultiTouch = false;
+            singleTouchOrbitsCamera = false;
             return true;
         }
 
@@ -157,6 +160,7 @@ public final class FluidSurfaceView extends GLSurfaceView {
             lastTouchX = event.getX(0);
             lastTouchY = event.getY(0);
             wasMultiTouch = false;
+            singleTouchOrbitsCamera = false;
             return true;
         }
 
@@ -166,13 +170,18 @@ public final class FluidSurfaceView extends GLSurfaceView {
         if (action == MotionEvent.ACTION_DOWN) {
             lastTouchX = x;
             lastTouchY = y;
-            if (cfg.touchTool == SimulationConfig.TOOL_ATTRACT) {
-                cfg.activeTouchForceMode = 1;
-                camera.computeTouchRay(x, y, cfg.is2D, cfg);
-            } else if (cfg.touchTool == SimulationConfig.TOOL_REPEL) {
-                cfg.activeTouchForceMode = -1;
-                camera.computeTouchRay(x, y, cfg.is2D, cfg);
+            if (cfg.touchTool == SimulationConfig.TOOL_ATTRACT || cfg.touchTool == SimulationConfig.TOOL_REPEL) {
+                boolean hitBox = camera.computeTouchRay(x, y, cfg.is2D, cfg);
+                if (!cfg.is2D && !hitBox) {
+                    // Starting swipe outside the 3D bounding box orbits the camera directly
+                    singleTouchOrbitsCamera = true;
+                    cfg.activeTouchForceMode = 0;
+                } else {
+                    singleTouchOrbitsCamera = false;
+                    cfg.activeTouchForceMode = (cfg.touchTool == SimulationConfig.TOOL_ATTRACT) ? 1 : -1;
+                }
             } else {
+                singleTouchOrbitsCamera = !cfg.is2D;
                 cfg.activeTouchForceMode = 0;
             }
         } else if (action == MotionEvent.ACTION_MOVE) {
@@ -181,7 +190,10 @@ public final class FluidSurfaceView extends GLSurfaceView {
             lastTouchX = x;
             lastTouchY = y;
 
-            if (cfg.touchTool == SimulationConfig.TOOL_ATTRACT) {
+            if (singleTouchOrbitsCamera) {
+                cfg.activeTouchForceMode = 0;
+                camera.orbit(-dx * 0.0065f, dy * 0.0065f);
+            } else if (cfg.touchTool == SimulationConfig.TOOL_ATTRACT) {
                 cfg.activeTouchForceMode = 1;
                 camera.computeTouchRay(x, y, cfg.is2D, cfg);
             } else if (cfg.touchTool == SimulationConfig.TOOL_REPEL) {

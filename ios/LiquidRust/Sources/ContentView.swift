@@ -30,6 +30,9 @@ struct ContentView: View {
             .animation(.spring(response: 0.34, dampingFraction: 0.80), value: showInspectorSheet)
         }
         .preferredColorScheme(.dark)
+        .onChange(of: cfg.tiltGravityEnabled) { enabled in
+            OrientationController.setLocked(enabled)
+        }
         .sheet(isPresented: $showInspectorSheet) {
             LiquidGlassInspectorSheet(cfg: cfg, selectedTab: $selectedSheetTab)
                 .presentationDetents([.fraction(0.54), .large])

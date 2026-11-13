@@ -639,7 +639,7 @@ inline float3 colormap_fire(float t) {
     return mix(c2, c3, (t - 0.72f) / 0.28f);
 }
 
-inline float4 shade_particle_core(ParticleVertOut in, float z, constant RenderUniforms& u) {
+inline float4 shade_particle_core(ParticleVertOut in, float z, constant RenderUniforms& u, bool is_3d_mode) {
     float radius = u.params.x;
     float tex_str = saturate(u.params.z);
     float t_anim = u.params.w;
@@ -650,36 +650,49 @@ inline float4 shade_particle_core(ParticleVertOut in, float z, constant RenderUn
     int tex_mode = u.modes.w;
 
     float3 n = float3(in.uv.x, in.uv.y, z);
-    float3 surf_pos = in.world_pos + n * radius;
+    float3 surf_pos = in.world_pos + n * (radius * 1.35f);
 
     float caustic_boost = 0.0f;
     float foam_tex = 0.0f;
-    float grid_mod = 1.0f;
+    float tex_shade = 1.0f;
 
     if (tex_mode != 0 && tex_str > 0.005f) {
         if (tex_mode == 1) {
-            float w1 = cos(surf_pos.x * 28.0f + surf_pos.y * 19.0f - t_anim * 3.8f);
-            float w2 = sin(surf_pos.z * 26.0f - surf_pos.x * 16.0f + t_anim * 3.1f);
-            n = normalize(n + float3(w1, w2, 0.0f) * (tex_str * 0.42f));
-            caustic_boost = max(w1 * w2, 0.0f) * tex_str * 0.20f;
+            // Capillary Ripples
+            float w1 = sin(surf_pos.x * 22.0f + surf_pos.y * 15.0f - t_anim * 4.2f);
+            float w2 = cos(surf_pos.z * 20.0f - surf_pos.x * 14.0f + surf_pos.y * 12.0f + t_anim * 3.4f);
+            float ripple = 0.5f * (w1 + w2);
+            n = normalize(n + float3(w1, w2, 0.0f) * (tex_str * 0.85f));
+            tex_shade = 1.0f + ripple * (0.45f * tex_str);
+            caustic_boost = pow(max(ripple, 0.0f), 1.8f) * (0.95f * tex_str);
         } else if (tex_mode == 2) {
-            float3 p = surf_pos * 18.0f;
-            float c1 = abs(sin(p.x + sin(p.y * 1.3f + t_anim * 2.4f)) * cos(p.y + cos(p.z * 1.4f - t_anim * 1.9f)));
-            float web = pow(1.0f - saturate(c1), 3.0f);
-            caustic_boost = web * tex_str * 0.85f;
-            n = normalize(n + float3(sin(p.x * 1.7f), cos(p.y * 1.7f), 0.0f) * (tex_str * 0.25f));
+            // Luminous Refractive Caustic Web
+            float3 p = surf_pos * 13.5f;
+            float c1 = abs(sin(p.x + sin(p.y * 1.4f + t_anim * 2.6f)) * cos(p.y + cos(p.z * 1.5f - t_anim * 2.1f)));
+            float web = pow(1.0f - saturate(c1), 2.4f);
+            tex_shade = 1.0f - tex_str * 0.42f;
+            caustic_boost = web * (1.35f * tex_str);
+            n = normalize(n + float3(sin(p.x * 1.9f), cos(p.y * 1.9f), 0.0f) * (tex_str * 0.45f));
         } else if (tex_mode == 3) {
-            float3 p = surf_pos * 24.0f + float3(t_anim * 1.5f, -t_anim * 0.8f, t_anim * 1.2f);
+            // Aerated Seafoam
+            float3 p = surf_pos * 19.0f + float3(t_anim * 1.8f, -t_anim * 0.9f, t_anim * 1.4f);
             float f = (sin(p.x) * cos(p.y) + sin(p.y * 1.7f + p.z) + cos(p.z * 2.3f - p.x)) * 0.333f + 0.5f;
-            foam_tex = saturate((f - 0.38f) * 2.6f) * tex_str * (0.28f + 0.72f * in.speed_t);
-            n = normalize(n + float3(f - 0.5f, (1.0f - f) - 0.5f, 0.0f) * (tex_str * 0.22f));
+            float cell = smoothstep(0.32f, 0.72f, f);
+            foam_tex = cell * saturate(tex_str * 1.35f) * (0.55f + 0.45f * in.speed_t);
+            n = normalize(n + float3(f - 0.5f, (1.0f - f) - 0.5f, 0.0f) * (tex_str * 0.40f));
         } else if (tex_mode == 4) {
-            float gx = abs(fract(surf_pos.x * 8.0f) - 0.5f);
-            float gy = abs(fract(surf_pos.y * 8.0f) - 0.5f);
-            float gz = abs(fract(surf_pos.z * 8.0f) - 0.5f);
-            float line_v = max(1.0f - min(gx, gy) * 14.0f, 1.0f - gz * 14.0f);
-            caustic_boost = saturate(line_v) * tex_str * 0.45f;
-            grid_mod = 1.0f - tex_str * 0.14f;
+            // Spatial Lagrangian Grid
+            float freq = 5.5f;
+            float gx = abs(fract(surf_pos.x * freq) - 0.5f);
+            float gy = abs(fract(surf_pos.y * freq) - 0.5f);
+            float line_xy = max(smoothstep(0.42f, 0.49f, gx), smoothstep(0.42f, 0.49f, gy));
+            if (is_3d_mode) {
+                float gz = abs(fract(surf_pos.z * freq) - 0.5f);
+                line_xy = max(line_xy, smoothstep(0.42f, 0.49f, gz));
+            }
+            float checker = float((int(floor(surf_pos.x * freq)) + int(floor(surf_pos.y * freq))) & 1);
+            tex_shade = 1.0f - tex_str * (0.28f + 0.22f * checker);
+            caustic_boost = line_xy * (1.25f * tex_str);
         }
     }
 
@@ -701,9 +714,10 @@ inline float4 shade_particle_core(ParticleVertOut in, float z, constant RenderUn
         else base_color = colormap_ocean(in.metric_t);
     }
 
-    base_color = base_color * grid_mod + mix(shallow_col, float3(0.96f, 0.99f, 1.0f), 0.35f) * caustic_boost;
+    float3 boost_col = mix(shallow_col, float3(0.96f, 0.99f, 1.0f), 0.55f) * caustic_boost;
+    base_color = base_color * tex_shade + boost_col;
     if (foam_tex > 0.005f) {
-        base_color = mix(base_color, float3(0.95f, 0.98f, 1.0f), clamp(foam_tex, 0.0f, 0.85f));
+        base_color = mix(base_color, float3(0.96f, 0.99f, 1.0f), clamp(foam_tex, 0.0f, 0.90f));
     }
 
     float3 rgb = base_color;
@@ -735,7 +749,8 @@ inline float4 shade_particle_core(ParticleVertOut in, float z, constant RenderUn
 
         rgb = mix(body_lit, sky_env * mix(float3(1.0f), base_color, metallic), clamp(fresnel * (0.75f + 0.25f * metallic), 0.0f, 0.96f))
             + spec
-            + sss_tint;
+            + sss_tint
+            + boost_col * 0.45f;
     }
 
     return float4(saturate(rgb), 1.0f);
@@ -751,7 +766,7 @@ fragment float4 particle_frag_2d(
         discard_fragment();
     }
     float z = sqrt(max(1.0f - r2, 0.0f));
-    return shade_particle_core(in, z, u);
+    return shade_particle_core(in, z, u, false);
 }
 
 struct Frag3DOut {
@@ -771,7 +786,7 @@ fragment Frag3DOut particle_frag_3d(
     float z = sqrt(max(1.0f - r2, 0.0f));
 
     Frag3DOut out;
-    out.color = shade_particle_core(in, z, u);
+    out.color = shade_particle_core(in, z, u, true);
 
     float radius = u.params.x;
     float3 sphere_eye = in.pos_eye + float3(in.uv * radius, z * radius);

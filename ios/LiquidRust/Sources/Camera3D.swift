@@ -115,7 +115,8 @@ final class Camera3D {
         viewProjMatrix = projMatrix * viewMatrix
     }
 
-    func computeTouchRay(xPx: Float, yPx: Float, viewWidth: Float, viewHeight: Float, is2D: Bool, cfg: SimulationConfig) {
+    @discardableResult
+    func computeTouchRay(xPx: Float, yPx: Float, viewWidth: Float, viewHeight: Float, is2D: Bool, cfg: SimulationConfig) -> Bool {
         updateMatrices(is2D: is2D)
         let invVP = viewProjMatrix.inverse
 
@@ -134,10 +135,37 @@ final class Camera3D {
 
         let dir = pFar - pNear
         let len = simd_length(dir)
-        if len > 1e-6 {
-            cfg.rayOrig = pNear
-            cfg.rayDir = dir / len
+        guard len > 1e-6 else { return false }
+
+        let ndir = dir / len
+        cfg.rayOrig = pNear
+        cfg.rayDir = ndir
+
+        return Self.rayIntersectsAABB(orig: pNear, dir: ndir, bMin: boundMin, bMax: boundMax)
+    }
+
+    private static func rayIntersectsAABB(orig: SIMD3<Float>, dir: SIMD3<Float>, bMin: SIMD3<Float>, bMax: SIMD3<Float>) -> Bool {
+        var tMin: Float = 0.0
+        var tMax: Float = 1e6
+
+        for i in 0..<3 {
+            let o = orig[i]
+            let d = dir[i]
+            let mn = bMin[i]
+            let mx = bMax[i]
+            if abs(d) < 1e-6 {
+                if o < mn || o > mx { return false }
+            } else {
+                let inv = 1.0 / d
+                var t1 = (mn - o) * inv
+                var t2 = (mx - o) * inv
+                if t1 > t2 { swap(&t1, &t2) }
+                tMin = max(tMin, t1)
+                tMax = min(tMax, t2)
+                if tMin > tMax { return false }
+            }
         }
+        return tMax >= max(tMin, 0.0)
     }
 
     // Metal right-handed [0, 1] clip-space perspective matrix

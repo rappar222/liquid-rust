@@ -143,11 +143,12 @@ public final class Camera3D {
 
     /**
      * Unprojects screen touch coordinates (xPx, yPx) into SimulationConfig's world ray without allocations.
+     * Returns true if the cast ray intersects the simulation chamber bounding box.
      */
-    public synchronized void computeTouchRay(float xPx, float yPx, boolean is2D, SimulationConfig cfg) {
+    public synchronized boolean computeTouchRay(float xPx, float yPx, boolean is2D, SimulationConfig cfg) {
         updateMatrices(is2D);
         if (!Matrix.invertM(invViewProj, 0, viewProjMatrix, 0)) {
-            return;
+            return false;
         }
 
         float ndcX = (xPx / (float) viewportWidth) * 2.0f - 1.0f;
@@ -171,14 +172,70 @@ public final class Camera3D {
         float dz = outFar[2] * invWf - oz;
 
         float len = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (len > 1e-6f) {
-            float invL = 1.0f / len;
-            cfg.rayOrigX = ox;
-            cfg.rayOrigY = oy;
-            cfg.rayOrigZ = oz;
-            cfg.rayDirX = dx * invL;
-            cfg.rayDirY = dy * invL;
-            cfg.rayDirZ = dz * invL;
+        if (len <= 1e-6f) {
+            return false;
         }
+
+        float invL = 1.0f / len;
+        float ndx = dx * invL;
+        float ndy = dy * invL;
+        float ndz = dz * invL;
+
+        cfg.rayOrigX = ox;
+        cfg.rayOrigY = oy;
+        cfg.rayOrigZ = oz;
+        cfg.rayDirX = ndx;
+        cfg.rayDirY = ndy;
+        cfg.rayDirZ = ndz;
+
+        return rayIntersectsAABB(ox, oy, oz, ndx, ndy, ndz,
+            boundMinX, boundMaxX, boundMinY, boundMaxY, boundMinZ, boundMaxZ);
+    }
+
+    private static boolean rayIntersectsAABB(float ox, float oy, float oz,
+                                             float dx, float dy, float dz,
+                                             float minX, float maxX,
+                                             float minY, float maxY,
+                                             float minZ, float maxZ) {
+        float tMin = 0.0f;
+        float tMax = 1e6f;
+
+        if (Math.abs(dx) < 1e-6f) {
+            if (ox < minX || ox > maxX) return false;
+        } else {
+            float inv = 1.0f / dx;
+            float t1 = (minX - ox) * inv;
+            float t2 = (maxX - ox) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            tMin = Math.max(tMin, t1);
+            tMax = Math.min(tMax, t2);
+            if (tMin > tMax) return false;
+        }
+
+        if (Math.abs(dy) < 1e-6f) {
+            if (oy < minY || oy > maxY) return false;
+        } else {
+            float inv = 1.0f / dy;
+            float t1 = (minY - oy) * inv;
+            float t2 = (maxY - oy) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            tMin = Math.max(tMin, t1);
+            tMax = Math.min(tMax, t2);
+            if (tMin > tMax) return false;
+        }
+
+        if (Math.abs(dz) < 1e-6f) {
+            if (oz < minZ || oz > maxZ) return false;
+        } else {
+            float inv = 1.0f / dz;
+            float t1 = (minZ - oz) * inv;
+            float t2 = (maxZ - oz) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            tMin = Math.max(tMin, t1);
+            tMax = Math.min(tMax, t2);
+            if (tMin > tMax) return false;
+        }
+
+        return tMax >= Math.max(tMin, 0.0f);
     }
 }

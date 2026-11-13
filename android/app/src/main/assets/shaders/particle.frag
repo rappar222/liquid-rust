@@ -88,39 +88,51 @@ void main() {
     gl_FragDepth = clamp(((clip_pos.z / clip_pos.w) + 1.0) * 0.5, 0.0, 1.0);
 #endif
 
-    vec3 surf_pos = v_world_pos + n * u_radius;
+    vec3 surf_pos = v_world_pos + n * (u_radius * 1.35);
     float tex_str = clamp(u_tex_strength, 0.0, 1.0);
     float t_anim = u_anim_time;
 
     float caustic_boost = 0.0;
+    float tex_shade = 1.0;
     float foam_tex = 0.0;
-    float grid_mod = 1.0;
 
     if (u_tex_mode != 0 && tex_str > 0.005) {
         if (u_tex_mode == 1) {
-            float w1 = cos(surf_pos.x * 28.0 + surf_pos.y * 19.0 - t_anim * 3.8);
-            float w2 = sin(surf_pos.z * 26.0 - surf_pos.x * 16.0 + t_anim * 3.1);
-            n = normalize(n + vec3(w1, w2, 0.0) * (tex_str * 0.42));
-            caustic_boost = max(w1 * w2, 0.0) * tex_str * 0.20;
+            // Capillary Ripples: animated multi-wave crests & troughs
+            float w1 = sin(surf_pos.x * 22.0 + surf_pos.y * 15.0 - t_anim * 4.2);
+            float w2 = cos(surf_pos.z * 20.0 - surf_pos.x * 14.0 + surf_pos.y * 12.0 + t_anim * 3.4);
+            float ripple = 0.5 * (w1 + w2);
+            n = normalize(n + vec3(w1, w2, 0.0) * (tex_str * 0.85));
+            tex_shade = 1.0 + ripple * (0.45 * tex_str);
+            caustic_boost = pow(max(ripple, 0.0), 1.8) * (0.95 * tex_str);
         } else if (u_tex_mode == 2) {
-            vec3 p = surf_pos * 18.0;
-            float c1 = abs(sin(p.x + sin(p.y * 1.3 + t_anim * 2.4)) * cos(p.y + cos(p.z * 1.4 - t_anim * 1.9)));
-            float web = pow(1.0 - clamp(c1, 0.0, 1.0), 3.0);
-            caustic_boost = web * tex_str * 0.85;
-            n = normalize(n + vec3(sin(p.x * 1.7), cos(p.y * 1.7), 0.0) * (tex_str * 0.25));
+            // Luminous Refractive Caustic Web
+            vec3 p = surf_pos * 13.5;
+            float c1 = abs(sin(p.x + sin(p.y * 1.4 + t_anim * 2.6)) * cos(p.y + cos(p.z * 1.5 - t_anim * 2.1)));
+            float web = pow(1.0 - clamp(c1, 0.0, 1.0), 2.4);
+            tex_shade = 1.0 - tex_str * 0.42;
+            caustic_boost = web * (1.35 * tex_str);
+            n = normalize(n + vec3(sin(p.x * 1.9), cos(p.y * 1.9), 0.0) * (tex_str * 0.45));
         } else if (u_tex_mode == 3) {
-            vec3 p = surf_pos * 24.0 + vec3(t_anim * 1.5, -t_anim * 0.8, t_anim * 1.2);
+            // Aerated Seafoam: cellular white foam patches visible across liquid
+            vec3 p = surf_pos * 19.0 + vec3(t_anim * 1.8, -t_anim * 0.9, t_anim * 1.4);
             float f = (sin(p.x) * cos(p.y) + sin(p.y * 1.7 + p.z) + cos(p.z * 2.3 - p.x)) * 0.333 + 0.5;
-            foam_tex = clamp((f - 0.38) * 2.6, 0.0, 1.0) * tex_str * (0.28 + 0.72 * v_speed_t);
-            n = normalize(n + vec3(f - 0.5, (1.0 - f) - 0.5, 0.0) * (tex_str * 0.22));
+            float cell = smoothstep(0.32, 0.72, f);
+            foam_tex = cell * clamp(tex_str * 1.35, 0.0, 1.0) * (0.55 + 0.45 * v_speed_t);
+            n = normalize(n + vec3(f - 0.5, (1.0 - f) - 0.5, 0.0) * (tex_str * 0.40));
         } else if (u_tex_mode == 4) {
-            float gx = abs(fract(surf_pos.x * 8.0) - 0.5);
-            float gy = abs(fract(surf_pos.y * 8.0) - 0.5);
-            float gz = abs(fract(surf_pos.z * 8.0) - 0.5);
-            float line = max(1.0 - min(gx, gy) * 14.0, 1.0 - gz * 14.0);
-            float line_c = clamp(line, 0.0, 1.0) * tex_str;
-            grid_mod = 1.0 - tex_str * 0.14;
-            caustic_boost = line_c * 0.45;
+            // High-Contrast Spatial Lagrangian Grid (advects cleanly in 2D & 3D)
+            float freq = 5.5;
+            float gx = abs(fract(surf_pos.x * freq) - 0.5);
+            float gy = abs(fract(surf_pos.y * freq) - 0.5);
+            float line_xy = max(smoothstep(0.42, 0.49, gx), smoothstep(0.42, 0.49, gy));
+#ifdef MODE_3D
+            float gz = abs(fract(surf_pos.z * freq) - 0.5);
+            line_xy = max(line_xy, smoothstep(0.42, 0.49, gz));
+#endif
+            float checker = mod(floor(surf_pos.x * freq) + floor(surf_pos.y * freq), 2.0);
+            tex_shade = 1.0 - tex_str * (0.28 + 0.22 * checker);
+            caustic_boost = line_xy * (1.25 * tex_str);
         }
     }
 
@@ -139,9 +151,10 @@ void main() {
         else base_color = colormap_ocean(v_metric_t);
     }
 
-    base_color = base_color * grid_mod + mix(u_shallow_color, vec3(0.96, 0.99, 1.0), 0.35) * caustic_boost;
+    vec3 boost_col = mix(u_shallow_color, vec3(0.96, 0.99, 1.0), 0.55) * caustic_boost;
+    base_color = base_color * tex_shade + boost_col;
     if (foam_tex > 0.005) {
-        base_color = mix(base_color, vec3(0.95, 0.98, 1.0), clamp(foam_tex, 0.0, 0.85));
+        base_color = mix(base_color, vec3(0.96, 0.99, 1.0), clamp(foam_tex, 0.0, 0.90));
     }
 
     vec3 rgb = base_color;
@@ -172,7 +185,8 @@ void main() {
 
         rgb = mix(body_lit, sky_env * mix(vec3(1.0), base_color, metallic), clamp(fresnel * (0.75 + 0.25 * metallic), 0.0, 0.96))
             + spec
-            + sss_tint;
+            + sss_tint
+            + boost_col * 0.45;
     }
 
     fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);

@@ -126,7 +126,7 @@ public final class SimulationConfig {
     public volatile float shallowR = 0.22f, shallowG = 0.74f, shallowB = 0.97f;
     public volatile float deepR = 0.05f, deepG = 0.23f, deepB = 0.54f;
     public volatile int texMode = 1;   // 0: None, 1: Ripples, 2: Caustics, 3: Foam, 4: Grid
-    public volatile float texStrength = 0.28f;
+    public volatile float texStrength = 0.55f;
     public volatile float foamAmount = 0.35f;
     public volatile float ior = 1.333f;
     public volatile float roughness = 0.045f;

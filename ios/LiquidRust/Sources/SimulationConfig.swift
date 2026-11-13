@@ -104,7 +104,7 @@ final class SimulationConfig: ObservableObject {
     @Published var colorMap: Int = 0  // 0: Ocean, 1: Turbo, 2: Viridis, 3: Magma
     @Published var litSpheres: Bool = true
     @Published var texMode: Int = 1   // 0: Smooth, 1: Ripples, 2: Caustics, 3: Foam, 4: Grid
-    @Published var texStrength: Float = 0.28
+    @Published var texStrength: Float = 0.55
     @Published var foamAmount: Float = 0.35
     @Published var ior: Float = 1.333
     @Published var roughness: Float = 0.045

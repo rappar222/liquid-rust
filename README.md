@@ -11,6 +11,7 @@ This is a standalone web version of LiquidRust designed to run in modern browser
 Deploy on any server with Docker and Docker Compose installed:
 
 ```bash
+cd web
 docker compose up -d
 ```
 
@@ -35,6 +36,7 @@ docker compose down
 You can serve the static files with any local HTTP server:
 
 ```bash
+cd web
 
 # Python 3
 python3 -m http.server 8080

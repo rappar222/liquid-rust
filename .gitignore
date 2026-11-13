@@ -1,9 +1,4 @@
-/target
-Cargo.lock
-exports/
-*.ply
-*.mp4
-/dist/
-/*.tar.gz
 .DS_Store
-renders/
+node_modules/
+.env
+*.log

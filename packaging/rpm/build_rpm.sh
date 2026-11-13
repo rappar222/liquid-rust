@@ -39,11 +39,8 @@ case "$ARCH" in
         ;;
 esac
 
-BIN_SRC="$ROOT_DIR/target/${TARGET}/release/liquid-rust"
-if [ ! -f "$BIN_SRC" ]; then
-    echo "Binary not found at $BIN_SRC. Compiling with cargo-zigbuild..."
-    cargo zigbuild --release --target "${TARGET}.2.17"
-fi
+echo "Compiling ${TARGET} (glibc 2.17) with cargo-zigbuild..."
+cargo zigbuild --release --target "${TARGET}.2.17"
 
 RPM_FILE="$ROOT_DIR/dist/liquid-rust-${VERSION}-1.${RPM_ARCH}.rpm"
 

@@ -116,6 +116,8 @@ pub struct LiquidApp {
     pub status_message: String,
     pub show_extreme_modal: bool,
     pub obj_file_path: String,
+    pub obj_browse_pending: Arc<AtomicBool>,
+    pub obj_browse_result: Arc<Mutex<Option<String>>>,
     pub next_collider_id: u32,
     pub next_faucet_id: u32,
     pub next_drain_id: u32,
@@ -260,6 +262,8 @@ impl LiquidApp {
             status_message: "Ready".to_string(),
             show_extreme_modal: false,
             obj_file_path: "model.obj".to_string(),
+            obj_browse_pending: Arc::new(AtomicBool::new(false)),
+            obj_browse_result: Arc::new(Mutex::new(None)),
             next_collider_id: 1,
             next_faucet_id: 1,
             next_drain_id: 1,
@@ -1376,21 +1380,42 @@ impl LiquidApp {
                     }
                 });
 
+                // Consume any file chosen from the async native OBJ browser dialog
+                let picked_obj = self
+                    .obj_browse_result
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take());
+                if let Some(picked_path) = picked_obj {
+                    self.obj_file_path = picked_path.clone();
+                    self.load_obj_obstacle(&picked_path);
+                }
+
                 ui.horizontal(|ui| {
                     ui.label("OBJ:");
-                    ui.text_edit_singleline(&mut self.obj_file_path);
-                    if ui.button("Load").clicked() {
+                    let text_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.obj_file_path).desired_width(126.0),
+                    );
+                    let enter_pressed =
+                        text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                    let browsing = self.obj_browse_pending.load(Ordering::Relaxed);
+                    if ui
+                        .add_enabled(!browsing, egui::Button::new("📁 Browse…"))
+                        .on_hover_text("Browse your computer for a Wavefront .OBJ 3D mesh")
+                        .clicked()
+                    {
+                        self.spawn_obj_file_browser(ui.ctx().clone());
+                    }
+
+                    if ui
+                        .button("Load")
+                        .on_hover_text("Load .OBJ mesh obstacle into the chamber")
+                        .clicked()
+                        || enter_pressed
+                    {
                         let path = self.obj_file_path.trim().to_string();
-                        match Collider::load_obj(&path, Vec3::new(0.0, 0.5, 0.0), 0.4) {
-                            Ok(mut col) => {
-                                let id = self.next_collider_id;
-                                self.next_collider_id += 1;
-                                col.id = id;
-                                self.status_message = format!("Loaded OBJ: {}", path);
-                                self.solver.colliders.push(col);
-                            }
-                            Err(e) => self.status_message = format!("OBJ error: {}", e),
-                        }
+                        self.load_obj_obstacle(&path);
                     }
                 });
 
@@ -2838,6 +2863,67 @@ impl eframe::App for LiquidApp {
 }
 
 impl LiquidApp {
+    fn load_obj_obstacle(&mut self, path: &str) {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            self.status_message = "OBJ error: file path is empty".to_string();
+            return;
+        }
+        match Collider::load_obj(trimmed, Vec3::new(0.0, 0.5, 0.0), 0.4) {
+            Ok(mut col) => {
+                let id = self.next_collider_id;
+                self.next_collider_id += 1;
+                col.id = id;
+                let file_label = std::path::Path::new(trimmed)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(trimmed);
+                col.name = format!("OBJ #{} ({})", id, file_label);
+                self.status_message = format!("Loaded OBJ: {}", trimmed);
+                self.solver.colliders.push(col);
+            }
+            Err(e) => {
+                self.status_message = format!("OBJ error: {}", e);
+            }
+        }
+    }
+
+    fn spawn_obj_file_browser(&self, ctx: egui::Context) {
+        if self.obj_browse_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pending = Arc::clone(&self.obj_browse_pending);
+        let result_slot = Arc::clone(&self.obj_browse_result);
+        let initial_hint = self.obj_file_path.trim().to_string();
+
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Select Wavefront .OBJ Obstacle Mesh")
+                .add_filter("Wavefront OBJ Mesh (*.obj)", &["obj", "OBJ"])
+                .add_filter("All Files", &["*"]);
+
+            let hint_path = std::path::Path::new(&initial_hint);
+            if let Some(parent) = hint_path.parent() {
+                if !parent.as_os_str().is_empty() && parent.is_dir() {
+                    dialog = dialog.set_directory(parent);
+                } else if let Ok(cwd) = std::env::current_dir() {
+                    dialog = dialog.set_directory(cwd);
+                }
+            } else if let Ok(cwd) = std::env::current_dir() {
+                dialog = dialog.set_directory(cwd);
+            }
+
+            if let Some(chosen) = dialog.pick_file() {
+                if let Ok(mut guard) = result_slot.lock() {
+                    *guard = Some(chosen.to_string_lossy().into_owned());
+                }
+            }
+
+            pending.store(false, Ordering::SeqCst);
+            ctx.request_repaint();
+        });
+    }
+
     fn draw_updater_modal(&mut self, ctx: &egui::Context) {
         let snap = self.updater.snapshot();
 

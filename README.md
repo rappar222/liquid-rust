@@ -103,8 +103,8 @@ sudo apt install liquid-rust
 
 #### Option 2: Download `.deb` Package
 ```bash
-curl -LO https://github.com/rappar222/liquid-rust/releases/latest/download/liquid-rust_0.3.2_amd64.deb
-sudo apt install ./liquid-rust_0.3.2_amd64.deb
+curl -LO https://github.com/rappar222/liquid-rust/releases/latest/download/liquid-rust_0.3.3_amd64.deb
+sudo apt install ./liquid-rust_0.3.3_amd64.deb
 ```
 
 ---

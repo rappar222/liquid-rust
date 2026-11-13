@@ -699,7 +699,8 @@ fn install_elevated_or_user_fallback(bin: &[u8], target_exe: &Path) -> Result<Pa
         }
     }
 
-    // 2. Native desktop Polkit authentication (`pkexec`) for GUI updates of `/bin/liquid-rust`
+    // 2. Native desktop Polkit authentication (`pkexec`) for GUI updates of `/bin/liquid-rust` on Linux
+    #[cfg(not(target_os = "macos"))]
     if let Ok(status) = Command::new("pkexec")
         .arg("sh")
         .arg("-c")
@@ -712,6 +713,32 @@ fn install_elevated_or_user_fallback(bin: &[u8], target_exe: &Path) -> Result<Pa
         if status.success() {
             let _ = fs::remove_file(&stage_path);
             return Ok(target_exe.to_path_buf());
+        }
+    }
+
+    // 2b. Native macOS GUI authentication (`osascript` Touch ID / Admin prompt) for `/usr/local/bin/liquid-rust`
+    #[cfg(target_os = "macos")]
+    {
+        let esc = |s: &str| s.replace('\'', "'\\''");
+        let stage_s = esc(&stage_path.to_string_lossy());
+        let target_s = esc(&target_exe.to_string_lossy());
+        let shell_cmd = format!(
+            "install -m 0755 '{}' '{}.new' && mv -f '{}.new' '{}'",
+            stage_s, target_s, target_s, target_s
+        );
+        let osa_expr = format!(
+            "do shell script \"{}\" with administrator privileges",
+            shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        if let Ok(status) = Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(&osa_expr)
+            .status()
+        {
+            if status.success() {
+                let _ = fs::remove_file(&stage_path);
+                return Ok(target_exe.to_path_buf());
+            }
         }
     }
 

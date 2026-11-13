@@ -3,11 +3,10 @@ name: Build iOS IPA
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ ios ]
     paths:
-      - 'ios/LiquidRust/**'
-      - 'ios/project.yml'
-      - '.github/workflows/build-ios.yml'
+      - 'LiquidRust/**'
+      - 'project.yml'
 
 jobs:
   build-ipa:
@@ -23,7 +22,6 @@ jobs:
           fi
 
       - name: Generate Xcode Project & Build Release arm64 App
-        working-directory: ios
         run: |
           xcodegen generate
           xcodebuild \
@@ -41,7 +39,6 @@ jobs:
             build
 
       - name: Ad-Hoc Pseudo-Sign & Package Payload into liquid-rust-ios.ipa
-        working-directory: ios
         run: |
           APP_DIR="build/Build/Products/Release-iphoneos/LiquidRust.app"
           codesign --force --deep --sign - "$APP_DIR"
@@ -56,6 +53,6 @@ jobs:
         with:
           name: liquid-rust-ios-bundle
           path: |
-            ios/dist/liquid-rust-ios.ipa
-            ios/LiquidRust.xcodeproj/**
+            dist/liquid-rust-ios.ipa
+            LiquidRust.xcodeproj/**
           if-no-files-found: error

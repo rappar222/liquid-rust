@@ -1,9 +1,5 @@
-/target
-Cargo.lock
-exports/
-*.ply
-*.mp4
-/dist/
-/*.tar.gz
+build/
+DerivedData/
+*.xcuserdata
 .DS_Store
-renders/
+Payload/

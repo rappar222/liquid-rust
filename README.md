@@ -35,6 +35,7 @@ docker compose down
 You can serve the static files with any local HTTP server:
 
 ```bash
+
 # Python 3
 python3 -m http.server 8080
 
@@ -51,18 +52,17 @@ Then open `http://localhost:8080` in Chrome, Firefox, Safari, or Edge.
 ### Camera Controls
 | Action | Mouse | Touch |
 |---|---|---|
-| **3D Rotate / Orbit** | Left Click + Drag (3D Mode) | Single Finger Drag (3D Orbit) |
-| **Pan / Move** | `Shift` + Drag (2D Mode) / Middle or Right Drag (3D Mode) | Two Finger Drag |
+| **Rotate / Orbit (3D)** | Right Click + Drag | Single Finger Drag |
+| **Pan / Move** | Middle Click + Drag | Two Finger Drag |
 | **Zoom** | Mouse Scroll Wheel | Pinch to Zoom |
 | **2D / 3D Switch** | Click **2D Mode** toggle | Tap **2D Mode** toggle |
 
 ### Fluid & Physics Interactions
 | Action | Key / Gesture | Description |
 |---|---|---|
-| **2D Attract / Pull Fluid** | Left Click & Drag | Directly pulls particles towards the cursor in 2D mode |
-| **2D Repel / Push Fluid** | Right Click (or `Ctrl` + Click) & Drag | Directly pushes particles away from the cursor in 2D mode |
-| **3D Attract / Repel Fluid** | `Shift` + Left / Right Drag | Pulls or pushes particles in 3D mode |
-| **Drag Sphere Obstacle** | Left Click & Drag on Sphere | Moves the dynamic collision sphere around the container |
+| **Attract / Pull Fluid** | Left Click & Drag | Pulls particles towards the cursor in 2D & 3D |
+| **Repel / Push Fluid** | `Shift` + Left Click & Drag | Pushes particles away from the cursor in 2D & 3D |
+| **Drag Sphere Obstacle** | Obstacle Sliders | Moves the dynamic collision sphere around the container |
 | **ASMR Slow-Mo** | Time Speed Slider | Slows simulation down to 0.05x for ultra-smooth fluid splash visualization |
 
 ---

@@ -721,8 +721,8 @@ class LiquidApp {
         window.addEventListener('keydown', (e) => {
             if (e.key === 'Shift') {
                 this.isShiftHeld = true;
-                if (this.solver && this.solver.is2D) {
-                    this.solver.mouseForceMode = 0;
+                if (this.solver && this.isPointerDown && this.pointerButton === 0) {
+                    this.solver.mouseForceMode = -1;
                 }
             }
         });
@@ -730,12 +730,8 @@ class LiquidApp {
         window.addEventListener('keyup', (e) => {
             if (e.key === 'Shift') {
                 this.isShiftHeld = false;
-                if (this.solver) {
-                    if (this.solver.is2D && this.isPointerDown) {
-                        this.solver.mouseForceMode = (this.pointerButton === 0) ? 1 : -1;
-                    } else {
-                        this.solver.mouseForceMode = 0;
-                    }
+                if (this.solver && this.isPointerDown && this.pointerButton === 0) {
+                    this.solver.mouseForceMode = 1;
                 }
             }
         });
@@ -743,20 +739,19 @@ class LiquidApp {
         this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
         this.canvas.addEventListener('mousedown', (e) => {
+            if (e.button === 1) {
+                e.preventDefault(); // Prevent middle-click browser auto-scroll
+            }
             this.isPointerDown = true;
             this.pointerButton = e.button;
+            this.isShiftHeld = !!e.shiftKey;
             this.lastPointerX = e.clientX;
             this.lastPointerY = e.clientY;
 
             if (this.solver) {
-                const is2D = !!this.solver.is2D;
-                // In 2D mode: direct click interacts (Left = attract, Right = repel).
-                // In 2D mode: holding Shift switches to camera pan instead.
-                // In 3D mode: holding Shift engages fluid interaction; no shift orbits/pans.
-                const shouldInteract = is2D ? !this.isShiftHeld : this.isShiftHeld;
-
-                if (shouldInteract) {
-                    this.solver.mouseForceMode = (e.button === 0) ? 1 : -1;
+                // Left Drag = Attract (1), Shift + Left Drag = Repel (-1)
+                if (e.button === 0) {
+                    this.solver.mouseForceMode = this.isShiftHeld ? -1 : 1;
                     this.updateMouseRay(e.clientX, e.clientY);
                 } else {
                     this.solver.mouseForceMode = 0;
@@ -770,13 +765,7 @@ class LiquidApp {
         });
 
         window.addEventListener('mousemove', (e) => {
-            if (this.solver) {
-                const is2D = !!this.solver.is2D;
-                const shouldInteract = is2D ? !this.isShiftHeld : this.isShiftHeld;
-                if (shouldInteract) {
-                    this.updateMouseRay(e.clientX, e.clientY);
-                }
-            }
+            this.isShiftHeld = !!e.shiftKey;
 
             if (!this.isPointerDown || !this.solver) return;
 
@@ -785,22 +774,15 @@ class LiquidApp {
             this.lastPointerX = e.clientX;
             this.lastPointerY = e.clientY;
 
-            const is2D = !!this.solver.is2D;
-
-            if (is2D) {
-                // In 2D: Shift + Drag pans the camera; normal Drag interacts with liquid
-                if (this.isShiftHeld || this.pointerButton === 1) {
-                    this.camera.pan(dx, dy);
-                }
-            } else {
-                // In 3D: normal Drag orbits/pans; Shift + Drag interacts with liquid
-                if (this.isShiftHeld) return;
-
-                if (this.pointerButton === 0) {
-                    this.camera.rotate(dx * 0.006, -dy * 0.006);
-                } else if (this.pointerButton === 1 || this.pointerButton === 2) {
-                    this.camera.pan(dx, dy);
-                }
+            if (this.pointerButton === 0) {
+                this.solver.mouseForceMode = this.isShiftHeld ? -1 : 1;
+                this.updateMouseRay(e.clientX, e.clientY);
+            } else if (this.pointerButton === 1) {
+                // Middle-Click Drag: always pan camera
+                this.camera.pan(dx, dy);
+            } else if (this.pointerButton === 2 && !this.solver.is2D) {
+                // Right-Click Drag: orbit 3D camera
+                this.camera.rotate(dx * 0.006, -dy * 0.006);
             }
         });
 

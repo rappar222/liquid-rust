@@ -20,7 +20,7 @@ adb install -r dist/liquid-rust-android.apk
 ./build_apk.sh
 ```
 
-You can also open this repository root directly in **Android Studio**.
+You can also open this `android/` directory directly in **Android Studio**.
 
 ---
 

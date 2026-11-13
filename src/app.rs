@@ -10,6 +10,10 @@ use crate::sph::solver::{
     compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver,
 };
 use crate::sph::{ChamberShape, Collider, ColliderShape, CubeFace, Drain, Faucet, FaucetShape};
+use crate::updater::{
+    cleanup_old_binary, format_bytes, restart_into_updated_binary, UpdatePhase, UpdaterHandle,
+    CURRENT_VERSION,
+};
 use eframe::egui;
 use glam::Vec3;
 use glow::HasContext as _;
@@ -126,10 +130,14 @@ pub struct LiquidApp {
     // Background MP4 render worker state
     pub bg_render: Arc<Mutex<BgRenderState>>,
     pub bg_render_cancel: Arc<AtomicBool>,
+
+    // GitHub Release self-updater state
+    pub updater: UpdaterHandle,
 }
 
 impl LiquidApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cleanup_old_binary();
         Self::apply_studio_theme(&cc.egui_ctx);
 
         let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
@@ -173,6 +181,8 @@ impl LiquidApp {
             true,
         );
         app.theme_applied = true;
+        app.updater
+            .spawn_check(Some(cc.egui_ctx.clone()), false);
         app
     }
 
@@ -268,6 +278,7 @@ impl LiquidApp {
                 finished_message: None,
             })),
             bg_render_cancel: Arc::new(AtomicBool::new(false)),
+            updater: UpdaterHandle::new(),
         }
     }
 
@@ -2200,6 +2211,67 @@ impl eframe::App for LiquidApp {
                             .color(egui::Color32::from_rgb(235, 244, 255)),
                     );
 
+                    // Version pill / Update badge right next to app title
+                    let upd_snap = self.updater.snapshot();
+                    match &upd_snap.phase {
+                        UpdatePhase::UpdateAvailable(info) => {
+                            let upd_btn = egui::Button::new(
+                                egui::RichText::new(format!("⬆ Update {}", info.tag_name))
+                                    .strong()
+                                    .size(11.5)
+                                    .color(egui::Color32::from_rgb(10, 24, 18)),
+                            )
+                            .fill(egui::Color32::from_rgb(74, 222, 128));
+                            if ui
+                                .add(upd_btn)
+                                .on_hover_text(format!(
+                                    "New release {} is available on GitHub! Click to update & restart.",
+                                    info.tag_name
+                                ))
+                                .clicked()
+                            {
+                                self.updater.open_modal();
+                            }
+                        }
+                        UpdatePhase::Downloading {
+                            downloaded_bytes,
+                            total_bytes,
+                            ..
+                        } => {
+                            let pct = if *total_bytes > 0 {
+                                (*downloaded_bytes * 100) / *total_bytes
+                            } else {
+                                0
+                            };
+                            let dl_btn = egui::Button::new(
+                                egui::RichText::new(format!("⬇ {}%", pct))
+                                    .strong()
+                                    .size(11.5)
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(22, 108, 196));
+                            if ui.add(dl_btn).clicked() {
+                                self.updater.open_modal();
+                            }
+                        }
+                        _ => {
+                            let ver_btn = egui::Button::new(
+                                egui::RichText::new(format!("v{}", CURRENT_VERSION))
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(148, 178, 214)),
+                            )
+                            .fill(egui::Color32::from_rgb(20, 28, 42));
+                            if ui
+                                .add(ver_btn)
+                                .on_hover_text("Check GitHub Releases for updates")
+                                .clicked()
+                            {
+                                self.updater.spawn_check(Some(ctx.clone()), true);
+                            }
+                        }
+                    }
+
                     let active_fill = egui::Color32::from_rgb(14, 116, 184);
                     let idle_fill = egui::Color32::from_rgb(32, 41, 54);
                     let btn_3d = egui::Button::new(
@@ -2779,5 +2851,236 @@ impl eframe::App for LiquidApp {
                     });
                 });
         }
+
+        // 6. GitHub Release Self-Updater Notification & Progress Modal
+        self.draw_updater_modal(ctx);
+    }
+}
+
+impl LiquidApp {
+    fn draw_updater_modal(&mut self, ctx: &egui::Context) {
+        let snap = self.updater.snapshot();
+
+        if let UpdatePhase::ReadyToRestart { ref target_exe, .. } = snap.phase {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if let Err(e) = restart_into_updated_binary(target_exe) {
+                self.status_message = e;
+            }
+            return;
+        }
+
+        if !snap.show_modal {
+            return;
+        }
+
+        let title = match &snap.phase {
+            UpdatePhase::UpdateAvailable(info) => {
+                format!("⬆ Update Available — {}", info.tag_name)
+            }
+            UpdatePhase::Downloading { info, .. } => {
+                format!("⬇ Downloading Update {}...", info.tag_name)
+            }
+            UpdatePhase::Installing(info) => {
+                format!("⚙ Installing {}...", info.tag_name)
+            }
+            _ => "🔄 LiquidRust Software Update".to_string(),
+        };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.set_max_width(470.0);
+                ui.add_space(4.0);
+
+                match &snap.phase {
+                    UpdatePhase::Idle | UpdatePhase::Checking => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new(
+                                    "Checking GitHub Releases (rappar222/liquid-rust)...",
+                                )
+                                .size(13.5),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Close").clicked() {
+                                    self.updater.close_modal();
+                                }
+                            });
+                        });
+                    }
+                    UpdatePhase::UpToDate(info) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(74, 222, 128),
+                            egui::RichText::new(format!(
+                                "✔ You are running the latest version (v{}).",
+                                CURRENT_VERSION
+                            ))
+                            .strong()
+                            .size(14.0),
+                        );
+                        ui.add_space(4.0);
+                        ui.weak(format!(
+                            "Latest GitHub release: {} • Package: {} ({})",
+                            info.tag_name,
+                            info.asset_name,
+                            format_bytes(info.asset_size)
+                        ));
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("🔄 Check Again").clicked() {
+                                self.updater.spawn_check(Some(ctx.clone()), true);
+                            }
+                            if ui
+                                .button("↻ Reinstall & Restart")
+                                .on_hover_text(
+                                    "Download the latest asset for this release tag and restart",
+                                )
+                                .clicked()
+                            {
+                                self.updater
+                                    .spawn_download_and_apply(info.clone(), Some(ctx.clone()));
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Close").clicked() {
+                                    self.updater.close_modal();
+                                }
+                            });
+                        });
+                    }
+                    UpdatePhase::UpdateAvailable(info) => {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("Installed: v{}", CURRENT_VERSION))
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(168, 184, 206)),
+                            );
+                            ui.label("→");
+                            ui.label(
+                                egui::RichText::new(format!("Latest: {}", info.tag_name))
+                                    .monospace()
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(74, 222, 128)),
+                            );
+                        });
+                        ui.weak(format!(
+                            "{} • {} ({})",
+                            info.title,
+                            info.asset_name,
+                            format_bytes(info.asset_size)
+                        ));
+
+                        if !info.notes.is_empty() {
+                            ui.add_space(8.0);
+                            egui::Frame::group(ui.style())
+                                .fill(egui::Color32::from_rgb(10, 14, 22))
+                                .inner_margin(egui::Margin::same(8))
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .max_height(145.0)
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(&info.notes)
+                                                    .size(12.0)
+                                                    .color(egui::Color32::from_rgb(206, 218, 235)),
+                                            );
+                                        });
+                                });
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Later").clicked() {
+                                self.updater.close_modal();
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let update_btn = egui::Button::new(
+                                    egui::RichText::new("⬆ Update & Restart")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(8, 24, 16)),
+                                )
+                                .fill(egui::Color32::from_rgb(74, 222, 128));
+                                if ui.add(update_btn).clicked() {
+                                    self.updater
+                                        .spawn_download_and_apply(info.clone(), Some(ctx.clone()));
+                                }
+                            });
+                        });
+                    }
+                    UpdatePhase::Downloading {
+                        info,
+                        downloaded_bytes,
+                        total_bytes,
+                    } => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Downloading {} ({})...",
+                                info.asset_name, info.tag_name
+                            ))
+                            .strong(),
+                        );
+                        ui.add_space(6.0);
+                        let frac = if *total_bytes > 0 {
+                            (*downloaded_bytes as f32 / *total_bytes as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .show_percentage()
+                                .animate(true),
+                        );
+                        ui.add_space(4.0);
+                        ui.weak(format!(
+                            "{} / {} — LiquidRust will restart automatically when ready.",
+                            format_bytes(*downloaded_bytes),
+                            format_bytes(*total_bytes)
+                        ));
+                    }
+                    UpdatePhase::Installing(info) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Applying update {} & restarting...",
+                                    info.tag_name
+                                ))
+                                .strong(),
+                            );
+                        });
+                    }
+                    UpdatePhase::Error(err) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 110, 110),
+                            egui::RichText::new("Update Error").strong(),
+                        );
+                        ui.label(err);
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("🔄 Retry").clicked() {
+                                self.updater.spawn_check(Some(ctx.clone()), true);
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Close").clicked() {
+                                    self.updater.close_modal();
+                                }
+                            });
+                        });
+                    }
+                    UpdatePhase::ReadyToRestart { .. } => {}
+                }
+            });
     }
 }

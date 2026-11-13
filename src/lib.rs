@@ -4,6 +4,7 @@ pub mod gpu;
 pub mod math;
 pub mod render;
 pub mod sph;
+pub mod updater;
 
 pub use app::LiquidApp;
 pub use export::{Mp4Encoder, PlyExporter, SoftwareRenderer};

@@ -75,6 +75,7 @@ pub struct GpuSphSolver {
     pub total_cells: u32,
     pub grid_dim: [u32; 3],
     pub cell_size: f32,
+    pub sim_time: f32,
 }
 
 impl GpuSphSolver {
@@ -323,6 +324,7 @@ impl GpuSphSolver {
             total_cells: 0,
             grid_dim: [0, 0, 0],
             cell_size: config.smoothing_length,
+            sim_time: 0.0,
         };
 
         if !initial_particles.is_empty() {
@@ -367,6 +369,7 @@ impl GpuSphSolver {
 
         self.particle_count = count;
         self.particle_capacity = capacity;
+        self.sim_time = 0.0;
 
         let mut cell_size = config.smoothing_length.max(1e-5);
         let size = bounds.size();
@@ -622,6 +625,8 @@ impl GpuSphSolver {
             if num_colliders as usize >= 16 {
                 break;
             }
+            let rest_bits = col.restitution.to_bits();
+            let fric_bits = col.friction.to_bits();
             match &col.shape {
                 ColliderShape::Sphere { center, radius } => {
                     if collider_enabled == 0.0 {
@@ -629,7 +634,7 @@ impl GpuSphSolver {
                         collider_pos = [center.x, center.y, center.z, *radius];
                     }
                     gpu_colliders[num_colliders as usize] = GpuColliderData {
-                        info: [1, 1, 0, 0],
+                        info: [1, 1, rest_bits, fric_bits],
                         pos_rad: [center.x, center.y, center.z, *radius],
                         extents: [0.0; 4],
                     };
@@ -639,7 +644,7 @@ impl GpuSphSolver {
                     let center = aabb.center();
                     let half_size = aabb.size() * 0.5;
                     gpu_colliders[num_colliders as usize] = GpuColliderData {
-                        info: [2, 1, 0, 0],
+                        info: [2, 1, rest_bits, fric_bits],
                         pos_rad: [center.x, center.y, center.z, 0.0],
                         extents: [half_size.x, half_size.y, half_size.z, 0.0],
                     };
@@ -647,7 +652,7 @@ impl GpuSphSolver {
                 }
                 ColliderShape::Cylinder { center, radius, height } => {
                     gpu_colliders[num_colliders as usize] = GpuColliderData {
-                        info: [3, 1, 0, 0],
+                        info: [3, 1, rest_bits, fric_bits],
                         pos_rad: [center.x, center.y, center.z, *radius],
                         extents: [0.0, 0.0, 0.0, *height],
                     };
@@ -694,6 +699,15 @@ impl GpuSphSolver {
             0.0
         };
 
+        self.sim_time += dt;
+        let wave_accel_x = if config.wave_amplitude > 1e-4 {
+            let omega = std::f32::consts::TAU * config.wave_frequency.clamp(0.05, 8.0);
+            config.wave_amplitude * (omega * omega).clamp(1.0, 42.0) * (omega * self.sim_time).sin()
+        } else {
+            0.0
+        };
+        let wave_zone_w = ((bounds.max.x - bounds.min.x) * 0.45).max(0.1);
+
         let mut ch_info = chamber.gpu_info(&bounds);
         ch_info[1] = config.vorticity.max(0.0);
 
@@ -727,7 +741,7 @@ impl GpuSphSolver {
             ],
             colliders: gpu_colliders,
             chamber_info: ch_info,
-            boundary_params: [config.spacing, 0.0, 0.0, 0.0],
+            boundary_params: [config.spacing, config.air_drag.max(0.0), wave_accel_x, wave_zone_w],
         };
 
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
@@ -868,9 +882,12 @@ impl GpuSphSolver {
             out.resize(self.particle_count, Particle::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0));
             out.par_iter_mut().enumerate().for_each(|(i, p)| {
                 let gp = &gpu_slice[i];
-                p.position = Vec3::new(gp.pos_type[0], gp.pos_type[1], gp.pos_type[2]);
-                p.velocity = Vec3::new(gp.vel_dens[0], gp.vel_dens[1], gp.vel_dens[2]);
-                p.density = gp.vel_dens[3];
+                let pos = Vec3::new(gp.pos_type[0], gp.pos_type[1], gp.pos_type[2]);
+                let vel = Vec3::new(gp.vel_dens[0], gp.vel_dens[1], gp.vel_dens[2]);
+                let dens = gp.vel_dens[3];
+                p.position = if pos.is_finite() { pos } else { Vec3::ZERO };
+                p.velocity = if vel.is_finite() { vel } else { Vec3::ZERO };
+                p.density = if dens.is_finite() { dens } else { 1000.0 };
                 p.id = i as u32;
                 p.particle_type = if gp.pos_type[3] > 0.5 {
                     ParticleType::Boundary

@@ -1,9 +1,9 @@
 use crate::math::Aabb;
-use crate::render::surface_mesh::{MeshVertex, SurfaceMesh, SurfaceMeshConfig};
+use crate::render::surface_mesh::{EnvironmentPreset, MeshVertex, SurfaceMesh, SurfaceMeshConfig};
 use crate::sph::collider::{Collider, ColliderShape};
 use crate::sph::faucet::{CubeFace, Drain, Faucet, FaucetShape};
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec3};
 use glow::*;
 use std::sync::Arc;
 
@@ -33,6 +33,13 @@ pub struct GlRenderer {
     mesh_ibo: NativeBuffer,
     line_scratch: Vec<LineVertex>,
     floor_scratch: Vec<LineVertex>,
+    pub show_wireframe: bool,
+    pub show_grid: bool,
+    pub exposure: f32,
+    pub env_preset: EnvironmentPreset,
+    pub particle_light_dir: Vec3,
+    pub particle_light_intensity: f32,
+    pub particle_ambient_intensity: f32,
 }
 
 impl GlRenderer {
@@ -70,6 +77,8 @@ in vec3 v_pos_eye;
 uniform mat4 u_proj;
 uniform float u_point_radius;
 uniform vec3 u_light_dir;
+uniform vec3 u_light_params_p; // x: light_intensity, y: ambient_intensity, z: exposure
+uniform vec3 u_rim_sky_col;
 uniform int u_lit_spheres;
 uniform int u_is_2d;
 
@@ -91,18 +100,22 @@ void main() {
         gl_FragDepth = clamp(((clip_pos.z / clip_pos.w) + 1.0) * 0.5, 0.0, 1.0);
     }
 
+    float exposure = max(u_light_params_p.z, 0.05);
     if (u_lit_spheres != 0) {
-        float diff = max(dot(normal, u_light_dir), 0.0);
+        vec3 L = normalize(u_light_dir);
+        float diff = max(dot(normal, L), 0.0);
         vec3 view_dir = vec3(0.0, 0.0, 1.0);
-        vec3 half_dir = normalize(u_light_dir + view_dir);
-        float spec = pow(max(dot(normal, half_dir), 0.0), 48.0);
+        vec3 half_dir = normalize(L + view_dir);
+        float spec = pow(max(dot(normal, half_dir), 0.0), 48.0) * u_light_params_p.x * 0.38;
         float fresnel = pow(1.0 - max(normal.z, 0.0), 3.2);
-        vec3 rim_sky = vec3(0.35, 0.68, 0.96) * fresnel * 0.28;
+        vec3 rim_sky = u_rim_sky_col * fresnel * 0.30;
 
-        vec3 rgb = v_color.rgb * (0.42 + 0.58 * diff) + vec3(0.45, 0.48, 0.52) * spec + rim_sky;
+        float amb = u_light_params_p.y * 1.15;
+        vec3 rgb = (v_color.rgb * (amb + 0.50 * u_light_params_p.x * diff) + vec3(0.92, 0.96, 1.0) * spec + rim_sky) * exposure;
+        rgb = rgb / (vec3(1.0) + rgb * 0.14);
         FragColor = vec4(rgb, 1.0);
     } else {
-        FragColor = vec4(v_color.rgb, 1.0);
+        FragColor = vec4(v_color.rgb * exposure, 1.0);
     }
 }
 "#;
@@ -166,6 +179,10 @@ uniform vec4 u_light_params; // x: ior, y: roughness, z: specular_intensity, w: 
 uniform vec4 u_env_params;   // x: env_reflection, y: refraction_strength, z: light_intensity, w: ambient_intensity
 uniform vec3 u_light_dir;
 uniform vec4 u_tex_params;   // x: mode (int), y: scale, z: strength, w: time
+uniform vec3 u_sky_horizon;
+uniform vec3 u_sky_zenith;
+uniform vec3 u_sky_ground;
+uniform float u_exposure;
 uniform int u_backface_pass;
 
 out vec4 FragColor;
@@ -238,9 +255,9 @@ float grid_line(vec2 uv) {
 
 vec3 sample_studio_sky(vec3 dir) {
     float y = clamp(dir.y, -1.0, 1.0);
-    vec3 zenith = vec3(0.18, 0.42, 0.78);
-    vec3 horizon = vec3(0.62, 0.80, 0.96);
-    vec3 ground = vec3(0.05, 0.07, 0.11);
+    vec3 zenith = u_sky_zenith;
+    vec3 horizon = u_sky_horizon;
+    vec3 ground = u_sky_ground;
     if (y >= 0.0) {
         vec3 sky = mix(horizon, zenith, pow(y, 0.55));
         float sun_spot = pow(max(dot(dir, u_light_dir), 0.0), 96.0);
@@ -367,7 +384,8 @@ void main() {
     vec3 foam_col = vec3(0.94, 0.97, 1.0) * (amb + diff * 0.85 + 0.25);
     color = mix(color, foam_col, foam);
 
-    // Filmic tone compression for bright glints
+    // Exposure + Filmic tone compression for bright glints
+    color *= max(u_exposure, 0.05);
     color = color / (vec3(1.0) + color * 0.18);
 
     float out_alpha = clamp(mix(u_mat_params.x, 1.0, max(max(fresnel.r, foam), metallic)), 0.12, 1.0);
@@ -461,6 +479,13 @@ void main() {
                 mesh_ibo,
                 line_scratch: Vec::with_capacity(512),
                 floor_scratch: Vec::with_capacity(128),
+                show_wireframe: true,
+                show_grid: true,
+                exposure: 1.0,
+                env_preset: EnvironmentPreset::StudioDark,
+                particle_light_dir: Vec3::new(0.42, 0.82, 0.38).normalize(),
+                particle_light_intensity: 1.25,
+                particle_ambient_intensity: 0.32,
             })
         }
     }
@@ -476,12 +501,13 @@ void main() {
         drains: &[Drain],
         is_2d: bool,
     ) {
-        // Subtle 3D studio reference floor grid beneath the chamber
-        if !is_2d {
+        // Subtle 3D studio reference floor grid beneath the chamber (scales dynamically with bounds)
+        if !is_2d && self.show_grid {
             self.floor_scratch.clear();
             let y_floor = bounds.min.y - 0.002;
-            let grid_half = 1.6f32;
-            let steps = 16;
+            let b_size = bounds.size();
+            let grid_half = (b_size.x.max(b_size.z) * 0.85 + 0.8).max(1.6);
+            let steps = ((grid_half * 2.0 / 0.25).round() as usize).clamp(16, 48);
             let step = (grid_half * 2.0) / steps as f32;
             for i in 0..=steps {
                 let v = -grid_half + i as f32 * step;
@@ -505,7 +531,7 @@ void main() {
             let u_vp = gl.get_uniform_location(self.line_program, "u_view_proj");
             let u_col = gl.get_uniform_location(self.line_program, "u_line_color");
             gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
-            gl.uniform_4_f32(u_col.as_ref(), 0.16, 0.22, 0.32, 0.42);
+            gl.uniform_4_f32(u_col.as_ref(), 0.18, 0.25, 0.36, 0.45);
 
             gl.bind_vertex_array(Some(self.line_vao));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.line_vbo));
@@ -516,6 +542,10 @@ void main() {
             );
             gl.line_width(1.0);
             gl.draw_arrays(glow::LINES, 0, self.floor_scratch.len() as i32);
+        }
+
+        if !self.show_wireframe {
+            return;
         }
 
         self.line_scratch.clear();
@@ -687,6 +717,8 @@ void main() {
                 let u_vh = gl.get_uniform_location(self.particle_program, "u_viewport_height");
                 let u_tf = gl.get_uniform_location(self.particle_program, "u_tan_half_fov");
                 let u_ld = gl.get_uniform_location(self.particle_program, "u_light_dir");
+                let u_lpp = gl.get_uniform_location(self.particle_program, "u_light_params_p");
+                let u_rim = gl.get_uniform_location(self.particle_program, "u_rim_sky_col");
                 let u_lit = gl.get_uniform_location(self.particle_program, "u_lit_spheres");
                 let u_is_2d = gl.get_uniform_location(self.particle_program, "u_is_2d");
 
@@ -698,8 +730,29 @@ void main() {
                 gl.uniform_1_f32(u_vh.as_ref(), viewport_size[1]);
                 gl.uniform_1_f32(u_tf.as_ref(), tan_half_fov);
 
-                let light_dir = Vec3::new(0.42, 0.82, 0.38).normalize();
+                // Transform world-space sun direction into view/eye space so orbiting camera keeps lighting world-anchored
+                let world_ld = if self.particle_light_dir.length_squared() > 0.25 {
+                    self.particle_light_dir.normalize()
+                } else {
+                    Vec3::new(0.42, 0.82, 0.38).normalize()
+                };
+                let eye_ld = (Mat3::from_mat4(view) * world_ld).normalize_or_zero();
+                let light_dir = if eye_ld.length_squared() > 0.25 {
+                    eye_ld
+                } else {
+                    Vec3::new(0.42, 0.82, 0.38).normalize()
+                };
+                let (sky_hor, _, _) = self.env_preset.sky_reflection_linear();
+                let rim_srgb = sky_hor.clamp(Vec3::ZERO, Vec3::ONE).powf(1.0 / 2.2);
+
                 gl.uniform_3_f32(u_ld.as_ref(), light_dir.x, light_dir.y, light_dir.z);
+                gl.uniform_3_f32(
+                    u_lpp.as_ref(),
+                    self.particle_light_intensity,
+                    self.particle_ambient_intensity,
+                    self.exposure,
+                );
+                gl.uniform_3_f32(u_rim.as_ref(), rim_srgb.x, rim_srgb.y, rim_srgb.z);
                 gl.uniform_1_i32(u_lit.as_ref(), if lit_spheres { 1 } else { 0 });
                 gl.uniform_1_i32(u_is_2d.as_ref(), if is_2d { 1 } else { 0 });
 
@@ -751,6 +804,10 @@ void main() {
             gl.clear(glow::DEPTH_BUFFER_BIT);
 
             let view_proj = proj * view;
+            self.show_wireframe = mesh_cfg.show_wireframe;
+            self.show_grid = mesh_cfg.show_grid;
+            self.exposure = mesh_cfg.exposure;
+            self.env_preset = mesh_cfg.env_preset;
 
             // 1. Draw Studio Grid, Chamber, Colliders, Faucets, and Drains first so translucent liquid blends over them
             self.draw_scene_wireframes(
@@ -770,6 +827,10 @@ void main() {
                 let u_env = gl.get_uniform_location(self.mesh_program, "u_env_params");
                 let u_ldir = gl.get_uniform_location(self.mesh_program, "u_light_dir");
                 let u_tex = gl.get_uniform_location(self.mesh_program, "u_tex_params");
+                let u_sky_h = gl.get_uniform_location(self.mesh_program, "u_sky_horizon");
+                let u_sky_z = gl.get_uniform_location(self.mesh_program, "u_sky_zenith");
+                let u_sky_g = gl.get_uniform_location(self.mesh_program, "u_sky_ground");
+                let u_exp = gl.get_uniform_location(self.mesh_program, "u_exposure");
                 let u_back = gl.get_uniform_location(self.mesh_program, "u_backface_pass");
 
                 let ld = mesh_cfg.light_dir.normalize_or_zero();
@@ -778,6 +839,10 @@ void main() {
                 } else {
                     Vec3::new(0.42, 0.82, 0.38).normalize()
                 };
+                let (sky_hor_l, sky_zen_l, sky_gnd_l) = mesh_cfg.env_preset.sky_reflection_linear();
+                let sky_hor = sky_hor_l.clamp(Vec3::ZERO, Vec3::ONE).powf(1.0 / 2.2);
+                let sky_zen = sky_zen_l.clamp(Vec3::ZERO, Vec3::ONE).powf(1.0 / 2.2);
+                let sky_gnd = sky_gnd_l.clamp(Vec3::ZERO, Vec3::ONE).powf(1.0 / 2.2);
 
                 gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
                 gl.uniform_3_f32(u_eye.as_ref(), eye_pos.x, eye_pos.y, eye_pos.z);
@@ -822,6 +887,10 @@ void main() {
                     mesh_cfg.texture_strength,
                     anim_time,
                 );
+                gl.uniform_3_f32(u_sky_h.as_ref(), sky_hor.x, sky_hor.y, sky_hor.z);
+                gl.uniform_3_f32(u_sky_z.as_ref(), sky_zen.x, sky_zen.y, sky_zen.z);
+                gl.uniform_3_f32(u_sky_g.as_ref(), sky_gnd.x, sky_gnd.y, sky_gnd.z);
+                gl.uniform_1_f32(u_exp.as_ref(), mesh_cfg.exposure);
 
                 gl.bind_vertex_array(Some(self.mesh_vao));
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.mesh_vbo));

@@ -1341,3 +1341,401 @@ fn test_vertical_wall_wave_runup_drains_without_lingering_lip() {
         l_near_p95
     );
 }
+
+#[test]
+fn test_cylinder_top_cap_collision_cpu_and_gpu() {
+    use liquid_rust::gpu::GpuSphSolver;
+    use liquid_rust::sph::{Collider, SimulationQuality};
+
+    let col = Collider::cylinder(Vec3::new(0.0, 0.25, 0.0), 0.22, 0.30);
+    let r = 0.015f32;
+    let top_y = 0.25 + 0.15; // 0.40
+
+    // 1. Direct CPU penetration just below top cap near cylinder axis must push +Y, NOT sideways to r=0.22
+    let mut pos = Vec3::new(0.02, top_y - 0.005, -0.01);
+    let mut vel = Vec3::new(0.0, -1.2, 0.0);
+    assert!(col.resolve(&mut pos, &mut vel, r));
+    assert!(
+        pos.y >= top_y + r - 1e-4,
+        "Top-cap hit should project upward onto cylinder top cap, got pos={:?}",
+        pos
+    );
+    assert!(
+        pos.x.hypot(pos.z) < 0.05,
+        "Top-cap hit must NOT teleport particle sideways to cylinder rim, got pos={:?}",
+        pos
+    );
+    assert!(vel.y >= -1e-4, "Downward normal velocity must be removed on top cap, got vel={:?}", vel);
+
+    // 2. Full solver step (CPU & GPU if available) with a particle resting over cylinder top center
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.8), Vec3::new(0.8, 1.2, 0.8));
+    let mut solver = SphSolver::new(bounds, SolverConfig::default());
+    solver.apply_quality(SimulationQuality::Draft);
+    let pr = solver.config.particle_radius;
+    solver.colliders.push(col.clone());
+    solver.particles.push(Particle::new(
+        Vec3::new(0.0, top_y + pr + 0.02, 0.0),
+        Vec3::new(0.0, -0.8, 0.0),
+        1.0,
+        0,
+    ));
+
+    let mut gpu = GpuSphSolver::new(solver.bounds, &solver.config, &solver.particles).ok();
+    for _ in 0..20 {
+        solver.step(1.0 / 60.0);
+        if let Some(ref mut g) = gpu {
+            g.step(
+                solver.bounds,
+                &solver.chamber,
+                &solver.config,
+                &solver.colliders,
+                None,
+                0.0,
+                0,
+                1.0 / 60.0,
+                false,
+            );
+        }
+    }
+
+    let cpu_p = solver.particles[0];
+    assert!(
+        cpu_p.position.y >= top_y + pr - 2e-3 && cpu_p.position.x.hypot(cpu_p.position.z) < 0.08,
+        "CPU particle should rest on cylinder top cap, got {:?}",
+        cpu_p.position
+    );
+
+    if let Some(ref g) = gpu {
+        let mut gpu_particles = Vec::new();
+        g.read_particles(&mut gpu_particles);
+        let gp = gpu_particles[0];
+        assert!(
+            gp.position.y >= top_y + pr - 2e-3 && gp.position.x.hypot(gp.position.z) < 0.08,
+            "GPU particle should rest on cylinder top cap, got {:?}",
+            gp.position
+        );
+    }
+}
+
+#[test]
+fn test_2d_splash_and_zero_g_non_overlapping_discs() {
+    use liquid_rust::sph::SimulationQuality;
+
+    for &preset in &[ScenePreset::DropletSplash, ScenePreset::ZeroGravityBlobs] {
+        let bounds = Aabb::new(Vec3::new(-0.9, 0.0, -0.05), Vec3::new(0.9, 1.4, 0.05));
+        let mut solver = SphSolver::new(bounds, SolverConfig::default());
+        solver.set_2d(true);
+        solver.apply_quality(SimulationQuality::Draft);
+        SceneGenerator::setup_scene(&mut solver, preset);
+
+        assert!(!solver.particles.is_empty());
+        let min_allowed_dist = solver.config.spacing * 0.45;
+        for i in 0..solver.particles.len() {
+            let pi = solver.particles[i].position;
+            assert!(pi.z.abs() < 1e-6, "2D particle must lie on z=0 plane, got {:?}", pi);
+            for j in (i + 1)..solver.particles.len() {
+                let pj = solver.particles[j].position;
+                let d = pi.distance(pj);
+                assert!(
+                    d >= min_allowed_dist,
+                    "2D {:?} spawned overlapping particles {} and {} at dist={:.6} (spacing={:.4})",
+                    preset,
+                    i,
+                    j,
+                    d,
+                    solver.config.spacing
+                );
+            }
+        }
+
+        for _ in 0..30 {
+            solver.step(1.0 / 60.0);
+        }
+        for p in &solver.particles {
+            assert!(p.position.is_finite() && p.velocity.is_finite());
+            assert!(
+                p.velocity.length() < solver.config.max_velocity + 0.1,
+                "2D {:?} velocity should remain bounded, got {:?}",
+                preset,
+                p.velocity
+            );
+        }
+    }
+
+    // Also verify 3D ZeroGravityBlobs fits cleanly above floor y >= 0.0
+    let mut solver_3d = SphSolver::new(
+        Aabb::new(Vec3::new(-0.8, 0.0, -0.8), Vec3::new(0.8, 1.4, 0.8)),
+        SolverConfig::default(),
+    );
+    solver_3d.apply_quality(SimulationQuality::Draft);
+    SceneGenerator::setup_scene(&mut solver_3d, ScenePreset::ZeroGravityBlobs);
+    for p in &solver_3d.particles {
+        assert!(
+            p.position.y >= solver_3d.bounds.min.y,
+            "3D ZeroGravityBlobs particles must spawn above chamber floor y>=0, got {:?}",
+            p.position
+        );
+    }
+}
+
+#[test]
+fn test_fluid_physics_presets_air_drag_and_wave_maker() {
+    use liquid_rust::gpu::GpuSphSolver;
+    use liquid_rust::sph::{FluidPhysicsPreset, SimulationQuality};
+
+    // 1. Honey must damp motion significantly faster than Water
+    let run_preset_speed = |preset: FluidPhysicsPreset| -> f32 {
+        let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.05), Vec3::new(0.8, 1.2, 0.05));
+        let mut solver = SphSolver::new(bounds, SolverConfig::default());
+        solver.set_2d(true);
+        solver.apply_quality(SimulationQuality::Draft);
+        SceneGenerator::setup_scene(&mut solver, ScenePreset::DamBreak);
+        preset.apply(&mut solver.config);
+        for _ in 0..45 {
+            solver.step(1.0 / 60.0);
+        }
+        solver.particles.iter().map(|p| p.velocity.length()).sum::<f32>()
+            / solver.particles.len() as f32
+    };
+    let speed_water = run_preset_speed(FluidPhysicsPreset::Water);
+    let speed_honey = run_preset_speed(FluidPhysicsPreset::Honey);
+    assert!(
+        speed_honey < speed_water * 0.85,
+        "Honey ({:.3}) should flow noticeably slower than Water ({:.3})",
+        speed_honey,
+        speed_water
+    );
+
+    // 2. Airborne droplet drag slows isolated fast spray compared to zero drag
+    let run_droplet_vx = |drag: f32| -> f32 {
+        let bounds = Aabb::new(Vec3::new(-2.0, 0.0, -0.5), Vec3::new(2.0, 2.0, 0.5));
+        let mut cfg = SolverConfig::default();
+        cfg.air_drag = drag;
+        let mut solver = SphSolver::new(bounds, cfg);
+        solver.particles.push(Particle::new(
+            Vec3::new(-1.0, 1.2, 0.0),
+            Vec3::new(4.0, 0.0, 0.0),
+            1.0,
+            0,
+        ));
+        for _ in 0..20 {
+            solver.step(1.0 / 60.0);
+        }
+        solver.particles[0].velocity.x
+    };
+    let vx_no_drag = run_droplet_vx(0.0);
+    let vx_with_drag = run_droplet_vx(1.2);
+    assert!(
+        vx_with_drag < vx_no_drag - 0.15,
+        "Air drag should decelerate isolated airborne spray: with_drag={:.3} vs no_drag={:.3}",
+        vx_with_drag,
+        vx_no_drag
+    );
+
+    // 3. Hydraulic wave maker drives sloshing stably on CPU & GPU
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.4), Vec3::new(0.8, 1.2, 0.4));
+    let mut solver = SphSolver::new(bounds, SolverConfig::default());
+    solver.apply_quality(SimulationQuality::Draft);
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DropletSplash);
+    solver.config.wave_amplitude = 0.20;
+    solver.config.wave_frequency = 1.1;
+
+    let mut gpu = GpuSphSolver::new(solver.bounds, &solver.config, &solver.particles).ok();
+    for _ in 0..35 {
+        solver.step(1.0 / 60.0);
+        if let Some(ref mut g) = gpu {
+            g.step(
+                solver.bounds,
+                &solver.chamber,
+                &solver.config,
+                &solver.colliders,
+                None,
+                0.0,
+                0,
+                1.0 / 60.0,
+                false,
+            );
+        }
+    }
+    let avg_abs_vx = solver.particles.iter().map(|p| p.velocity.x.abs()).sum::<f32>()
+        / solver.particles.len() as f32;
+    assert!(avg_abs_vx > 0.01, "Wave maker should induce horizontal sloshing, got {}", avg_abs_vx);
+    assert!(solver.particles.iter().all(|p| p.position.is_finite() && p.velocity.is_finite()));
+    if let Some(ref g) = gpu {
+        let mut gp = Vec::new();
+        g.read_particles(&mut gp);
+        let gpu_abs_vx = gp.iter().map(|p| p.velocity.x.abs()).sum::<f32>() / gp.len() as f32;
+        assert!(gpu_abs_vx > 0.01, "GPU wave maker should induce sloshing, got {}", gpu_abs_vx);
+        assert!(gp.iter().all(|p| p.position.is_finite() && p.velocity.is_finite()));
+    }
+}
+
+#[test]
+fn test_png_exporter_and_studio_particle_renderer() {
+    use liquid_rust::export::{PngExporter, SoftwareRenderer};
+    use liquid_rust::render::{
+        Camera, CliRenderQuality, ColorMapType, ColorMode, EnvironmentPreset, SurfaceMesh,
+        SurfaceMeshConfig,
+    };
+    use liquid_rust::sph::{Collider, SimulationQuality};
+
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.8), Vec3::new(0.8, 1.2, 0.8));
+    let mut solver = SphSolver::new(bounds, SolverConfig::default());
+    solver.apply_quality(SimulationQuality::Draft);
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::ObstacleDrop);
+    solver.colliders.push(Collider::cylinder(Vec3::new(0.25, 0.2, 0.0), 0.12, 0.35));
+    for _ in 0..10 {
+        solver.step(1.0 / 60.0);
+    }
+
+    let cam = Camera::default();
+    let mut mesh_cfg = SurfaceMeshConfig::default();
+    mesh_cfg.env_preset = EnvironmentPreset::GoldenSunset;
+    mesh_cfg.exposure = 1.15;
+    mesh_cfg.show_grid = true;
+    mesh_cfg.show_wireframe = true;
+
+    let mut rend = SoftwareRenderer::new_with_quality(192, 108, CliRenderQuality::Studio);
+    rend.env_preset = mesh_cfg.env_preset;
+    rend.exposure = mesh_cfg.exposure;
+    rend.show_grid = mesh_cfg.show_grid;
+    rend.show_wireframe = mesh_cfg.show_wireframe;
+    rend.particle_foam = true;
+    rend.lit_spheres = true;
+    rend.render_particles_studio(
+        &solver.particles,
+        solver.config.particle_radius,
+        &solver.chamber,
+        solver.bounds,
+        &solver.colliders,
+        &cam,
+        ColorMode::Foam,
+        ColorMapType::Inferno,
+        solver.config.rest_density,
+        false,
+    );
+    assert_eq!(rend.rgb_buffer.len(), 192 * 108 * 3);
+    assert!(rend.rgb_buffer.iter().any(|&v| v > 120));
+
+    let tmp_png = std::env::temp_dir().join("liquid_rust_studio_test.png");
+    PngExporter::save_rgb(&tmp_png, rend.width, rend.height, &rend.rgb_buffer)
+        .expect("Studio PNG export must succeed");
+    let bytes = std::fs::read(&tmp_png).expect("Saved PNG must be readable");
+    let _ = std::fs::remove_file(&tmp_png);
+
+    assert_eq!(&bytes[0..8], b"\x89PNG\r\n\x1a\n", "Valid PNG signature required");
+    assert_eq!(&bytes[12..16], b"IHDR");
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    assert_eq!((w, h), (192, 108));
+    assert!(bytes.windows(4).any(|w| w == b"IDAT"), "PNG must contain IDAT chunk");
+    assert!(bytes.windows(4).any(|w| w == b"IEND"), "PNG must contain IEND chunk");
+
+    // Also exercise Vorticity + Ice colormap and SurfaceMesh with ArcticLab environment
+    mesh_cfg.env_preset = EnvironmentPreset::ArcticLab;
+    rend.env_preset = EnvironmentPreset::ArcticLab;
+    rend.particle_foam = false;
+    rend.lit_spheres = false;
+    rend.render_particles_studio(
+        &solver.particles,
+        solver.config.particle_radius,
+        &solver.chamber,
+        solver.bounds,
+        &solver.colliders,
+        &cam,
+        ColorMode::Vorticity,
+        ColorMapType::Ice,
+        solver.config.rest_density,
+        false,
+    );
+    let mesh = SurfaceMesh::from_particles(
+        &solver.particles,
+        solver.config.particle_radius,
+        solver.config.smoothing_length,
+        &mesh_cfg,
+    );
+    rend.render_surface_mesh_frame(
+        &mesh,
+        &mesh_cfg,
+        &cam,
+        &solver.chamber,
+        solver.bounds,
+        &solver.colliders,
+        0.4,
+        false,
+    );
+    assert!(rend.rgb_buffer.iter().any(|&v| v > 140));
+}
+
+#[test]
+fn test_scene_json_roundtrip_and_cli_command_flags() {
+    use liquid_rust::app::{CliCommandMode, LiquidApp};
+    use liquid_rust::render::EnvironmentPreset;
+    use liquid_rust::scene_io::SceneConfigFile;
+    use liquid_rust::sph::{ChamberShape, Collider, CubeFace, Drain, Faucet, FluidPhysicsPreset};
+
+    let mut app = LiquidApp::new_headless();
+    app.fluid_preset = FluidPhysicsPreset::Honey;
+    FluidPhysicsPreset::Honey.apply(&mut app.solver.config);
+    app.solver.config.wave_amplitude = 0.16;
+    app.solver.config.wave_frequency = 1.25;
+    app.solver.chamber.shape = ChamberShape::Bathtub;
+    app.solver.chamber.base_size = Vec3::new(2.2, 1.4, 1.6);
+    app.solver.chamber.custom_size = true;
+    app.solver.bounds = app.solver.chamber.compute_bounds();
+
+    let mut col = Collider::sphere(Vec3::new(0.15, 0.35, -0.1), 0.22);
+    col.restitution = 0.45;
+    col.friction = 0.28;
+    app.solver.colliders.push(col);
+    app.solver.faucets.push(Faucet::new_circle(
+        "Tap #1",
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, -1.5, 0.0),
+        0.09,
+        650.0,
+    ));
+    let drain = Drain::new("Drain #1", CubeFace::Right, Vec3::new(0.0, -0.25, 0.0), 0.18);
+    app.solver.drains.push(drain);
+
+    app.mesh_config.env_preset = EnvironmentPreset::ArcticLab;
+    app.mesh_config.exposure = 1.25;
+    app.camera_orbit_speed_deg = 12.5;
+    app.cli_mode = CliCommandMode::Mp4Video;
+
+    let cmd = app.generate_cli_command();
+    assert!(cmd.contains("--fluid-preset honey"), "Expected --fluid-preset honey in {}", cmd);
+    assert!(cmd.contains("--wave-amp 0.160"), "Expected --wave-amp in {}", cmd);
+    assert!(cmd.contains("--wave-freq 1.25"), "Expected --wave-freq in {}", cmd);
+    assert!(cmd.contains("--chamber-shape bathtub"), "Expected --chamber-shape bathtub in {}", cmd);
+    assert!(cmd.contains("--chamber-size 2.20,1.40,1.60"), "Expected --chamber-size in {}", cmd);
+    assert!(cmd.contains("--env-preset arctic"), "Expected --env-preset arctic in {}", cmd);
+    assert!(cmd.contains("--exposure 1.25"), "Expected --exposure 1.25 in {}", cmd);
+    assert!(cmd.contains("--camera-orbit 12.5"), "Expected --camera-orbit 12.5 in {}", cmd);
+    assert!(cmd.contains("--faucet \"stream:"), "Expected --faucet stream: in {}", cmd);
+    assert!(cmd.contains("--drain "), "Expected --drain in {}", cmd);
+    assert!(cmd.contains(":0.45:0.28"), "Expected obstacle bounce:slip suffix in {}", cmd);
+
+    let tmp_json = std::env::temp_dir().join("liquid_rust_scene_roundtrip.json");
+    app.to_scene_config_file()
+        .save_to_path(&tmp_json)
+        .expect("Scene JSON save must succeed");
+    let loaded = SceneConfigFile::load_from_path(&tmp_json).expect("Scene JSON load must succeed");
+    let _ = std::fs::remove_file(&tmp_json);
+
+    let mut app2 = LiquidApp::new_headless();
+    app2.apply_scene_config_file(&loaded);
+    assert_eq!(app2.fluid_preset, FluidPhysicsPreset::Honey);
+    assert!((app2.solver.config.wave_amplitude - 0.16).abs() < 1e-5);
+    assert!((app2.solver.config.wave_frequency - 1.25).abs() < 1e-5);
+    assert_eq!(app2.solver.chamber.shape, ChamberShape::Bathtub);
+    assert!(app2.solver.chamber.custom_size);
+    assert_eq!(app2.solver.colliders.len(), 1);
+    assert!((app2.solver.colliders[0].restitution - 0.45).abs() < 1e-5);
+    assert!((app2.solver.colliders[0].friction - 0.28).abs() < 1e-5);
+    assert_eq!(app2.solver.faucets.len(), 1);
+    assert_eq!(app2.solver.drains.len(), 1);
+    assert_eq!(app2.mesh_config.env_preset, EnvironmentPreset::ArcticLab);
+    assert!((app2.mesh_config.exposure - 1.25).abs() < 1e-5);
+    assert!((app2.camera_orbit_speed_deg - 12.5).abs() < 1e-5);
+}

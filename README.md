@@ -48,29 +48,22 @@ Once installed, run `liquid-rust` from any directory — and update anytime via 
   - Multi-threaded density, pressure, force, and integration loops with `rayon`.
   - Simulates 10,000+ particles at over 100–250+ FPS on modern CPUs.
 
-- **Interactive 3D Hardware Viewport**:
-  - Point sprite sphere rendering with fragment-shader screen-space normal reconstruction and specular Phong lighting.
-  - Smooth 3D Orbit Camera (orbit, pan, zoom, view-reset).
-  - Multiple color visualization modes:
-    - **Velocity Magnitude**
-    - **Pressure Field**
-    - **Density Deviation**
-    - **Height (Y)**
-    - **Kinetic Energy**
-    - **Uniform Aqua**
-  - Perceptual colormaps: **Ocean**, **Turbo (Google Rainbow)**, **Viridis**, **Fire / Magma**.
+- **Interactive 3D Studio Viewport & Environments**:
+  - Point sprite sphere rendering with world-anchored sun lighting, screen-space normal reconstruction, and aerated whitewater crest highlights.
+  - Reconstructed 3D Marching-Cubes **Surface Mesh** mode with Beer-Lambert absorption, Fresnel refraction, caustics, and procedural ripples.
+  - Studio sky & lighting presets: **Studio Dark**, **Daylight Sky**, **Golden Sunset**, **Arctic Lab**, and **Abyssal Deep**, plus exposure, floor grid, wireframe, FOV, and turntable orbit controls.
+  - Color visualization modes: **Velocity**, **Pressure**, **Density**, **Height (Y)**, **Kinetic Energy**, **Foam / Whitewater**, **Vorticity / Swirl**, and **Uniform Aqua**.
+  - Perceptual colormaps: **Ocean**, **Turbo**, **Viridis**, **Magma / Fire**, **Inferno**, and **Ice**.
+  - Font-independent vector iconography and progressive `Advanced …` drawers so novice and expert controls stay clean and organized.
 
-- **Interactive Fluid Manipulation**:
-  - Left-Click Drag to **attract** fluid towards the mouse ray.
-  - Hold `Shift` + Left-Click Drag to **repel** fluid.
-  - Middle-Click Drag to **pan** the camera, and Right-Click Drag to **orbit** (3D).
-  - Add and interactively move solid obstacles (spheres, boxes) in real time.
+- **Substance Physics Presets & Hydraulic Wave Maker**:
+  - One-click physical substance profiles (`--fluid-preset`): **Pure Water**, **Ocean Surf**, **Light Oil**, **Thick Honey**, **Glycerin**, **Liquid Mercury**, **Molten Lava**, and **Zero-G Globules**.
+  - Built-in sinusoidal **Wave Maker** (`--wave-amp`, `--wave-freq`), sparse airborne spray drag (`--air-drag`), and per-obstacle bounce/slip controls.
 
-- **Blender / VFX Point Cloud & MP4 Video Export**:
-  - Direct CLI export to **H.264 MP4 videos** (`--export-mp4 simulation.mp4`) via hardware-buffered software rasterizer and FFmpeg pipe.
-  - Exports single frames or entire animation sequences in standard binary/ASCII **Stanford PLY format** (`.ply`).
-  - Includes positions, velocities, density, pressure, and RGB color fields.
-  - Easily importable into **Blender** (Geometry Nodes / Point Cloud), MeshLab, Houdini, or CloudCompare for photorealistic fluid meshing and raytracing.
+- **Portable Studio Scene JSON, PNG Screenshots, MP4 Video & Blender Export**:
+  - Save and reload complete studio setups (chamber, obstacles, faucets, drains, physics, materials, lighting, camera) as portable `.json` files (`--scene` / `--save-scene` or GUI toolbar).
+  - Instant studio **PNG frame / screenshot** export (`--export-png snapshot.png` or `P` / `F12` in GUI) with up to 4x4 SSAA.
+  - Direct CLI & GUI export to **H.264 MP4 videos** (`--export-mp4 simulation.mp4`), **Wavefront `.OBJ` liquid meshes** (`--export-obj`), and binary/ASCII **Stanford PLY** point clouds (`--export-ply`).
 
 - **Configurable Particle Quality & Smoothness**:
   - Dynamically adjust particle size and density in both GUI and CLI:
@@ -145,7 +138,7 @@ cargo run --release
 
 ---
 
-## 🕹 Viewport & Controls
+## 🕹 Viewport & Keyboard Shortcuts
 
 | Action | Control |
 | :--- | :--- |
@@ -154,9 +147,15 @@ cargo run --release
 | **Pan Camera** | Middle-Click + Drag |
 | **Orbit Camera (3D)** | Right-Click + Drag |
 | **Zoom In / Out** | Scroll Wheel |
-| **Play / Pause** | Top Toolbar Button or Space |
-| **Step Single Frame** | `⏭ Step` Button |
-| **Reset Simulation** | `🔄 Reset` Button |
+| **Play / Pause** | `Space` or Top Toolbar Button |
+| **Step Single Frame** | `.` (Period) or `Step` Button |
+| **Reset Simulation** | `R` |
+| **Reset Camera View** | `C` |
+| **Toggle Spheres / Surface Mesh** | `M` |
+| **Toggle Floor Grid / Wireframe** | `G` / `B` |
+| **Toggle Turntable Auto-Orbit** | `O` |
+| **Save Studio PNG Screenshot** | `P` or `F12` |
+| **Keyboard Shortcuts Reference** | `?` or `F1` |
 
 ---
 
@@ -196,40 +195,70 @@ cargo run --release -- --headless --preset splash --frames 150 --export-ply ./re
 # Export an ultra-detailed CLI-only offline render (Surface Mesh + SSAA + 4K + H.264 CRF 11)
 cargo run --release -- --export-mp4 master_water.mp4 --preset dam-break --quality studio --render-quality master --res 4k --surface-mesh --time 4.0 --fps 60
 
+# Export a high-SSAA studio PNG snapshot with Honey physics, Golden Sunset sky, and wave maker
+cargo run --release -- --export-png honey_waves.png --preset splash --fluid-preset honey --env-preset sunset --wave-amp 0.15 --render-quality studio --time 1.8
+
+# Save a customized CLI setup to a portable JSON scene file, then launch or render from it
+cargo run --release -- --preset obstacle --fluid-preset mercury --chamber-shape bathtub --save-scene mercury_tub.json
+cargo run --release -- --scene mercury_tub.json --export-mp4 mercury_tub.mp4 --time 3.0 --fps 60
+
 # Run with custom particle radius and spacing for ultra-fine liquid
 cargo run --release -- --particle-radius 0.008 --spacing 0.014 --time 2.5 --fps 60
 ```
 
-### Available CLI Flags
+### Key CLI Flags (`liquid-rust --help` for full grouped reference)
 
 ```
-Options:
-      --headless                    Run in headless mode without opening GUI window
-      --preset <NAME>               Scene preset: dam-break, double-dam, splash, obstacle, tornado, zero-g [default: dam-break]
-  -q, --quality <QUALITY>           Interactive: draft, medium, high, ultra, cinematic, extreme; CLI-only: studio (~2.5M), film (~4.9M), master (~8.2M) [default: medium]
-      --render-quality <MODE>       [CLI only] Offline render optics & AA: standard (1x), studio (2x2 SSAA), cinema (3x3 SSAA), master (4x4 SSAA, dispersion, CRF 11)
-      --res, --resolution <RES>     [CLI only] Video resolution preset: 480p, 720p, 1k/1080p, 2k/1440p, 3k, 4k/2160p, 5k, 6k, 8k/4320p, optional -vertical, or WxH
-      --surface-mesh                Enable reconstructed 3D liquid surface mesh + PBR refraction/caustics
-      --chamber-shape <TYPE>        Bounding box type: box, sphere, bathtub (aliases: --box-type, --bounds-type, --chamber-type)
+Scene & Container:
+      --preset <NAME>               Scene preset: dam-break, double-dam, splash, obstacle, tornado, zero-g, empty [default: dam-break]
+      --scene <FILE.json>           Load complete studio scene configuration (.json); CLI flags override JSON values
+      --save-scene <FILE.json>      Save effective scene, physics, lighting & camera configuration to portable .json
+      --2d                          Run simulation in 2D planar mode (Z = 0)
+      --chamber-shape <TYPE>        Bounding box type: box, sphere, bathtub (aliases: --box-type, --bounds-type)
       --chamber-size <W,H[,D]>      Bounding box size in meters: D, W,H (2D), or W,H,D (aliases: --box-size, --bounds-size)
-      --chamber-scale <SCALE>       Bounding box scale: uniform, X,Y, or X,Y,Z (aliases: --box-scale, --bounds-scale)
-      --faucet <SPEC>               Add emitter: tap:x,y,z[:radius[:rate[:vx,vy,vz]]], stream:x,y,z:vx,vy,vz[:rate[:spread[:radius]]], circle/shower/waterfall
+      --chamber-scale <SCALE>       Bounding box scale: uniform, X,Y, or X,Y,Z
+      --faucet <SPEC>               Add emitter: tap:x,y,z[:radius[:rate[:vx,vy,vz]]], stream:..., circle/shower/waterfall
       --drain <SPEC>                Add drain: floor:radius, floor:x,z:radius, <face>:radius, or custom:x,y,z:radius
-      --obstacle <SPEC>             Add collider: sphere:x,y,z:r, box:x,y,z:hx,hy,hz, cylinder:x,y,z:r,h, or mesh:<path>
-      --particle-radius <R>         Custom particle radius override (smaller = finer fluid)
+      --obstacle <SPEC>             Add collider: sphere:x,y,z:r[:bounce[:slip]], box:..., cylinder:..., or obj:path:x,y,z:scale[:rx,ry,rz]
+
+Resolution & Timeline:
+  -q, --quality <QUALITY>           Interactive: draft..extreme; CLI-only: studio (~2.5M), film (~4.9M), master (~8.2M) [default: medium]
+      --particles <COUNT>           Target initial particle count override
+      --particle-radius <R>         Custom particle radius override
       --spacing <S>                 Custom particle spacing override
-  -t, --time <SECONDS>              Total simulation duration in seconds (e.g. --time 4.0)
-      --fps <FPS>                   Framerate for video export and simulation stepping [default: 60]
-      --frames <FRAMES>             Number of simulation frames to run if --time is not set [default: 120]
-      --dt <DT>                     Custom time step dt per frame (defaults to 1.0 / fps)
-      --export-mp4 <PATH>           Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
-      --export-obj <DIR>            Directory to export reconstructed Wavefront .OBJ surface mesh sequence
-      --video-width <WIDTH>         Video export width in pixels [default: 1280]
-      --video-height <HEIGHT>       Video export height in pixels [default: 720]
-      --export-ply <DIR>            Directory to export PLY point cloud frames
-      --benchmark                   Print performance benchmark statistics
-  -h, --help                        Print help
-  -V, --version                     Print version
+  -t, --time <SECONDS>              Total simulation duration in seconds
+      --fps <FPS>                   Framerate for export and simulation stepping [default: 60]
+      --sim-speed <MULT>            Simulation speed / ASMR slow-motion multiplier (e.g. 0.25) [default: 1.0]
+
+Fluid Physics & Solver:
+      --fluid-preset <NAME>         Substance profile: water, ocean, oil, honey, glycerin, mercury, lava, zero-g
+      --viscosity <V>               XSPH artificial viscosity override
+      --surface-tension <ST>        Macroscopic cohesive surface tension override
+      --vorticity <VORT>            Swirl / vorticity confinement strength override
+      --air-drag <DRAG>             Aerodynamic spray drag on isolated airborne droplets
+      --gravity <Y|GX,GY,GZ>        Gravity override (scalar Y such as -9.81, or 3D vector gx,gy,gz)
+      --restitution <BOUNCE>        Chamber wall bounce / restitution [0..1]
+      --friction <SLIP>             Chamber wall tangential friction [0..1]
+      --substeps <N>                Physics substeps per frame override
+      --iterations <N>              PBF pressure solver iterations per substep override
+      --wave-amp <AMP>              Sinusoidal wave-maker amplitude (0 = off)
+      --wave-freq <HZ>              Wave-maker oscillation frequency in Hz [default: 0.85]
+
+Visuals, Environment, Camera & Export:
+      --surface-mesh                Enable reconstructed 3D liquid surface mesh + PBR refraction/caustics
+      --color-mode <MODE>           Particle coloring: velocity, pressure, density, height, energy, foam, vorticity, solid
+      --color-map <MAP>             Colormap: ocean, turbo, viridis, magma, inferno, ice
+      --env-preset <ENV>            Studio sky & lighting: studio, daylight, sunset, arctic, abyssal
+      --exposure <EXP>              Filmic camera exposure multiplier [default: 1.0]
+      --camera-orbit <DEG_PER_SEC>  Continuous 3D turntable orbit speed in deg/s
+      --fov <DEGREES>               Vertical camera field of view in degrees [default: 45]
+      --render-quality <MODE>       Offline render AA & optics: standard (1x), studio (2x2), cinema (3x3), master (4x4, CRF 11)
+      --res, --resolution <RES>     Video/PNG resolution preset: 480p..8k, optional -vertical, or WxH
+      --export-mp4 <FILE.mp4>       Export H.264 MP4 video via FFmpeg
+      --export-png <FILE.png>       Render simulation and save final studio PNG frame
+      --export-obj <DIR>            Export reconstructed Wavefront .OBJ surface mesh sequence
+      --export-ply <DIR>            Export Stanford .PLY point cloud sequence
+      --headless / --benchmark      Run without GUI window / print throughput statistics
 ```
 
 ---

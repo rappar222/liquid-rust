@@ -135,6 +135,22 @@ impl SimulationQuality {
         }
     }
 
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "draft" | "low" => Some(SimulationQuality::Draft),
+            "medium" | "med" => Some(SimulationQuality::Medium),
+            "high" => Some(SimulationQuality::High),
+            "ultra" => Some(SimulationQuality::Ultra),
+            "cinematic" => Some(SimulationQuality::Cinematic),
+            "extreme" | "max" => Some(SimulationQuality::Extreme),
+            "studio" => Some(SimulationQuality::Studio),
+            "film" => Some(SimulationQuality::Film),
+            "master" => Some(SimulationQuality::Master),
+            "custom" => Some(SimulationQuality::Custom),
+            _ => None,
+        }
+    }
+
     pub fn apply(&self, config: &mut SolverConfig, is_2d: bool) {
         match self {
             SimulationQuality::Draft => {
@@ -212,6 +228,175 @@ impl SimulationQuality {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FluidPhysicsPreset {
+    Water,
+    Ocean,
+    Oil,
+    Honey,
+    Glycerin,
+    Mercury,
+    Lava,
+    ZeroG,
+    Custom,
+}
+
+impl FluidPhysicsPreset {
+    pub const ALL: &'static [FluidPhysicsPreset] = &[
+        FluidPhysicsPreset::Water,
+        FluidPhysicsPreset::Ocean,
+        FluidPhysicsPreset::Oil,
+        FluidPhysicsPreset::Honey,
+        FluidPhysicsPreset::Glycerin,
+        FluidPhysicsPreset::Mercury,
+        FluidPhysicsPreset::Lava,
+        FluidPhysicsPreset::ZeroG,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            FluidPhysicsPreset::Water => "Pure Water",
+            FluidPhysicsPreset::Ocean => "Ocean Surf",
+            FluidPhysicsPreset::Oil => "Olive Oil",
+            FluidPhysicsPreset::Honey => "Warm Honey",
+            FluidPhysicsPreset::Glycerin => "Thick Glycerin",
+            FluidPhysicsPreset::Mercury => "Liquid Mercury",
+            FluidPhysicsPreset::Lava => "Molten Lava",
+            FluidPhysicsPreset::ZeroG => "Zero-G Gel",
+            FluidPhysicsPreset::Custom => "Custom",
+        }
+    }
+
+    pub fn slug(&self) -> &'static str {
+        match self {
+            FluidPhysicsPreset::Water => "water",
+            FluidPhysicsPreset::Ocean => "ocean",
+            FluidPhysicsPreset::Oil => "oil",
+            FluidPhysicsPreset::Honey => "honey",
+            FluidPhysicsPreset::Glycerin => "glycerin",
+            FluidPhysicsPreset::Mercury => "mercury",
+            FluidPhysicsPreset::Lava => "lava",
+            FluidPhysicsPreset::ZeroG => "zero-g",
+            FluidPhysicsPreset::Custom => "custom",
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "water" | "pure-water" => Some(FluidPhysicsPreset::Water),
+            "ocean" | "sea" | "surf" => Some(FluidPhysicsPreset::Ocean),
+            "oil" | "olive-oil" => Some(FluidPhysicsPreset::Oil),
+            "honey" | "syrup" => Some(FluidPhysicsPreset::Honey),
+            "glycerin" | "glycerol" => Some(FluidPhysicsPreset::Glycerin),
+            "mercury" | "quicksilver" => Some(FluidPhysicsPreset::Mercury),
+            "lava" | "magma" => Some(FluidPhysicsPreset::Lava),
+            "zero-g" | "zerog" | "gel" => Some(FluidPhysicsPreset::ZeroG),
+            "custom" => Some(FluidPhysicsPreset::Custom),
+            _ => None,
+        }
+    }
+
+    pub fn apply(&self, config: &mut SolverConfig) {
+        match self {
+            FluidPhysicsPreset::Water => {
+                config.viscosity = 0.10;
+                config.surface_tension = 0.065;
+                config.vorticity = 0.050;
+                config.tensile_k = 0.0010;
+                config.air_drag = 0.35;
+                config.restitution = 0.02;
+                config.boundary_friction = 0.96;
+                if config.gravity.length_squared() < 1e-4 {
+                    config.gravity = Vec3::new(0.0, -9.81, 0.0);
+                }
+            }
+            FluidPhysicsPreset::Ocean => {
+                config.viscosity = 0.06;
+                config.surface_tension = 0.050;
+                config.vorticity = 0.075;
+                config.tensile_k = 0.0008;
+                config.air_drag = 0.48;
+                config.restitution = 0.03;
+                config.boundary_friction = 0.97;
+                if config.gravity.length_squared() < 1e-4 {
+                    config.gravity = Vec3::new(0.0, -9.81, 0.0);
+                }
+            }
+            FluidPhysicsPreset::Oil => {
+                config.viscosity = 0.32;
+                config.surface_tension = 0.045;
+                config.vorticity = 0.020;
+                config.tensile_k = 0.0015;
+                config.air_drag = 0.25;
+                config.restitution = 0.01;
+                config.boundary_friction = 0.90;
+                if config.gravity.length_squared() < 1e-4 {
+                    config.gravity = Vec3::new(0.0, -9.81, 0.0);
+                }
+            }
+            FluidPhysicsPreset::Honey => {
+                config.viscosity = 0.78;
+                config.surface_tension = 0.095;
+                config.vorticity = 0.004;
+                config.tensile_k = 0.0025;
+                config.air_drag = 0.15;
+                config.restitution = 0.00;
+                config.boundary_friction = 0.28;
+                if config.gravity.length_squared() < 1e-4 {
+                    config.gravity = Vec3::new(0.0, -9.81, 0.0);
+                }
+            }
+            FluidPhysicsPreset::Glycerin => {
+                config.viscosity = 0.88;
+                config.surface_tension = 0.085;
+                config.vorticity = 0.002;
+                config.tensile_k = 0.0030;
+                config.air_drag = 0.12;
+                config.restitution = 0.00;
+                config.boundary_friction = 0.20;
+                if config.gravity.length_squared() < 1e-4 {
+                    config.gravity = Vec3::new(0.0, -9.81, 0.0);
+                }
+            }
+            FluidPhysicsPreset::Mercury => {
+                config.viscosity = 0.08;
+                config.surface_tension = 0.250;
+                config.vorticity = 0.035;
+                config.tensile_k = 0.0040;
+                config.air_drag = 0.08;
+                config.restitution = 0.08;
+                config.boundary_friction = 0.99;
+                if config.gravity.length_squared() < 1e-4 {
+                    config.gravity = Vec3::new(0.0, -9.81, 0.0);
+                }
+            }
+            FluidPhysicsPreset::Lava => {
+                config.viscosity = 0.85;
+                config.surface_tension = 0.130;
+                config.vorticity = 0.008;
+                config.tensile_k = 0.0030;
+                config.air_drag = 0.10;
+                config.restitution = 0.00;
+                config.boundary_friction = 0.15;
+                if config.gravity.length_squared() < 1e-4 {
+                    config.gravity = Vec3::new(0.0, -9.81, 0.0);
+                }
+            }
+            FluidPhysicsPreset::ZeroG => {
+                config.gravity = Vec3::ZERO;
+                config.viscosity = 0.18;
+                config.surface_tension = 0.140;
+                config.vorticity = 0.025;
+                config.tensile_k = 0.0040;
+                config.air_drag = 0.05;
+                config.restitution = 0.06;
+                config.boundary_friction = 0.96;
+            }
+            FluidPhysicsPreset::Custom => {}
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SolverConfig {
     pub particle_radius: f32,     // Physical radius for collisions
@@ -223,11 +408,14 @@ pub struct SolverConfig {
     pub viscosity: f32,           // Normalized XSPH viscosity [0.0, 1.0]
     pub surface_tension: f32,     // Free-surface cohesion coefficient
     pub vorticity: f32,           // Vorticity confinement strength for natural turbulent eddies
+    pub air_drag: f32,            // Aerodynamic drag on sparse airborne splash droplets
     pub restitution: f32,         // Boundary restitution (0.0 for inelastic water, no bouncing)
     pub boundary_friction: f32,   // Wall friction
     pub gravity: Vec3,
     pub tensile_k: f32,           // Tensile instability correction coefficient
     pub max_velocity: f32,
+    pub wave_amplitude: f32,      // Wave-maker paddle amplitude in meters (0.0 = off)
+    pub wave_frequency: f32,      // Wave-maker frequency in Hz
 }
 
 impl Default for SolverConfig {
@@ -247,11 +435,14 @@ impl Default for SolverConfig {
             viscosity: 0.12,
             surface_tension: 0.06,
             vorticity: 0.045,
+            air_drag: 0.35,
             restitution: 0.02, // Inelastic fluid impact: practically 0 bounce
             boundary_friction: 0.95,
             gravity: Vec3::new(0.0, -9.81, 0.0),
             tensile_k: 0.001,
             max_velocity: 12.0,
+            wave_amplitude: 0.0,
+            wave_frequency: 0.85,
         }
     }
 }
@@ -314,6 +505,7 @@ pub struct SphSolver {
     pub kernels: SphKernels,
     pub grid: SpatialHashGrid,
     pub is_2d: bool,
+    pub sim_time: f32,
 
     // Working buffers for PBF (Position-Based Fluids)
     predicted_positions: Vec<Vec3>,
@@ -348,6 +540,7 @@ impl SphSolver {
             kernels,
             grid,
             is_2d: false,
+            sim_time: 0.0,
             predicted_positions: Vec::new(),
             old_positions: Vec::new(),
             lambdas: Vec::new(),
@@ -406,6 +599,7 @@ impl SphSolver {
     pub fn clear_particles(&mut self) {
         self.particles.clear();
         self.next_particle_id = 0;
+        self.sim_time = 0.0;
     }
 
     pub fn particle_count(&self) -> usize {
@@ -468,6 +662,7 @@ impl SphSolver {
     }
 
     fn pbf_substep(&mut self, dt: f32, frame_dt: f32) {
+        self.sim_time += dt;
         let n = self.particles.len();
         let use_parallel = n >= PAR_THRESHOLD;
 
@@ -491,6 +686,15 @@ impl SphSolver {
         let mouse_strength = self.mouse_force_strength;
         let is_2d = self.is_2d;
         let chamber = &self.chamber;
+        let wave_accel_x = if self.config.wave_amplitude > 1e-4 {
+            let omega = std::f32::consts::TAU * self.config.wave_frequency.clamp(0.05, 8.0);
+            self.config.wave_amplitude
+                * (omega * omega).clamp(1.0, 42.0)
+                * (omega * self.sim_time).sin()
+        } else {
+            0.0
+        };
+        let wave_zone_w = ((bounds.max.x - bounds.min.x) * 0.45).max(0.1);
 
         // Precompute planar mouse hit in 2D mode
         let mouse_hit_2d = if is_2d && mouse_mode != 0 {
@@ -499,7 +703,7 @@ impl SphSolver {
             None
         };
 
-        // 2. Predict positions with gravity & mouse interaction
+        // 2. Predict positions with gravity, wave maker & mouse interaction
         let predict_one = |(p, (old_out, pred_out)): (&mut Particle, (&mut Vec3, &mut Vec3))| {
             *old_out = p.position;
 
@@ -536,7 +740,14 @@ impl SphSolver {
                 }
             }
 
-            let accel = gravity + f_user;
+            let mut f_wave = Vec3::ZERO;
+            if wave_accel_x.abs() > 1e-5 {
+                let paddle_w =
+                    0.30 + 0.70 * (1.0 - (p.position.x - bounds.min.x) / wave_zone_w).clamp(0.0, 1.0);
+                f_wave.x = wave_accel_x * paddle_w;
+            }
+
+            let accel = gravity + f_user + f_wave;
             p.velocity += accel * dt;
 
             let mut pred = p.position + p.velocity * dt;
@@ -815,6 +1026,9 @@ impl SphSolver {
         let max_vel = self.config.max_velocity;
         let restitution = self.config.restitution;
         let friction = self.config.boundary_friction;
+        let air_drag = self.config.air_drag.max(0.0);
+        let visc_raw = self.config.viscosity.clamp(0.0, 0.95);
+        let creep = ((visc_raw - 0.25) / 0.70).clamp(0.0, 1.0);
         let pred_pos = &self.predicted_positions;
         let old_pos_slice = &self.old_positions;
         let densities = &self.densities;
@@ -826,7 +1040,13 @@ impl SphSolver {
 
             let mut new_pos = pred_pos[i];
             let old_pos = old_pos_slice[i];
+            if !new_pos.is_finite() {
+                new_pos = bounds.center();
+            }
             let mut vel = (new_pos - old_pos) * inv_dt;
+            if !vel.is_finite() {
+                vel = Vec3::ZERO;
+            }
 
             chamber.resolve_velocity(
                 new_pos,
@@ -848,6 +1068,28 @@ impl SphSolver {
                 vel.z = 0.0;
             }
 
+            // Stokes/Poiseuille creeping boundary-layer shear for high-viscosity fluids (Oil, Honey, Glycerin, Lava)
+            if creep > 0.0 {
+                let floor_prox = (1.0 - ((new_pos.y - bounds.min.y) / (6.0 * h))).clamp(0.0, 1.0);
+                let c2 = creep * creep;
+                let h_damp = 1.0 / (1.0 + c2 * (2.0 + 10.0 * floor_prox) * dt);
+                let v_damp = 1.0 / (1.0 + c2 * 1.2 * dt);
+                vel.x *= h_damp;
+                vel.z *= h_damp;
+                vel.y *= v_damp;
+            }
+
+            // Aerodynamic drag on sparse airborne splash droplets (bulk liquid unaffected)
+            if air_drag > 1e-4 {
+                let rho_ratio = densities[i] * inv_rho0;
+                let exposure = ((0.58 - rho_ratio) / 0.42).clamp(0.0, 1.0);
+                let cur_spd = vel.length();
+                if exposure > 0.0 && cur_spd > 0.20 {
+                    let drag_rate = air_drag * exposure * (0.60 + 0.35 * cur_spd);
+                    vel *= 1.0 / (1.0 + drag_rate * dt);
+                }
+            }
+
             let speed = vel.length();
             if speed > max_vel {
                 vel = (vel / speed) * max_vel;
@@ -855,8 +1097,8 @@ impl SphSolver {
 
             p.velocity = vel;
             p.position = new_pos;
-            p.density = densities[i];
-            p.pressure = (densities[i] - rho0).max(0.0);
+            p.density = if densities[i].is_finite() { densities[i] } else { rho0 };
+            p.pressure = (p.density - rho0).max(0.0);
         };
 
         if use_parallel {

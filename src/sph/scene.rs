@@ -38,6 +38,31 @@ impl ScenePreset {
             ScenePreset::Empty => "Empty Basin (Faucets / Inflow)",
         }
     }
+
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ScenePreset::DamBreak => "dam-break",
+            ScenePreset::DoubleDamBreak => "double-dam",
+            ScenePreset::DropletSplash => "splash",
+            ScenePreset::ObstacleDrop => "obstacle",
+            ScenePreset::VortexTornado => "vortex",
+            ScenePreset::ZeroGravityBlobs => "zero-g",
+            ScenePreset::Empty => "empty",
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dam-break" | "dam" | "dambreak" => Some(ScenePreset::DamBreak),
+            "double-dam" | "double" | "doubledam" => Some(ScenePreset::DoubleDamBreak),
+            "splash" | "droplet" | "droplet-splash" => Some(ScenePreset::DropletSplash),
+            "obstacle" | "obstacle-drop" => Some(ScenePreset::ObstacleDrop),
+            "vortex" | "tornado" | "vortex-tornado" => Some(ScenePreset::VortexTornado),
+            "zero-g" | "zerog" | "zero-gravity" => Some(ScenePreset::ZeroGravityBlobs),
+            "empty" | "basin" | "faucet" => Some(ScenePreset::Empty),
+            _ => None,
+        }
+    }
 }
 
 pub struct SceneGenerator;
@@ -109,7 +134,7 @@ impl SceneGenerator {
         particles
     }
 
-    /// Spawn spherical cluster of particles on lattice
+    /// Spawn spherical cluster of particles on lattice (3D)
     pub fn spawn_sphere(
         center: Vec3,
         radius: f32,
@@ -140,10 +165,38 @@ impl SceneGenerator {
         particles
     }
 
+    /// Spawn planar circular disc of particles on Z=0 lattice (2D)
+    pub fn spawn_disc_2d(
+        center: Vec3,
+        radius: f32,
+        spacing: f32,
+        initial_vel: Vec3,
+        start_id: &mut u32,
+    ) -> Vec<Particle> {
+        let mut particles = Vec::new();
+        let r2 = radius * radius;
+        let steps = (radius / spacing).ceil() as i32;
+        let vel_2d = Vec3::new(initial_vel.x, initial_vel.y, 0.0);
+
+        for ix in -steps..=steps {
+            for iy in -steps..=steps {
+                let dx = ix as f32 * spacing;
+                let dy = iy as f32 * spacing;
+                if dx * dx + dy * dy <= r2 {
+                    let pos = Vec3::new(center.x + dx, center.y + dy, 0.0);
+                    particles.push(Particle::new(pos, vel_2d, 1.0, *start_id));
+                    *start_id += 1;
+                }
+            }
+        }
+        particles
+    }
+
     /// Setup solver for specified preset
     pub fn setup_scene(solver: &mut SphSolver, preset: ScenePreset) {
         solver.clear_particles();
         solver.colliders.clear();
+        solver.sim_time = 0.0;
         let mut id = 0;
 
         let spacing = solver.config.spacing;
@@ -217,15 +270,14 @@ impl SceneGenerator {
                         solver.add_particle(p);
                     }
 
-                    let drop = Self::spawn_sphere(
+                    let drop = Self::spawn_disc_2d(
                         Vec3::new(0.0, 0.85, 0.0),
                         0.18,
                         spacing,
                         Vec3::new(0.0, -3.5, 0.0),
                         &mut id,
                     );
-                    for mut p in drop {
-                        p.position.z = 0.0;
+                    for p in drop {
                         solver.add_particle(p);
                     }
                 }
@@ -285,27 +337,25 @@ impl SceneGenerator {
                     solver.config.viscosity = 0.10;
                     solver.config.tensile_k = 0.005;
 
-                    let b1 = Self::spawn_sphere(
+                    let b1 = Self::spawn_disc_2d(
                         Vec3::new(-0.35, 0.6, 0.0),
                         0.20,
                         spacing,
                         Vec3::new(0.6, 0.0, 0.0),
                         &mut id,
                     );
-                    for mut p in b1 {
-                        p.position.z = 0.0;
+                    for p in b1 {
                         solver.add_particle(p);
                     }
 
-                    let b2 = Self::spawn_sphere(
+                    let b2 = Self::spawn_disc_2d(
                         Vec3::new(0.35, 0.65, 0.0),
                         0.16,
                         spacing,
                         Vec3::new(-0.6, 0.0, 0.0),
                         &mut id,
                     );
-                    for mut p in b2 {
-                        p.position.z = 0.0;
+                    for p in b2 {
                         solver.add_particle(p);
                     }
                 }
@@ -452,14 +502,14 @@ impl SceneGenerator {
                     }
                 }
                 ScenePreset::ZeroGravityBlobs => {
-                    solver.bounds = Aabb::new(Vec3::new(-0.8, -0.8, -0.8), Vec3::new(0.8, 0.8, 0.8));
+                    solver.bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.8), Vec3::new(0.8, 1.4, 0.8));
                     solver.config.gravity = Vec3::ZERO;
                     solver.config.viscosity = 0.12;
                     solver.config.tensile_k = 0.005;
 
                     // Two floating liquid spheres moving towards each other
                     let b1 = Self::spawn_sphere(
-                        Vec3::new(-0.35, 0.0, 0.0),
+                        Vec3::new(-0.35, 0.68, 0.0),
                         0.20,
                         spacing,
                         Vec3::new(0.5, 0.0, 0.0),
@@ -470,7 +520,7 @@ impl SceneGenerator {
                     }
 
                     let b2 = Self::spawn_sphere(
-                        Vec3::new(0.35, 0.05, 0.0),
+                        Vec3::new(0.35, 0.73, 0.0),
                         0.16,
                         spacing,
                         Vec3::new(-0.5, 0.0, 0.0),

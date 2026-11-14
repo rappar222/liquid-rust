@@ -1,13 +1,19 @@
-use crate::export::{Mp4Encoder, PlyExporter, SoftwareRenderer};
+use crate::export::{Mp4Encoder, PlyExporter, PngExporter, SoftwareRenderer};
 use crate::gpu::GpuSphSolver;
 use crate::math::{unproject_mouse_ray, Aabb};
 use crate::render::{
-    Camera, ColorMap, ColorMapType, ColorMode, FluidMaterialPreset, GlRenderer, MeshTextureMode,
-    ParticleVertex, RenderMode, SurfaceMesh, SurfaceMeshConfig,
+    Camera, CliRenderQuality, ColorMap, ColorMapType, ColorMode, EnvironmentPreset,
+    FluidMaterialPreset, GlRenderer, MeshTextureMode, ParticleVertex, RenderMode, SurfaceMesh,
+    SurfaceMeshConfig,
+};
+use crate::scene_io::{
+    CameraDto, ChamberDto, ColliderDto, DrainDto, FaucetDto, SceneConfigFile, SolverConfigDto,
+    SurfaceMeshDto, VisualsDto,
 };
 use crate::sph::scene::{SceneGenerator, ScenePreset};
 use crate::sph::solver::{
-    compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver,
+    compute_lattice_rest_density, compute_lattice_rest_density_2d, FluidPhysicsPreset,
+    SimulationQuality, SolverConfig, SphSolver,
 };
 use crate::sph::{ChamberShape, Collider, ColliderShape, CubeFace, Drain, Faucet, FaucetShape};
 use crate::updater::{
@@ -26,6 +32,7 @@ use std::time::Instant;
 pub enum CliCommandMode {
     Gui,
     Mp4Video,
+    PngFrame,
     Headless,
     PlySequence,
 }
@@ -34,6 +41,7 @@ impl CliCommandMode {
     pub const ALL: &'static [CliCommandMode] = &[
         CliCommandMode::Gui,
         CliCommandMode::Mp4Video,
+        CliCommandMode::PngFrame,
         CliCommandMode::Headless,
         CliCommandMode::PlySequence,
     ];
@@ -42,6 +50,7 @@ impl CliCommandMode {
         match self {
             CliCommandMode::Gui => "Interactive GUI",
             CliCommandMode::Mp4Video => "MP4 Video",
+            CliCommandMode::PngFrame => "PNG Frame",
             CliCommandMode::Headless => "Headless Sim",
             CliCommandMode::PlySequence => "PLY Sequence",
         }
@@ -54,6 +63,31 @@ pub enum InspectorTab {
     Physics,
     Surface,
     RenderCli,
+}
+
+/// Crisp geometric vector icons painted directly via `egui::Painter` so every button, tab,
+/// and status badge renders cleanly across all Linux/macOS/Windows fonts without missing glyphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiIcon {
+    Wave,
+    Cube3D,
+    Plane2D,
+    Play,
+    Pause,
+    Step,
+    Reset,
+    Camera,
+    Spheres,
+    Mesh,
+    Sliders,
+    Film,
+    Copy,
+    Folder,
+    Save,
+    Image,
+    Help,
+    Warning,
+    Bolt,
 }
 
 /// Shared progress state for non-blocking background MP4 video rendering initiated from the GUI.
@@ -71,11 +105,13 @@ pub struct LiquidApp {
     pub use_gpu: bool,
     pub gpu_device_name: String,
     pub camera: Camera,
+    pub camera_orbit_speed_deg: f32,
     pub is_playing: bool,
     pub fixed_dt: f32,
     pub sim_speed: f32,
     pub current_preset: ScenePreset,
     pub current_quality: SimulationQuality,
+    pub fluid_preset: FluidPhysicsPreset,
 
     // Rendering & Surface Meshing settings
     pub renderer: Arc<Mutex<Option<GlRenderer>>>,
@@ -89,6 +125,7 @@ pub struct LiquidApp {
     pub sun_elevation_deg: f32,
 
     pub lit_spheres: bool,
+    pub particle_foam: bool,
     pub enable_culling: bool,
     pub drawn_particles_count: usize,
     pub color_mode: ColorMode,
@@ -103,6 +140,7 @@ pub struct LiquidApp {
 
     // Diagnostics
     pub last_frame_time: Instant,
+    pub last_camera_tick: Instant,
     pub frame_counter: usize,
     pub current_fps: f32,
     pub last_step_time_ms: f32,
@@ -111,13 +149,19 @@ pub struct LiquidApp {
     pub active_tab: InspectorTab,
     pub theme_applied: bool,
     pub export_path: String,
+    pub png_output_path: String,
+    pub scene_file_path: String,
     pub export_sequence: bool,
     pub exported_frames_count: usize,
     pub status_message: String,
     pub show_extreme_modal: bool,
+    pub show_shortcuts_modal: bool,
     pub obj_file_path: String,
     pub obj_browse_pending: Arc<AtomicBool>,
     pub obj_browse_result: Arc<Mutex<Option<String>>>,
+    pub scene_browse_pending: Arc<AtomicBool>,
+    pub scene_load_result: Arc<Mutex<Option<String>>>,
+    pub scene_save_result: Arc<Mutex<Option<String>>>,
     pub next_collider_id: u32,
     pub next_faucet_id: u32,
     pub next_drain_id: u32,
@@ -126,6 +170,7 @@ pub struct LiquidApp {
     pub cli_duration: f32,
     pub cli_fps: u32,
     pub cli_mp4_output: String,
+    pub gui_render_quality: CliRenderQuality,
     pub video_width: usize,
     pub video_height: usize,
 
@@ -219,6 +264,7 @@ impl LiquidApp {
         let mesh_config = SurfaceMeshConfig::default();
         let (az, el) = Self::dir_to_angles(mesh_config.light_dir);
         let init_cap = solver.particles.len();
+        let now = Instant::now();
 
         Self {
             solver,
@@ -226,11 +272,13 @@ impl LiquidApp {
             use_gpu,
             gpu_device_name,
             camera: Camera::default(),
+            camera_orbit_speed_deg: 0.0,
             is_playing,
             fixed_dt: 0.016,
             sim_speed: 1.0,
             current_preset: preset,
             current_quality: SimulationQuality::Medium,
+            fluid_preset: FluidPhysicsPreset::Water,
             renderer,
             render_mode: RenderMode::Particles,
             mesh_config,
@@ -241,6 +289,7 @@ impl LiquidApp {
             sun_azimuth_deg: az,
             sun_elevation_deg: el,
             lit_spheres: true,
+            particle_foam: true,
             enable_culling: true,
             drawn_particles_count: 0,
             color_mode: ColorMode::Velocity,
@@ -250,20 +299,27 @@ impl LiquidApp {
             sphere_obstacle_radius: 0.22,
             sphere_obstacle_enabled: false,
             render_vertices: Vec::with_capacity(init_cap),
-            last_frame_time: Instant::now(),
+            last_frame_time: now,
+            last_camera_tick: now,
             frame_counter: 0,
             current_fps: 60.0,
             last_step_time_ms: 0.0,
             active_tab: InspectorTab::Scene,
             theme_applied: false,
             export_path: "exports".to_string(),
+            png_output_path: "snapshot.png".to_string(),
+            scene_file_path: "scene.json".to_string(),
             export_sequence: false,
             exported_frames_count: 0,
             status_message: "Ready".to_string(),
             show_extreme_modal: false,
+            show_shortcuts_modal: false,
             obj_file_path: "model.obj".to_string(),
             obj_browse_pending: Arc::new(AtomicBool::new(false)),
             obj_browse_result: Arc::new(Mutex::new(None)),
+            scene_browse_pending: Arc::new(AtomicBool::new(false)),
+            scene_load_result: Arc::new(Mutex::new(None)),
+            scene_save_result: Arc::new(Mutex::new(None)),
             next_collider_id: 1,
             next_faucet_id: 1,
             next_drain_id: 1,
@@ -272,6 +328,7 @@ impl LiquidApp {
             cli_duration: 5.0,
             cli_fps: 60,
             cli_mp4_output: "simulation.mp4".to_string(),
+            gui_render_quality: CliRenderQuality::Standard,
             video_width: 1280,
             video_height: 720,
             bg_render: Arc::new(Mutex::new(BgRenderState {
@@ -289,35 +346,35 @@ impl LiquidApp {
     /// Apply sleek dark engineering studio theme to `egui`.
     pub fn apply_studio_theme(ctx: &egui::Context) {
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(11, 15, 23);
-        visuals.window_fill = egui::Color32::from_rgb(14, 19, 30);
+        visuals.panel_fill = egui::Color32::from_rgb(10, 14, 22);
+        visuals.window_fill = egui::Color32::from_rgb(13, 18, 28);
         visuals.extreme_bg_color = egui::Color32::from_rgb(7, 10, 16);
-        visuals.faint_bg_color = egui::Color32::from_rgb(17, 23, 36);
-        visuals.code_bg_color = egui::Color32::from_rgb(9, 13, 21);
+        visuals.faint_bg_color = egui::Color32::from_rgb(16, 22, 34);
+        visuals.code_bg_color = egui::Color32::from_rgb(8, 12, 20);
 
-        let border_subtle = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(34, 46, 68));
-        let border_hover = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(66, 138, 225));
-        let accent_fill = egui::Color32::from_rgb(22, 108, 196);
-        let accent_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(78, 178, 255));
+        let border_subtle = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(33, 45, 67));
+        let border_hover = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(68, 142, 230));
+        let accent_fill = egui::Color32::from_rgb(20, 110, 200);
+        let accent_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(82, 182, 255));
 
-        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(15, 20, 31);
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(14, 19, 30);
         visuals.widgets.noninteractive.bg_stroke = border_subtle;
         visuals.widgets.noninteractive.fg_stroke =
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(206, 216, 232));
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(208, 218, 234));
         visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
 
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(22, 30, 46);
-        visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(19, 26, 40);
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(21, 29, 45);
+        visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(18, 25, 39);
         visuals.widgets.inactive.bg_stroke = border_subtle;
         visuals.widgets.inactive.fg_stroke =
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(222, 230, 244));
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(224, 232, 246));
         visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
 
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(31, 43, 66);
-        visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(28, 39, 60);
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(30, 42, 65);
+        visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(27, 38, 59);
         visuals.widgets.hovered.bg_stroke = border_hover;
         visuals.widgets.hovered.fg_stroke =
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(245, 250, 255));
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(246, 251, 255));
         visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
 
         visuals.widgets.active.bg_fill = accent_fill;
@@ -332,7 +389,7 @@ impl LiquidApp {
         visuals.window_stroke = border_subtle;
 
         let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(7.0, 6.0);
+        style.spacing.item_spacing = egui::vec2(7.0, 5.5);
         style.spacing.button_padding = egui::vec2(8.0, 4.5);
         style.spacing.window_margin = egui::Margin::same(10);
         style.visuals = visuals;
@@ -363,6 +420,35 @@ impl LiquidApp {
         .normalize_or_zero();
     }
 
+    pub fn apply_fluid_preset(&mut self, preset: FluidPhysicsPreset) {
+        self.fluid_preset = preset;
+        preset.apply(&mut self.solver.config);
+        self.status_message = format!("Fluid substance: {}", preset.name());
+    }
+
+    pub fn apply_matching_visual_material(&mut self) {
+        let mat = match self.fluid_preset {
+            FluidPhysicsPreset::Water => FluidMaterialPreset::ClearWater,
+            FluidPhysicsPreset::Ocean => FluidMaterialPreset::DeepOcean,
+            FluidPhysicsPreset::Oil | FluidPhysicsPreset::Honey | FluidPhysicsPreset::Lava => {
+                FluidMaterialPreset::MoltenAmber
+            }
+            FluidPhysicsPreset::Glycerin => FluidMaterialPreset::EmeraldGel,
+            FluidPhysicsPreset::Mercury => FluidMaterialPreset::LiquidChrome,
+            FluidPhysicsPreset::ZeroG => FluidMaterialPreset::TropicalLagoon,
+            FluidPhysicsPreset::Custom => self.mesh_config.preset,
+        };
+        mat.apply(&mut self.mesh_config);
+        self.color_map = match self.fluid_preset {
+            FluidPhysicsPreset::Lava => ColorMapType::Inferno,
+            FluidPhysicsPreset::Honey | FluidPhysicsPreset::Oil => ColorMapType::Fire,
+            FluidPhysicsPreset::Mercury => ColorMapType::Ice,
+            FluidPhysicsPreset::Glycerin => ColorMapType::Viridis,
+            _ => ColorMapType::Ocean,
+        };
+        self.status_message = format!("Matched optical material: {}", mat.name());
+    }
+
     pub fn set_2d(&mut self, is_2d: bool) {
         self.is_2d = is_2d;
         self.solver.set_2d(is_2d);
@@ -371,6 +457,7 @@ impl LiquidApp {
             self.camera.elevation = 0.0;
             self.camera.target = Vec3::new(0.0, 0.6, 0.0);
             self.camera.distance = 2.4;
+            self.camera_orbit_speed_deg = 0.0;
         }
         self.solver.apply_quality(self.current_quality);
         self.load_preset(self.current_preset);
@@ -387,6 +474,14 @@ impl LiquidApp {
         if preset == ScenePreset::ObstacleDrop {
             self.sphere_obstacle_enabled = true;
         }
+        // Re-apply active non-default FluidPhysicsPreset (unless ZeroGravityBlobs explicitly overrides gravity)
+        if preset == ScenePreset::ZeroGravityBlobs {
+            self.fluid_preset = FluidPhysicsPreset::ZeroG;
+        } else if self.fluid_preset != FluidPhysicsPreset::Water
+            && self.fluid_preset != FluidPhysicsPreset::Custom
+        {
+            self.fluid_preset.apply(&mut self.solver.config);
+        }
         if let Some(ref mut gpu) = self.gpu_solver {
             gpu.init_buffers(
                 self.solver.bounds,
@@ -394,6 +489,14 @@ impl LiquidApp {
                 &self.solver.particles,
             );
         }
+        self.next_collider_id = self
+            .solver
+            .colliders
+            .iter()
+            .map(|c| c.id + 1)
+            .max()
+            .unwrap_or(1)
+            .max(self.next_collider_id);
         self.sim_time = 0.0;
         self.mesh_dirty = true;
         self.status_message = format!("Loaded preset: {}", preset.name());
@@ -406,6 +509,179 @@ impl LiquidApp {
         self.status_message = format!("Set quality: {}", quality.name_for(self.is_2d));
     }
 
+    pub fn reset_camera_framing(&mut self) {
+        if self.is_2d {
+            self.camera.azimuth = 0.0;
+            self.camera.elevation = 0.0;
+            self.camera.target = Vec3::new(0.0, 0.6, 0.0);
+            self.camera.distance = 2.4;
+        } else {
+            self.camera.reset();
+        }
+        self.camera_orbit_speed_deg = 0.0;
+    }
+
+    /// Snapshot complete studio state into a portable [`SceneConfigFile`].
+    pub fn to_scene_config_file(&self) -> SceneConfigFile {
+        SceneConfigFile {
+            version: 1,
+            preset: self.current_preset.slug().to_string(),
+            quality: self.current_quality.slug().to_string(),
+            fluid_preset: self.fluid_preset.slug().to_string(),
+            is_2d: self.is_2d,
+            sim_speed: self.sim_speed,
+            mouse_strength: self.solver.mouse_force_strength,
+            solver: SolverConfigDto::from_config(&self.solver.config),
+            chamber: ChamberDto::from_chamber(&self.solver.chamber),
+            colliders: self
+                .solver
+                .colliders
+                .iter()
+                .map(ColliderDto::from_collider)
+                .collect(),
+            faucets: self
+                .solver
+                .faucets
+                .iter()
+                .map(FaucetDto::from_faucet)
+                .collect(),
+            drains: self
+                .solver
+                .drains
+                .iter()
+                .map(DrainDto::from_drain)
+                .collect(),
+            camera: CameraDto::from_camera(&self.camera, self.camera_orbit_speed_deg),
+            visuals: VisualsDto {
+                render_mode: self.render_mode.slug().to_string(),
+                color_mode: self.color_mode.slug().to_string(),
+                color_map: self.color_map.slug().to_string(),
+                particle_scale: self.display_size_factor,
+                particle_foam: self.particle_foam,
+                lit_spheres: self.lit_spheres,
+                enable_culling: self.enable_culling,
+                mesh: SurfaceMeshDto::from_config(&self.mesh_config),
+            },
+        }
+    }
+
+    /// Restore full studio state from a loaded [`SceneConfigFile`].
+    pub fn apply_scene_config_file(&mut self, scene: &SceneConfigFile) {
+        self.is_2d = scene.is_2d;
+        self.solver.set_2d(scene.is_2d);
+        self.current_preset = scene.parsed_preset();
+        let mut q = scene.parsed_quality();
+        if q.is_cli_only() {
+            q = SimulationQuality::Extreme;
+        }
+        self.current_quality = q;
+        self.fluid_preset = scene.parsed_fluid_preset();
+        self.sim_speed = scene.sim_speed.clamp(0.05, 4.0);
+        self.solver.mouse_force_strength = scene.mouse_strength.clamp(1.0, 200.0);
+
+        let chamber = scene.chamber.to_chamber();
+        self.solver.set_chamber(chamber);
+        self.solver.config = scene.solver.to_config();
+        self.solver.config.rest_density = if self.is_2d {
+            compute_lattice_rest_density_2d(
+                self.solver.config.smoothing_length,
+                self.solver.config.spacing,
+            )
+        } else {
+            compute_lattice_rest_density(
+                self.solver.config.smoothing_length,
+                self.solver.config.spacing,
+            )
+        };
+        let saved_cfg = self.solver.config.clone();
+        SceneGenerator::setup_scene(&mut self.solver, self.current_preset);
+        self.solver.config = saved_cfg;
+
+        // Replace scene objects with saved colliders, faucets, and drains
+        self.solver.colliders.clear();
+        for (i, c_dto) in scene.colliders.iter().enumerate() {
+            if let Some(col) = c_dto.to_collider((i + 1) as u32) {
+                self.solver.colliders.push(col);
+            }
+        }
+        self.next_collider_id = (self.solver.colliders.len() as u32) + 1;
+
+        self.solver.faucets.clear();
+        for (i, f_dto) in scene.faucets.iter().enumerate() {
+            self.solver.faucets.push(f_dto.to_faucet((i + 1) as u32));
+        }
+        self.next_faucet_id = (self.solver.faucets.len() as u32) + 1;
+
+        self.solver.drains.clear();
+        for (i, d_dto) in scene.drains.iter().enumerate() {
+            self.solver.drains.push(d_dto.to_drain((i + 1) as u32));
+        }
+        self.next_drain_id = (self.solver.drains.len() as u32) + 1;
+
+        self.camera = scene.camera.to_camera();
+        self.camera_orbit_speed_deg = if self.is_2d {
+            0.0
+        } else {
+            scene.camera.orbit_speed_deg.clamp(-180.0, 180.0)
+        };
+
+        self.render_mode = scene.visuals.parsed_render_mode();
+        self.color_mode = scene.visuals.parsed_color_mode();
+        self.color_map = scene.visuals.parsed_color_map();
+        self.display_size_factor = scene.visuals.particle_scale.clamp(0.3, 3.0);
+        self.particle_foam = scene.visuals.particle_foam;
+        self.lit_spheres = scene.visuals.lit_spheres;
+        self.enable_culling = scene.visuals.enable_culling;
+        self.mesh_config = scene.visuals.mesh.to_config();
+        self.sync_sun_angles_from_dir();
+
+        if let Some(ref mut gpu) = self.gpu_solver {
+            gpu.init_buffers(
+                self.solver.bounds,
+                &self.solver.config,
+                &self.solver.particles,
+            );
+        }
+        self.sim_time = 0.0;
+        self.mesh_dirty = true;
+    }
+
+    pub fn save_scene_json(&mut self, path: &str) {
+        let trimmed = path.trim();
+        let target = if trimmed.is_empty() {
+            "scene.json"
+        } else {
+            trimmed
+        };
+        match self.to_scene_config_file().save_to_path(target) {
+            Ok(_) => {
+                self.scene_file_path = target.to_string();
+                self.status_message = format!("Saved studio scene to {}", target);
+            }
+            Err(e) => {
+                self.status_message = e;
+            }
+        }
+    }
+
+    pub fn load_scene_json(&mut self, path: &str) {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            self.status_message = "Scene load error: empty file path".to_string();
+            return;
+        }
+        match SceneConfigFile::load_from_path(trimmed) {
+            Ok(scene) => {
+                self.apply_scene_config_file(&scene);
+                self.scene_file_path = trimmed.to_string();
+                self.status_message = format!("Loaded studio scene from {}", trimmed);
+            }
+            Err(e) => {
+                self.status_message = e;
+            }
+        }
+    }
+
     fn step_simulation_once(&mut self, effective_dt: f32) {
         let start = Instant::now();
 
@@ -416,12 +692,12 @@ impl LiquidApp {
 
             if let Some(ref mut gpu) = self.gpu_solver {
                 if emitted {
-                    // Incremental slice upload instead of reallocating all GPU buffers
+                    // Emitted particles are strictly appended at the tail of `solver.particles`
                     gpu.sync_particles(
                         self.solver.bounds,
                         &self.solver.config,
                         &self.solver.particles,
-                        false,
+                        true,
                     );
                 }
                 gpu.step(
@@ -462,7 +738,7 @@ impl LiquidApp {
                             }
                         }
                         if p_hit {
-                            p.position = p.position.clamp(b_min, b_max);
+                            p.position = p.position.clamp(b_min.min(b_max), b_max.max(b_min));
                             if is_2d {
                                 p.position.z = 0.0;
                                 p.velocity.z = 0.0;
@@ -486,11 +762,12 @@ impl LiquidApp {
             let drained = self.solver.drain_particles();
             if drained > 0 {
                 if let Some(ref mut gpu) = self.gpu_solver {
+                    // Draining compacts interior indices (`retain`), so full upload (`append_only = false`) is required
                     gpu.sync_particles(
                         self.solver.bounds,
                         &self.solver.config,
                         &self.solver.particles,
-                        true,
+                        false,
                     );
                 }
             }
@@ -501,6 +778,78 @@ impl LiquidApp {
         self.sim_time += effective_dt;
         self.mesh_dirty = true;
         self.last_step_time_ms = start.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    pub fn export_current_png(&mut self) {
+        let dir = std::path::Path::new(&self.export_path);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            self.status_message = format!("PNG export error: {}", e);
+            return;
+        }
+        let path = dir.join(format!("fluid_frame_{:05}.png", self.exported_frames_count));
+        let width = self.video_width.max(320);
+        let height = self.video_height.max(240);
+
+        let mut sw = SoftwareRenderer::new_with_quality(width, height, self.gui_render_quality);
+        sw.enable_culling = self.enable_culling;
+        sw.lit_spheres = self.lit_spheres;
+        sw.particle_foam = self.particle_foam;
+        sw.env_preset = self.mesh_config.env_preset;
+        sw.exposure = self.mesh_config.exposure;
+        sw.show_grid = self.mesh_config.show_grid;
+        sw.show_wireframe = self.mesh_config.show_wireframe;
+        sw.light_dir = self.mesh_config.light_dir;
+        sw.light_intensity = self.mesh_config.light_intensity;
+        sw.ambient_intensity = self.mesh_config.ambient_intensity;
+
+        match self.render_mode {
+            RenderMode::Particles => {
+                sw.render_particles_studio(
+                    &self.solver.particles,
+                    self.solver.config.particle_radius * self.display_size_factor,
+                    &self.solver.chamber,
+                    self.solver.bounds,
+                    &self.solver.colliders,
+                    &self.camera,
+                    self.color_mode,
+                    self.color_map,
+                    self.solver.config.rest_density,
+                    self.is_2d,
+                );
+            }
+            RenderMode::SurfaceMesh => {
+                let mut mcfg = self.mesh_config.clone();
+                self.gui_render_quality
+                    .apply_to_mesh_config(&mut mcfg, false, false);
+                let mesh = SurfaceMesh::from_particles(
+                    &self.solver.particles,
+                    self.solver.config.particle_radius,
+                    self.solver.config.smoothing_length,
+                    &mcfg,
+                );
+                sw.render_surface_mesh_frame(
+                    &mesh,
+                    &mcfg,
+                    &self.camera,
+                    &self.solver.chamber,
+                    self.solver.bounds,
+                    &self.solver.colliders,
+                    self.sim_time,
+                    self.is_2d,
+                );
+            }
+        }
+
+        match PngExporter::save_rgb(&path, width, height, &sw.rgb_buffer) {
+            Ok(_) => {
+                self.status_message =
+                    format!("Saved {}x{} PNG to {}", width, height, path.display());
+                self.exported_frames_count += 1;
+            }
+            Err(e) => {
+                self.status_message = format!("PNG export error: {}", e);
+            }
+        }
     }
 
     pub fn export_current_frame(&mut self) {
@@ -576,25 +925,37 @@ impl LiquidApp {
         let fps = self.cli_fps.max(1);
         let total_frames = (self.cli_duration * fps as f32).round().max(1.0) as usize;
         let dt = (1.0 / fps as f32) * self.sim_speed;
-        let width = self.video_width.max(320);
-        let height = self.video_height.max(240);
+        let width = ((self.video_width.max(320) + 1) & !1).max(320);
+        let height = ((self.video_height.max(240) + 1) & !1).max(240);
 
         // Clone an independent simulation snapshot starting cleanly from the current preset & scene objects
-        let mut render_solver = SphSolver::new(self.solver.bounds, self.solver.config.clone());
+        let active_cfg = self.solver.config.clone();
+        let mut render_solver = SphSolver::new(self.solver.bounds, active_cfg.clone());
         render_solver.set_2d(self.is_2d);
         render_solver.set_chamber(self.solver.chamber.clone());
         SceneGenerator::setup_scene(&mut render_solver, self.current_preset);
+        render_solver.config = active_cfg;
         render_solver.colliders = self.solver.colliders.clone();
         render_solver.faucets = self.solver.faucets.clone();
         render_solver.drains = self.solver.drains.clone();
 
         let render_mode = self.render_mode;
-        let mesh_cfg = self.mesh_config.clone();
-        let camera = self.camera.clone();
+        let rq = self.gui_render_quality;
+        let mut mesh_cfg = self.mesh_config.clone();
+        rq.apply_to_mesh_config(&mut mesh_cfg, false, false);
+        let mut camera = self.camera.clone();
+        let orbit_rad_per_sec = if self.is_2d {
+            0.0
+        } else {
+            self.camera_orbit_speed_deg.to_radians()
+        };
+        let wall_frame_dt = 1.0 / fps as f32;
         let color_mode = self.color_mode;
         let color_map = self.color_map;
         let display_size_factor = self.display_size_factor;
         let enable_culling = self.enable_culling;
+        let lit_spheres = self.lit_spheres;
+        let particle_foam = self.particle_foam;
         let is_2d = self.is_2d;
         let use_gpu = self.use_gpu;
 
@@ -613,7 +974,14 @@ impl LiquidApp {
 
         std::thread::spawn(move || {
             let t_start = Instant::now();
-            let mut encoder = match Mp4Encoder::new(&out_path, width, height, fps) {
+            let mut encoder = match Mp4Encoder::new_with_encoding(
+                &out_path,
+                width,
+                height,
+                fps,
+                rq.ffmpeg_preset(),
+                rq.ffmpeg_crf(),
+            ) {
                 Ok(enc) => enc,
                 Err(e) => {
                     if let Ok(mut g) = state_arc.lock() {
@@ -635,8 +1003,18 @@ impl LiquidApp {
                 None
             };
 
-            let mut sw = SoftwareRenderer::new(width, height);
+            let mut sw = SoftwareRenderer::new_with_quality(width, height, rq);
             sw.enable_culling = enable_culling;
+            sw.lit_spheres = lit_spheres;
+            sw.particle_foam = particle_foam;
+            sw.env_preset = mesh_cfg.env_preset;
+            sw.exposure = mesh_cfg.exposure;
+            sw.show_grid = mesh_cfg.show_grid;
+            sw.show_wireframe = mesh_cfg.show_wireframe;
+            sw.light_dir = mesh_cfg.light_dir;
+            sw.light_intensity = mesh_cfg.light_intensity;
+            sw.ambient_intensity = mesh_cfg.ambient_intensity;
+
             let mut anim_t = 0.0f32;
             let mut done = 0usize;
 
@@ -653,7 +1031,7 @@ impl LiquidApp {
                             render_solver.bounds,
                             &render_solver.config,
                             &render_solver.particles,
-                            false,
+                            true,
                         );
                     }
                     gpu.step(
@@ -668,13 +1046,54 @@ impl LiquidApp {
                         is_2d,
                     );
                     gpu.read_particles(&mut render_solver.particles);
+
+                    let has_mesh_col = render_solver
+                        .colliders
+                        .iter()
+                        .any(|c| c.enabled && matches!(c.shape, ColliderShape::Mesh(_)));
+                    if has_mesh_col {
+                        let radius = render_solver.config.particle_radius;
+                        let colliders = &render_solver.colliders;
+                        let b_min = render_solver.bounds.min + Vec3::splat(radius);
+                        let b_max = render_solver.bounds.max - Vec3::splat(radius);
+                        let hit = render_solver
+                            .particles
+                            .par_iter_mut()
+                            .map(|p| {
+                                let mut p_hit = false;
+                                for col in colliders {
+                                    if let ColliderShape::Mesh(_) = &col.shape {
+                                        p_hit |=
+                                            col.resolve(&mut p.position, &mut p.velocity, radius);
+                                    }
+                                }
+                                if p_hit {
+                                    p.position = p.position.clamp(b_min.min(b_max), b_max.max(b_min));
+                                    if is_2d {
+                                        p.position.z = 0.0;
+                                        p.velocity.z = 0.0;
+                                    }
+                                }
+                                p_hit
+                            })
+                            .reduce(|| false, |a, b| a || b);
+                        if hit {
+                            gpu.sync_particles(
+                                render_solver.bounds,
+                                &render_solver.config,
+                                &render_solver.particles,
+                                false,
+                            );
+                        }
+                    }
+
                     let drained = render_solver.drain_particles();
                     if drained > 0 {
                         gpu.sync_particles(
                             render_solver.bounds,
                             &render_solver.config,
                             &render_solver.particles,
-                            true,
+                            false,
                         );
                     }
                 } else {
@@ -684,15 +1103,17 @@ impl LiquidApp {
 
                 match render_mode {
                     RenderMode::Particles => {
-                        sw.render_frame(
+                        sw.render_particles_studio(
                             &render_solver.particles,
                             render_solver.config.particle_radius * display_size_factor,
                             &render_solver.chamber,
                             render_solver.bounds,
+                            &render_solver.colliders,
                             &camera,
                             color_mode,
                             color_map,
                             render_solver.config.rest_density,
+                            is_2d,
                         );
                     }
                     RenderMode::SurfaceMesh => {
@@ -714,6 +1135,8 @@ impl LiquidApp {
                         );
                     }
                 }
+
+                camera.azimuth += orbit_rad_per_sec * wall_frame_dt;
 
                 if let Err(e) = encoder.write_frame(&sw.rgb_buffer) {
                     if let Ok(mut g) = state_arc.lock() {
@@ -746,6 +1169,56 @@ impl LiquidApp {
         });
     }
 
+    fn baseline_solver_config(&self) -> SolverConfig {
+        let mut base = SolverConfig::default();
+        if self.current_quality != SimulationQuality::Custom {
+            self.current_quality.apply(&mut base, self.is_2d);
+        }
+        match self.current_preset {
+            ScenePreset::DamBreak => {
+                base.gravity = Vec3::new(0.0, -9.81, 0.0);
+                base.viscosity = 0.08;
+                base.tensile_k = 0.0012;
+            }
+            ScenePreset::DoubleDamBreak => {
+                base.gravity = Vec3::new(0.0, -9.81, 0.0);
+                base.viscosity = 0.08;
+                base.tensile_k = 0.0015;
+            }
+            ScenePreset::DropletSplash => {
+                base.gravity = Vec3::new(0.0, -9.81, 0.0);
+                base.viscosity = 0.05;
+                base.tensile_k = 0.003;
+            }
+            ScenePreset::ObstacleDrop => {
+                base.gravity = Vec3::new(0.0, -9.81, 0.0);
+                base.viscosity = 0.08;
+            }
+            ScenePreset::VortexTornado => {
+                base.gravity = Vec3::new(0.0, -4.0, 0.0);
+                base.viscosity = 0.04;
+            }
+            ScenePreset::ZeroGravityBlobs => {
+                base.gravity = Vec3::ZERO;
+                base.viscosity = 0.15;
+                base.tensile_k = 0.005;
+            }
+            ScenePreset::Empty => {
+                base.gravity = Vec3::new(0.0, -9.81, 0.0);
+                base.viscosity = 0.05;
+                base.tensile_k = 0.002;
+            }
+        }
+        if self.fluid_preset != FluidPhysicsPreset::Water
+            && self.fluid_preset != FluidPhysicsPreset::Custom
+            && !(self.current_preset == ScenePreset::ZeroGravityBlobs
+                && self.fluid_preset == FluidPhysicsPreset::ZeroG)
+        {
+            self.fluid_preset.apply(&mut base);
+        }
+        base
+    }
+
     /// Construct the exact CLI command string representing the active scene, physics, and surface meshing setup.
     pub fn generate_cli_command(&self) -> String {
         let mut parts = vec!["liquid-rust".to_string()];
@@ -770,6 +1243,32 @@ impl LiquidApp {
                 if self.video_width != 1280 || self.video_height != 720 {
                     parts.push(format!("--video-width {}", self.video_width));
                     parts.push(format!("--video-height {}", self.video_height));
+                }
+                if self.gui_render_quality != CliRenderQuality::Standard {
+                    parts.push(format!(
+                        "--render-quality {}",
+                        self.gui_render_quality.slug()
+                    ));
+                }
+            }
+            CliCommandMode::PngFrame => {
+                let out = if self.png_output_path.trim().is_empty() {
+                    "snapshot.png"
+                } else {
+                    self.png_output_path.trim()
+                };
+                parts.push(format!("--export-png {}", out));
+                parts.push(format!("--time {:.1}", self.cli_duration));
+                parts.push(format!("--fps {}", self.cli_fps));
+                if self.video_width != 1280 || self.video_height != 720 {
+                    parts.push(format!("--video-width {}", self.video_width));
+                    parts.push(format!("--video-height {}", self.video_height));
+                }
+                if self.gui_render_quality != CliRenderQuality::Standard {
+                    parts.push(format!(
+                        "--render-quality {}",
+                        self.gui_render_quality.slug()
+                    ));
                 }
             }
             CliCommandMode::PlySequence => {
@@ -821,11 +1320,12 @@ impl LiquidApp {
             parts.push(format!("--sim-speed {:.2}", self.sim_speed));
         }
 
-        // Surface Meshing & Optical Material/Texture/Lighting flags (when SurfaceMesh mode is selected)
+        let mc = &self.mesh_config;
+        let def = SurfaceMeshConfig::default();
+
+        // Surface Meshing vs Particle shading flags
         if self.render_mode == RenderMode::SurfaceMesh {
             parts.push("--surface-mesh".to_string());
-            let mc = &self.mesh_config;
-            let def = SurfaceMeshConfig::default();
 
             parts.push(format!("--mesh-material {}", mc.preset.slug()));
 
@@ -905,63 +1405,149 @@ impl LiquidApp {
             if mc.smoothing_passes != def.smoothing_passes {
                 parts.push(format!("--mesh-smooth {}", mc.smoothing_passes));
             }
-            if (mc.light_dir - def.light_dir).length() > 0.03 {
-                parts.push(format!(
-                    "--light-dir {:.2},{:.2},{:.2}",
-                    mc.light_dir.x, mc.light_dir.y, mc.light_dir.z
-                ));
-            }
-            if (mc.light_intensity - def.light_intensity).abs() > 0.03 {
-                parts.push(format!("--light-intensity {:.2}", mc.light_intensity));
-            }
-            if (mc.ambient_intensity - def.ambient_intensity).abs() > 0.03 {
-                parts.push(format!("--ambient {:.2}", mc.ambient_intensity));
-            }
             if !mc.cast_shadows {
                 parts.push("--no-shadows".to_string());
             }
+        } else {
+            if self.color_mode != ColorMode::Velocity {
+                parts.push(format!("--color-mode {}", self.color_mode.slug()));
+            }
+            if self.color_map != ColorMapType::Ocean {
+                parts.push(format!("--color-map {}", self.color_map.slug()));
+            }
+            if (self.display_size_factor - 1.25).abs() > 0.02 {
+                parts.push(format!("--particle-scale {:.2}", self.display_size_factor));
+            }
+            if !self.particle_foam {
+                parts.push("--no-particle-foam".to_string());
+            }
+            if !self.lit_spheres {
+                parts.push("--unlit-spheres".to_string());
+            }
         }
 
-        // Non-default physics parameters
-        let def_phys = SolverConfig::default();
-        if (self.solver.config.vorticity - def_phys.vorticity).abs() > 0.005 {
-            parts.push(format!("--vorticity {:.3}", self.solver.config.vorticity));
+        // Studio environment & lighting overrides (apply to both Spheres and SurfaceMesh!)
+        if mc.env_preset != EnvironmentPreset::StudioDark {
+            parts.push(format!("--env-preset {}", mc.env_preset.slug()));
         }
-        if (self.solver.config.surface_tension - def_phys.surface_tension).abs() > 0.005 {
+        if (mc.exposure - 1.0).abs() > 0.03 {
+            parts.push(format!("--exposure {:.2}", mc.exposure));
+        }
+        if !mc.show_grid {
+            parts.push("--no-grid".to_string());
+        }
+        if !mc.show_wireframe {
+            parts.push("--no-wireframe".to_string());
+        }
+        if (mc.light_dir - def.light_dir).length() > 0.03 {
             parts.push(format!(
-                "--surface-tension {:.3}",
-                self.solver.config.surface_tension
+                "--light-dir {:.2},{:.2},{:.2}",
+                mc.light_dir.x, mc.light_dir.y, mc.light_dir.z
             ));
         }
+        if (mc.light_intensity - def.light_intensity).abs() > 0.03 {
+            parts.push(format!("--light-intensity {:.2}", mc.light_intensity));
+        }
+        if (mc.ambient_intensity - def.ambient_intensity).abs() > 0.03 {
+            parts.push(format!("--ambient {:.2}", mc.ambient_intensity));
+        }
 
-        // Non-default camera framing for MP4 renders
-        if self.cli_mode == CliCommandMode::Mp4Video && !self.is_2d {
-            let def_cam = Camera::default();
-            if (self.camera.azimuth - def_cam.azimuth).abs() > 0.02 {
+        // Fluid substance preset & non-default physics parameters
+        if self.fluid_preset != FluidPhysicsPreset::Water
+            && self.fluid_preset != FluidPhysicsPreset::Custom
+            && !(self.current_preset == ScenePreset::ZeroGravityBlobs
+                && self.fluid_preset == FluidPhysicsPreset::ZeroG)
+        {
+            parts.push(format!("--fluid-preset {}", self.fluid_preset.slug()));
+        }
+
+        let base_phys = self.baseline_solver_config();
+        let cfg = &self.solver.config;
+
+        if (cfg.viscosity - base_phys.viscosity).abs() > 0.005 {
+            parts.push(format!("--viscosity {:.3}", cfg.viscosity));
+        }
+        if (cfg.surface_tension - base_phys.surface_tension).abs() > 0.005 {
+            parts.push(format!("--surface-tension {:.3}", cfg.surface_tension));
+        }
+        if (cfg.vorticity - base_phys.vorticity).abs() > 0.005 {
+            parts.push(format!("--vorticity {:.3}", cfg.vorticity));
+        }
+        if (cfg.air_drag - base_phys.air_drag).abs() > 0.015 {
+            parts.push(format!("--air-drag {:.2}", cfg.air_drag));
+        }
+        if (cfg.gravity - base_phys.gravity).length() > 0.05 {
+            if cfg.gravity.x.abs() < 0.01 && cfg.gravity.z.abs() < 0.01 {
+                parts.push(format!("--gravity {:.2}", cfg.gravity.y));
+            } else {
                 parts.push(format!(
-                    "--camera-azimuth {:.1}",
-                    self.camera.azimuth.to_degrees()
+                    "--gravity {:.2},{:.2},{:.2}",
+                    cfg.gravity.x, cfg.gravity.y, cfg.gravity.z
                 ));
             }
-            if (self.camera.elevation - def_cam.elevation).abs() > 0.02 {
-                parts.push(format!(
-                    "--camera-elevation {:.1}",
-                    self.camera.elevation.to_degrees()
-                ));
+        }
+        if (cfg.restitution - base_phys.restitution).abs() > 0.01 {
+            parts.push(format!("--restitution {:.2}", cfg.restitution));
+        }
+        if (cfg.boundary_friction - base_phys.boundary_friction).abs() > 0.01 {
+            parts.push(format!("--friction {:.2}", cfg.boundary_friction));
+        }
+        if cfg.substeps != base_phys.substeps {
+            parts.push(format!("--substeps {}", cfg.substeps));
+        }
+        if cfg.solver_iterations != base_phys.solver_iterations {
+            parts.push(format!("--iterations {}", cfg.solver_iterations));
+        }
+        if (cfg.tensile_k - base_phys.tensile_k).abs() > 0.0005 {
+            parts.push(format!("--tensile-k {:.4}", cfg.tensile_k));
+        }
+        if (cfg.max_velocity - base_phys.max_velocity).abs() > 0.2 {
+            parts.push(format!("--max-velocity {:.1}", cfg.max_velocity));
+        }
+        if cfg.wave_amplitude > 0.002 {
+            parts.push(format!("--wave-amp {:.3}", cfg.wave_amplitude));
+            if (cfg.wave_frequency - 0.85).abs() > 0.02 {
+                parts.push(format!("--wave-freq {:.2}", cfg.wave_frequency));
             }
-            if (self.camera.distance - def_cam.distance).abs() > 0.05 {
-                parts.push(format!("--camera-distance {:.2}", self.camera.distance));
+        }
+
+        // Non-default camera framing
+        let def_cam = Camera::default();
+        if !self.is_2d {
+            if self.cli_mode == CliCommandMode::Mp4Video
+                || self.cli_mode == CliCommandMode::PngFrame
+                || self.camera_orbit_speed_deg.abs() > 0.1
+            {
+                if (self.camera.azimuth - def_cam.azimuth).abs() > 0.02 {
+                    parts.push(format!(
+                        "--camera-azimuth {:.1}",
+                        self.camera.azimuth.to_degrees()
+                    ));
+                }
+                if (self.camera.elevation - def_cam.elevation).abs() > 0.02 {
+                    parts.push(format!(
+                        "--camera-elevation {:.1}",
+                        self.camera.elevation.to_degrees()
+                    ));
+                }
+                if (self.camera.distance - def_cam.distance).abs() > 0.05 {
+                    parts.push(format!("--camera-distance {:.2}", self.camera.distance));
+                }
             }
+            if self.camera_orbit_speed_deg.abs() > 0.1 {
+                parts.push(format!("--camera-orbit {:.1}", self.camera_orbit_speed_deg));
+            }
+        }
+        if (self.camera.fov_y.to_degrees() - 45.0).abs() > 0.5 {
+            parts.push(format!("--fov {:.1}", self.camera.fov_y.to_degrees()));
         }
 
         // Chamber shape, size & scale
         if self.solver.chamber.shape != ChamberShape::Box {
-            let shape_str = match self.solver.chamber.shape {
-                ChamberShape::Bathtub => "bathtub",
-                ChamberShape::Sphere => "sphere",
-                ChamberShape::Box => "box",
-            };
-            parts.push(format!("--chamber-shape {}", shape_str));
+            parts.push(format!(
+                "--chamber-shape {}",
+                self.solver.chamber.shape.slug()
+            ));
         }
 
         if self.solver.chamber.custom_size {
@@ -1008,19 +1594,24 @@ impl LiquidApp {
             if !col.enabled {
                 continue;
             }
+            let phys_suffix = if col.restitution.abs() > 0.005 || (col.friction - 0.02).abs() > 0.005 {
+                format!(":{:.2}:{:.2}", col.restitution, col.friction)
+            } else {
+                String::new()
+            };
             match &col.shape {
                 ColliderShape::Sphere { center, radius } => {
                     parts.push(format!(
-                        "--obstacle \"sphere:{:.2},{:.2},{:.2}:{:.2}\"",
-                        center.x, center.y, center.z, radius
+                        "--obstacle \"sphere:{:.2},{:.2},{:.2}:{:.2}{}\"",
+                        center.x, center.y, center.z, radius, phys_suffix
                     ));
                 }
                 ColliderShape::Box { aabb } => {
                     let c = aabb.center();
                     let s = aabb.size();
                     parts.push(format!(
-                        "--obstacle \"box:{:.2},{:.2},{:.2}:{:.2},{:.2},{:.2}\"",
-                        c.x, c.y, c.z, s.x, s.y, s.z
+                        "--obstacle \"box:{:.2},{:.2},{:.2}:{:.2},{:.2},{:.2}{}\"",
+                        c.x, c.y, c.z, s.x, s.y, s.z, phys_suffix
                     ));
                 }
                 ColliderShape::Cylinder {
@@ -1029,8 +1620,8 @@ impl LiquidApp {
                     height,
                 } => {
                     parts.push(format!(
-                        "--obstacle \"cylinder:{:.2},{:.2},{:.2}:{:.2}:{:.2}\"",
-                        center.x, center.y, center.z, radius, height
+                        "--obstacle \"cylinder:{:.2},{:.2},{:.2}:{:.2}:{:.2}{}\"",
+                        center.x, center.y, center.z, radius, height, phys_suffix
                     ));
                 }
                 ColliderShape::Mesh(mesh) => {
@@ -1131,11 +1722,56 @@ impl LiquidApp {
                         parts.push(format!("--drain \"floor:{:.2}\"", d.radius));
                     }
                 }
-                CubeFace::Ceiling => parts.push(format!("--drain \"ceiling:{:.2}\"", d.radius)),
-                CubeFace::Left => parts.push(format!("--drain \"left:{:.2}\"", d.radius)),
-                CubeFace::Right => parts.push(format!("--drain \"right:{:.2}\"", d.radius)),
-                CubeFace::Back => parts.push(format!("--drain \"back:{:.2}\"", d.radius)),
-                CubeFace::Front => parts.push(format!("--drain \"front:{:.2}\"", d.radius)),
+                CubeFace::Ceiling => {
+                    if d.position.x.abs() > 1e-2 || d.position.z.abs() > 1e-2 {
+                        parts.push(format!(
+                            "--drain \"ceiling:{:.2},{:.2}:{:.2}\"",
+                            d.position.x, d.position.z, d.radius
+                        ));
+                    } else {
+                        parts.push(format!("--drain \"ceiling:{:.2}\"", d.radius));
+                    }
+                }
+                CubeFace::Left => {
+                    if d.position.y.abs() > 1e-2 || d.position.z.abs() > 1e-2 {
+                        parts.push(format!(
+                            "--drain \"left:{:.2},{:.2}:{:.2}\"",
+                            d.position.y, d.position.z, d.radius
+                        ));
+                    } else {
+                        parts.push(format!("--drain \"left:{:.2}\"", d.radius));
+                    }
+                }
+                CubeFace::Right => {
+                    if d.position.y.abs() > 1e-2 || d.position.z.abs() > 1e-2 {
+                        parts.push(format!(
+                            "--drain \"right:{:.2},{:.2}:{:.2}\"",
+                            d.position.y, d.position.z, d.radius
+                        ));
+                    } else {
+                        parts.push(format!("--drain \"right:{:.2}\"", d.radius));
+                    }
+                }
+                CubeFace::Back => {
+                    if d.position.x.abs() > 1e-2 || d.position.y.abs() > 1e-2 {
+                        parts.push(format!(
+                            "--drain \"back:{:.2},{:.2}:{:.2}\"",
+                            d.position.x, d.position.y, d.radius
+                        ));
+                    } else {
+                        parts.push(format!("--drain \"back:{:.2}\"", d.radius));
+                    }
+                }
+                CubeFace::Front => {
+                    if d.position.x.abs() > 1e-2 || d.position.y.abs() > 1e-2 {
+                        parts.push(format!(
+                            "--drain \"front:{:.2},{:.2}:{:.2}\"",
+                            d.position.x, d.position.y, d.radius
+                        ));
+                    } else {
+                        parts.push(format!("--drain \"front:{:.2}\"", d.radius));
+                    }
+                }
                 CubeFace::Custom => {
                     let p = d.position;
                     parts.push(format!(
@@ -1150,31 +1786,320 @@ impl LiquidApp {
     }
 
     fn compute_particle_color(&self, p: &crate::sph::particle::Particle) -> [u8; 3] {
-        let t = match self.color_mode {
-            ColorMode::Velocity => (p.speed() / 2.4).clamp(0.0, 1.0),
-            ColorMode::Pressure => {
-                (p.pressure / (self.solver.config.rest_density * 0.4)).clamp(0.0, 1.0)
+        ColorMap::particle_color(
+            p,
+            self.color_mode,
+            self.color_map,
+            self.solver.config.rest_density,
+            &self.solver.bounds,
+            self.particle_foam,
+        )
+    }
+
+    fn paint_icon(painter: &egui::Painter, center: egui::Pos2, icon: UiIcon, color: egui::Color32) {
+        let s = egui::Stroke::new(1.35_f32, color);
+        match icon {
+            UiIcon::Wave => {
+                let pts = [
+                    egui::pos2(center.x - 5.5, center.y + 1.5),
+                    egui::pos2(center.x - 2.8, center.y - 2.2),
+                    egui::pos2(center.x, center.y + 1.5),
+                    egui::pos2(center.x + 2.8, center.y - 2.2),
+                    egui::pos2(center.x + 5.5, center.y + 1.5),
+                ];
+                for w in pts.windows(2) {
+                    painter.line_segment([w[0], w[1]], s);
+                }
             }
-            ColorMode::Density => {
-                let dev = (p.density - self.solver.config.rest_density).abs()
-                    / self.solver.config.rest_density;
-                (dev * 4.0).clamp(0.0, 1.0)
+            UiIcon::Cube3D => {
+                let top = [
+                    egui::pos2(center.x, center.y - 5.2),
+                    egui::pos2(center.x + 4.8, center.y - 2.5),
+                    egui::pos2(center.x, center.y + 0.2),
+                    egui::pos2(center.x - 4.8, center.y - 2.5),
+                ];
+                for i in 0..4 {
+                    painter.line_segment([top[i], top[(i + 1) % 4]], s);
+                }
+                let bot_l = egui::pos2(center.x - 4.8, center.y + 2.8);
+                let bot_c = egui::pos2(center.x, center.y + 5.4);
+                let bot_r = egui::pos2(center.x + 4.8, center.y + 2.8);
+                painter.line_segment([top[3], bot_l], s);
+                painter.line_segment([top[2], bot_c], s);
+                painter.line_segment([top[1], bot_r], s);
+                painter.line_segment([bot_l, bot_c], s);
+                painter.line_segment([bot_c, bot_r], s);
             }
-            ColorMode::Height => {
-                let y = p.position.y;
-                let b = &self.solver.bounds;
-                ((y - b.min.y) / (b.max.y - b.min.y)).clamp(0.0, 1.0)
+            UiIcon::Plane2D => {
+                let r = egui::Rect::from_center_size(center, egui::vec2(9.6, 7.6));
+                painter.rect_stroke(r, egui::CornerRadius::same(1), s, egui::StrokeKind::Inside);
+                painter.line_segment(
+                    [egui::pos2(r.left() + 2.0, center.y + 1.0), egui::pos2(r.right() - 2.0, center.y - 1.0)],
+                    egui::Stroke::new(1.1_f32, color),
+                );
             }
-            ColorMode::KineticEnergy => (p.kinetic_energy() / 4.0).clamp(0.0, 1.0),
-            ColorMode::SingleColor => return [30, 140, 225],
+            UiIcon::Play => {
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(center.x - 3.2, center.y - 4.5),
+                        egui::pos2(center.x + 4.5, center.y),
+                        egui::pos2(center.x - 3.2, center.y + 4.5),
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            }
+            UiIcon::Pause => {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(center.x - 3.8, center.y - 4.4),
+                        egui::pos2(center.x - 1.2, center.y + 4.4),
+                    ),
+                    1.0,
+                    color,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(center.x + 1.2, center.y - 4.4),
+                        egui::pos2(center.x + 3.8, center.y + 4.4),
+                    ),
+                    1.0,
+                    color,
+                );
+            }
+            UiIcon::Step => {
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(center.x - 4.4, center.y - 4.0),
+                        egui::pos2(center.x + 1.4, center.y),
+                        egui::pos2(center.x - 4.4, center.y + 4.0),
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x + 3.4, center.y - 4.2),
+                        egui::pos2(center.x + 3.4, center.y + 4.2),
+                    ],
+                    egui::Stroke::new(1.8_f32, color),
+                );
+            }
+            UiIcon::Reset => {
+                painter.circle_stroke(center, 4.3, s);
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(center.x + 1.6, center.y - 5.6),
+                        egui::pos2(center.x + 5.2, center.y - 4.2),
+                        egui::pos2(center.x + 2.6, center.y - 1.8),
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            }
+            UiIcon::Camera => {
+                let body = egui::Rect::from_min_max(
+                    egui::pos2(center.x - 5.2, center.y - 3.4),
+                    egui::pos2(center.x + 2.2, center.y + 3.4),
+                );
+                painter.rect_stroke(body, egui::CornerRadius::same(1), s, egui::StrokeKind::Inside);
+                painter.line_segment([egui::pos2(center.x + 2.2, center.y - 1.2), egui::pos2(center.x + 5.2, center.y - 3.0)], s);
+                painter.line_segment([egui::pos2(center.x + 5.2, center.y - 3.0), egui::pos2(center.x + 5.2, center.y + 3.0)], s);
+                painter.line_segment([egui::pos2(center.x + 5.2, center.y + 3.0), egui::pos2(center.x + 2.2, center.y + 1.2)], s);
+            }
+            UiIcon::Spheres => {
+                painter.circle_stroke(egui::pos2(center.x - 1.8, center.y + 1.2), 3.3, s);
+                painter.circle_filled(egui::pos2(center.x + 2.6, center.y - 2.2), 2.1, color);
+            }
+            UiIcon::Mesh => {
+                let pts = [
+                    egui::pos2(center.x, center.y - 5.0),
+                    egui::pos2(center.x + 4.8, center.y),
+                    egui::pos2(center.x, center.y + 5.0),
+                    egui::pos2(center.x - 4.8, center.y),
+                ];
+                for i in 0..4 {
+                    painter.line_segment([pts[i], pts[(i + 1) % 4]], s);
+                }
+                painter.line_segment([pts[3], pts[1]], egui::Stroke::new(1.0_f32, color));
+            }
+            UiIcon::Sliders => {
+                for &(y_off, knob_x) in &[(-3.4f32, -1.6f32), (0.0, 2.0), (3.4, -0.8)] {
+                    painter.line_segment(
+                        [
+                            egui::pos2(center.x - 4.8, center.y + y_off),
+                            egui::pos2(center.x + 4.8, center.y + y_off),
+                        ],
+                        egui::Stroke::new(1.2_f32, color),
+                    );
+                    painter.circle_filled(egui::pos2(center.x + knob_x, center.y + y_off), 1.7, color);
+                }
+            }
+            UiIcon::Film => {
+                let r = egui::Rect::from_center_size(center, egui::vec2(10.0, 8.2));
+                painter.rect_stroke(r, egui::CornerRadius::same(1), s, egui::StrokeKind::Inside);
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(center.x - 1.5, center.y - 2.3),
+                        egui::pos2(center.x + 2.4, center.y),
+                        egui::pos2(center.x - 1.5, center.y + 2.3),
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            }
+            UiIcon::Copy => {
+                let back = egui::Rect::from_min_max(
+                    egui::pos2(center.x - 4.4, center.y - 4.6),
+                    egui::pos2(center.x + 2.2, center.y + 2.2),
+                );
+                let front = egui::Rect::from_min_max(
+                    egui::pos2(center.x - 2.0, center.y - 2.2),
+                    egui::pos2(center.x + 4.6, center.y + 4.6),
+                );
+                painter.rect_stroke(back, egui::CornerRadius::same(1), s, egui::StrokeKind::Inside);
+                painter.rect_stroke(front, egui::CornerRadius::same(1), s, egui::StrokeKind::Inside);
+            }
+            UiIcon::Folder => {
+                let body = egui::Rect::from_min_max(
+                    egui::pos2(center.x - 5.0, center.y - 2.4),
+                    egui::pos2(center.x + 5.0, center.y + 4.2),
+                );
+                painter.rect_stroke(body, egui::CornerRadius::same(1), s, egui::StrokeKind::Inside);
+                painter.line_segment([egui::pos2(center.x - 5.0, center.y - 2.4), egui::pos2(center.x - 4.2, center.y - 4.2)], s);
+                painter.line_segment([egui::pos2(center.x - 4.2, center.y - 4.2), egui::pos2(center.x - 0.8, center.y - 4.2)], s);
+                painter.line_segment([egui::pos2(center.x - 0.8, center.y - 4.2), egui::pos2(center.x + 0.4, center.y - 2.4)], s);
+            }
+            UiIcon::Save => {
+                let r = egui::Rect::from_center_size(center, egui::vec2(9.2, 9.2));
+                painter.rect_stroke(r, egui::CornerRadius::same(1), s, egui::StrokeKind::Inside);
+                let top = egui::Rect::from_min_max(
+                    egui::pos2(center.x - 2.6, r.top() + 0.5),
+                    egui::pos2(center.x + 2.4, center.y - 1.2),
+                );
+                painter.rect_stroke(top, egui::CornerRadius::ZERO, egui::Stroke::new(1.0_f32, color), egui::StrokeKind::Inside);
+            }
+            UiIcon::Image => {
+                let r = egui::Rect::from_center_size(center, egui::vec2(10.0, 8.0));
+                painter.rect_stroke(r, egui::CornerRadius::same(1), s, egui::StrokeKind::Inside);
+                painter.circle_filled(egui::pos2(r.left() + 2.8, r.top() + 2.5), 1.1, color);
+                painter.line_segment([egui::pos2(r.left() + 1.5, r.bottom() - 1.2), egui::pos2(center.x, center.y - 0.4)], s);
+                painter.line_segment([egui::pos2(center.x, center.y - 0.4), egui::pos2(r.right() - 1.4, r.bottom() - 1.2)], s);
+            }
+            UiIcon::Help => {
+                painter.circle_stroke(center, 5.0, s);
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "?",
+                    egui::FontId::proportional(10.5),
+                    color,
+                );
+            }
+            UiIcon::Warning => {
+                painter.add(egui::Shape::closed_line(
+                    vec![
+                        egui::pos2(center.x, center.y - 5.0),
+                        egui::pos2(center.x + 5.2, center.y + 4.4),
+                        egui::pos2(center.x - 5.2, center.y + 4.4),
+                    ],
+                    s,
+                ));
+                painter.line_segment(
+                    [egui::pos2(center.x, center.y - 1.8), egui::pos2(center.x, center.y + 1.2)],
+                    s,
+                );
+                painter.circle_filled(egui::pos2(center.x, center.y + 2.8), 0.9, color);
+            }
+            UiIcon::Bolt => {
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(center.x + 0.8, center.y - 5.2),
+                        egui::pos2(center.x - 3.8, center.y + 0.4),
+                        egui::pos2(center.x - 0.2, center.y + 0.4),
+                        egui::pos2(center.x - 1.0, center.y + 5.2),
+                        egui::pos2(center.x + 3.8, center.y - 0.6),
+                        egui::pos2(center.x + 0.2, center.y - 0.6),
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            }
+        }
+    }
+
+    fn icon_button(
+        ui: &mut egui::Ui,
+        icon: UiIcon,
+        label: &str,
+        selected: bool,
+        min_size: Option<egui::Vec2>,
+    ) -> egui::Response {
+        let font_id = egui::TextStyle::Button.resolve(ui.style());
+        let galley = if label.is_empty() {
+            None
+        } else {
+            Some(ui.fonts(|f| {
+                f.layout_no_wrap(label.to_string(), font_id.clone(), egui::Color32::WHITE)
+            }))
         };
-        ColorMap::sample(self.color_map, t)
+        let text_w = galley.as_ref().map_or(0.0, |g| g.size().x);
+        let gap = if label.is_empty() { 0.0 } else { 5.5 };
+        let icon_w = 13.0;
+        let pad = ui.spacing().button_padding;
+        let auto_size = egui::vec2(icon_w + gap + text_w + pad.x * 2.0, 24.0);
+        let desired = min_size.map_or(auto_size, |m| auto_size.max(m));
+
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let visuals = ui.style().interact_selectable(&response, selected);
+            let bg = if selected {
+                egui::Color32::from_rgb(20, 110, 200)
+            } else {
+                visuals.bg_fill
+            };
+            let stroke = if selected {
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(88, 184, 255))
+            } else {
+                visuals.bg_stroke
+            };
+            let fg = if selected {
+                egui::Color32::WHITE
+            } else {
+                visuals.fg_stroke.color
+            };
+
+            let p = ui.painter();
+            p.rect(
+                rect,
+                visuals.corner_radius,
+                bg,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+
+            let content_w = icon_w + gap + text_w;
+            let start_x = rect.center().x - content_w * 0.5;
+            let icon_center = egui::pos2(start_x + icon_w * 0.5, rect.center().y);
+            Self::paint_icon(p, icon_center, icon, fg);
+
+            if !label.is_empty() {
+                p.text(
+                    egui::pos2(start_x + icon_w + gap, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    font_id,
+                    fg,
+                );
+            }
+        }
+        response
     }
 
     fn draw_telemetry_pill(ui: &mut egui::Ui, text: String, color: egui::Color32) {
         egui::Frame::NONE
-            .fill(egui::Color32::from_rgb(16, 22, 34))
-            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(34, 46, 68)))
+            .fill(egui::Color32::from_rgb(15, 21, 33))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(33, 45, 67)))
             .corner_radius(egui::CornerRadius::same(5))
             .inner_margin(egui::Margin::symmetric(8, 3))
             .show(ui, |ui| {
@@ -1188,8 +2113,8 @@ impl LiquidApp {
         add_contents: impl FnOnce(&mut egui::Ui) -> R,
     ) -> R {
         egui::Frame::NONE
-            .fill(egui::Color32::from_rgb(15, 21, 33))
-            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(30, 41, 61)))
+            .fill(egui::Color32::from_rgb(14, 20, 32))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(29, 40, 60)))
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
@@ -1197,7 +2122,7 @@ impl LiquidApp {
                 ui.label(
                     egui::RichText::new(title)
                         .strong()
-                        .size(12.5)
+                        .size(12.2)
                         .color(egui::Color32::from_rgb(138, 192, 255)),
                 );
                 ui.add_space(4.0);
@@ -1262,41 +2187,72 @@ impl LiquidApp {
     }
 
     fn draw_scene_tab(&mut self, ui: &mut egui::Ui) {
-        // 0. 3D / 2D Simulation Space Switcher
-        Self::section_card(ui, "Simulation Space", |ui| {
+        // Consume async load/save scene file dialog selections
+        if let Some(load_path) = self
+            .scene_load_result
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
+            self.load_scene_json(&load_path);
+        }
+        if let Some(save_path) = self
+            .scene_save_result
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
+            self.save_scene_json(&save_path);
+        }
+
+        // 0. Simulation Space & Studio Scene File (.json)
+        Self::section_card(ui, "Simulation Space & Studio Project", |ui| {
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 6.0) * 0.5;
-                let btn_3d = egui::Button::new(
-                    egui::RichText::new("🌐 3D Volumetric").strong().color(if !self.is_2d {
-                        egui::Color32::WHITE
-                    } else {
-                        egui::Color32::from_rgb(175, 190, 210)
-                    }),
-                )
-                .fill(if !self.is_2d {
-                    egui::Color32::from_rgb(14, 116, 184)
-                } else {
-                    egui::Color32::from_rgb(30, 38, 50)
-                });
-                if ui.add_sized([w, 26.0], btn_3d).clicked() && self.is_2d {
+                if Self::icon_button(ui, UiIcon::Cube3D, "3D Volumetric", !self.is_2d, Some(egui::vec2(w, 26.0)))
+                    .clicked()
+                    && self.is_2d
+                {
                     self.set_2d(false);
                 }
-
-                let btn_2d = egui::Button::new(
-                    egui::RichText::new("▭ 2D Planar").strong().color(if self.is_2d {
-                        egui::Color32::WHITE
-                    } else {
-                        egui::Color32::from_rgb(175, 190, 210)
-                    }),
-                )
-                .fill(if self.is_2d {
-                    egui::Color32::from_rgb(14, 116, 184)
-                } else {
-                    egui::Color32::from_rgb(30, 38, 50)
-                });
-                if ui.add_sized([w, 26.0], btn_2d).clicked() && !self.is_2d {
+                if Self::icon_button(ui, UiIcon::Plane2D, "2D Planar", self.is_2d, Some(egui::vec2(w, 26.0)))
+                    .clicked()
+                    && !self.is_2d
+                {
                     self.set_2d(true);
                 }
+            });
+
+            ui.add_space(3.0);
+            let scene_busy = self.scene_browse_pending.load(Ordering::Relaxed);
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 6.0) * 0.5;
+                ui.add_enabled_ui(!scene_busy, |ui| {
+                    if Self::icon_button(
+                        ui,
+                        UiIcon::Folder,
+                        "Load Scene (.json)",
+                        false,
+                        Some(egui::vec2(w, 24.0)),
+                    )
+                    .on_hover_text("Open a saved LiquidRust studio scene (.json)")
+                    .clicked()
+                    {
+                        self.spawn_scene_file_dialog(ui.ctx().clone(), false);
+                    }
+                    if Self::icon_button(
+                        ui,
+                        UiIcon::Save,
+                        "Save Scene (.json)",
+                        false,
+                        Some(egui::vec2(w, 24.0)),
+                    )
+                    .on_hover_text("Save current scene, physics, obstacles, faucets, drains & visuals to .json")
+                    .clicked()
+                    {
+                        self.spawn_scene_file_dialog(ui.ctx().clone(), true);
+                    }
+                });
             });
         });
 
@@ -1304,6 +2260,7 @@ impl LiquidApp {
 
         // 1. Scene Presets
         Self::section_card(ui, "Scene Presets", |ui| {
+            let col_w = ((ui.available_width() - 6.0) * 0.5).max(132.0);
             egui::Grid::new("preset_grid")
                 .num_columns(2)
                 .spacing([6.0, 5.0])
@@ -1312,7 +2269,7 @@ impl LiquidApp {
                         let is_cur = self.current_preset == preset;
                         if ui
                             .add_sized(
-                                [142.0, 24.0],
+                                [col_w, 24.0],
                                 egui::Button::new(preset.name()).selected(is_cur),
                             )
                             .clicked()
@@ -1329,12 +2286,12 @@ impl LiquidApp {
         ui.add_space(6.0);
 
         // 2. Particle Quality & Resolution
-        Self::section_card(ui, "Particle Resolution & Lattice", |ui| {
+        Self::section_card(ui, "Particle Resolution", |ui| {
             for &q in SimulationQuality::ALL {
                 let is_cur = self.current_quality == q;
                 let label_text = if q == SimulationQuality::Extreme {
                     egui::RichText::new(q.name_for(self.is_2d))
-                        .color(egui::Color32::from_rgb(255, 145, 65))
+                        .color(egui::Color32::from_rgb(255, 150, 72))
                 } else {
                     egui::RichText::new(q.name_for(self.is_2d))
                 };
@@ -1347,41 +2304,55 @@ impl LiquidApp {
                 }
             }
 
-            ui.separator();
-            let mut changed = false;
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.solver.config.particle_radius, 0.010..=0.040)
-                        .text("Radius (m)"),
-                )
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.solver.config.spacing, 0.018..=0.065)
-                        .text("Spacing (m)"),
-                )
-                .changed();
+            egui::CollapsingHeader::new("Advanced Lattice Overrides")
+                .default_open(self.current_quality == SimulationQuality::Custom)
+                .show(ui, |ui| {
+                    let mut changed = false;
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.solver.config.particle_radius, 0.004..=0.045)
+                                .text("Radius")
+                                .suffix(" m"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.solver.config.spacing, 0.007..=0.070)
+                                .text("Spacing")
+                                .suffix(" m"),
+                        )
+                        .changed();
 
-            if changed {
-                self.current_quality = SimulationQuality::Custom;
-                self.solver.config.smoothing_length = self.solver.config.particle_radius * 3.1;
-                self.solver.config.rest_density = compute_lattice_rest_density(
-                    self.solver.config.smoothing_length,
-                    self.solver.config.spacing,
-                );
-            }
+                    if changed {
+                        self.current_quality = SimulationQuality::Custom;
+                        self.solver.config.smoothing_length =
+                            self.solver.config.particle_radius * 3.1;
+                        self.solver.config.rest_density = if self.is_2d {
+                            compute_lattice_rest_density_2d(
+                                self.solver.config.smoothing_length,
+                                self.solver.config.spacing,
+                            )
+                        } else {
+                            compute_lattice_rest_density(
+                                self.solver.config.smoothing_length,
+                                self.solver.config.spacing,
+                            )
+                        };
+                    }
 
-            if ui.button("⚡ Respawn Lattice").clicked() {
-                let h = self.solver.config.smoothing_length;
-                self.solver.set_smoothing_length(h);
-                self.load_preset(self.current_preset);
-            }
+                    if Self::icon_button(ui, UiIcon::Reset, "Respawn Lattice", false, None).clicked()
+                    {
+                        let h = self.solver.config.smoothing_length;
+                        self.solver.set_smoothing_length(h);
+                        self.load_preset(self.current_preset);
+                    }
+                });
         });
 
         ui.add_space(6.0);
 
-        // 3. Simulation Chamber & Bounds
-        Self::section_card(ui, "Container Chamber & Scale", |ui| {
+        // 3. Simulation Chamber, Exact Dimensions & Wave Maker
+        Self::section_card(ui, "Container Chamber & Wave Maker", |ui| {
             ui.horizontal(|ui| {
                 for &s in &ChamberShape::ALL {
                     if ui
@@ -1402,60 +2373,137 @@ impl LiquidApp {
                 }
             });
 
-            let mut scale_changed = false;
+            let mut bounds_changed = false;
             let mut uniform_s = (self.solver.chamber.scale.x
                 + self.solver.chamber.scale.y
                 + self.solver.chamber.scale.z)
                 / 3.0;
-            if ui
-                .add(egui::Slider::new(&mut uniform_s, 0.4..=3.0).text("Uniform"))
-                .changed()
-            {
-                self.solver.chamber.scale = Vec3::splat(uniform_s);
-                scale_changed = true;
-            }
-            scale_changed |= ui
-                .add(egui::Slider::new(&mut self.solver.chamber.scale.x, 0.3..=3.0).text("Length X"))
-                .changed();
-            scale_changed |= ui
-                .add(egui::Slider::new(&mut self.solver.chamber.scale.y, 0.3..=3.0).text("Height Y"))
-                .changed();
-            if !self.is_2d {
-                scale_changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.solver.chamber.scale.z, 0.3..=3.0)
-                            .text("Depth Z"),
-                    )
-                    .changed();
-            }
-
-            if self.solver.chamber.shape == ChamberShape::Bathtub {
-                ui.add(
-                    egui::Slider::new(&mut self.solver.chamber.tub_slope_ratio, 0.1..=0.45)
-                        .text("Backrest Slope"),
-                );
-                if !self.is_2d {
-                    ui.add(
-                        egui::Slider::new(&mut self.solver.chamber.tub_fillet_ratio, 0.05..=0.35)
-                            .text("Bottom Fillet"),
-                    );
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Slider::new(&mut uniform_s, 0.4..=3.0).text("Scale"))
+                    .changed()
+                {
+                    self.solver.chamber.scale = Vec3::splat(uniform_s);
+                    bounds_changed = true;
                 }
+                if ui
+                    .small_button("1.0x")
+                    .on_hover_text("Reset chamber scale & custom size")
+                    .clicked()
+                {
+                    self.solver.chamber.scale = Vec3::ONE;
+                    self.solver.chamber.base_size = Vec3::new(1.6, 1.2, 0.9);
+                    self.solver.chamber.custom_size = false;
+                    bounds_changed = true;
+                }
+            });
+
+            // Wave-maker paddle right in chamber card (compact 1-line activation, expands frequency when > 0)
+            ui.add(
+                egui::Slider::new(&mut self.solver.config.wave_amplitude, 0.0..=0.45)
+                    .text("Wave Maker")
+                    .suffix(" m")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("Oscillating hydraulic wave paddle along the left chamber wall (0.0 = off)");
+            if self.solver.config.wave_amplitude > 0.002 {
+                ui.add(
+                    egui::Slider::new(&mut self.solver.config.wave_frequency, 0.2..=3.5)
+                        .text("Wave Freq")
+                        .suffix(" Hz")
+                        .fixed_decimals(2),
+                );
             }
 
-            if ui.small_button("↺ Reset 1.0x").clicked() {
-                self.solver.chamber.scale = Vec3::ONE;
-                scale_changed = true;
-            }
+            egui::CollapsingHeader::new("Advanced Chamber Dimensions & Contours")
+                .default_open(
+                    self.solver.chamber.custom_size
+                        || self.solver.chamber.shape == ChamberShape::Bathtub,
+                )
+                .show(ui, |ui| {
+                    bounds_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.solver.chamber.scale.x, 0.3..=3.5)
+                                .text("Scale X"),
+                        )
+                        .changed();
+                    bounds_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.solver.chamber.scale.y, 0.3..=3.5)
+                                .text("Scale Y"),
+                        )
+                        .changed();
+                    if !self.is_2d {
+                        bounds_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.solver.chamber.scale.z, 0.3..=3.5)
+                                    .text("Scale Z"),
+                            )
+                            .changed();
+                    }
 
-            if scale_changed {
+                    ui.separator();
+                    ui.label("Base Size (meters):");
+                    let mut size_edited = false;
+                    size_edited |= ui
+                        .add(
+                            egui::Slider::new(&mut self.solver.chamber.base_size.x, 0.4..=5.0)
+                                .text("Width X")
+                                .suffix(" m"),
+                        )
+                        .changed();
+                    size_edited |= ui
+                        .add(
+                            egui::Slider::new(&mut self.solver.chamber.base_size.y, 0.4..=4.0)
+                                .text("Height Y")
+                                .suffix(" m"),
+                        )
+                        .changed();
+                    if !self.is_2d {
+                        size_edited |= ui
+                            .add(
+                                egui::Slider::new(&mut self.solver.chamber.base_size.z, 0.3..=4.0)
+                                    .text("Depth Z")
+                                    .suffix(" m"),
+                            )
+                            .changed();
+                    }
+                    if size_edited {
+                        self.solver.chamber.custom_size = true;
+                        bounds_changed = true;
+                    }
+
+                    if self.solver.chamber.shape == ChamberShape::Bathtub {
+                        ui.separator();
+                        ui.add(
+                            egui::Slider::new(&mut self.solver.chamber.tub_slope_ratio, 0.1..=0.45)
+                                .text("Backrest Slope"),
+                        );
+                        if !self.is_2d {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.solver.chamber.tub_fillet_ratio,
+                                    0.05..=0.35,
+                                )
+                                .text("Bottom Fillet"),
+                            );
+                        }
+                    }
+                });
+
+            if bounds_changed {
                 self.solver.bounds = self.solver.chamber.compute_bounds();
+                if self.is_2d {
+                    self.solver.bounds.min.z = -0.05;
+                    self.solver.bounds.max.z = 0.05;
+                }
             }
 
             let sz = self.solver.bounds.size();
             ui.weak(if self.is_2d {
-                format!("Bounds: {:.2} × {:.2} m", sz.x, sz.y)
+                format!("Active Bounds: {:.2} × {:.2} m", sz.x, sz.y)
             } else {
-                format!("Bounds: {:.2} × {:.2} × {:.2} m", sz.x, sz.y, sz.z)
+                format!("Active Bounds: {:.2} × {:.2} × {:.2} m", sz.x, sz.y, sz.z)
             });
         });
 
@@ -1496,7 +2544,7 @@ impl LiquidApp {
                     if ui.button("+ Cylinder").clicked() {
                         let id = self.next_collider_id;
                         self.next_collider_id += 1;
-                        let mut c = Collider::cylinder(Vec3::new(0.0, 0.45, 0.0), 0.15, 0.4);
+                        let mut c = Collider::cylinder(Vec3::new(0.0, 0.35, 0.0), 0.15, 0.4);
                         c.id = id;
                         c.name = format!("Cylinder #{}", id);
                         self.solver.colliders.push(c);
@@ -1517,19 +2565,20 @@ impl LiquidApp {
                 ui.horizontal(|ui| {
                     ui.label("OBJ:");
                     let text_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.obj_file_path).desired_width(126.0),
+                        egui::TextEdit::singleline(&mut self.obj_file_path).desired_width(120.0),
                     );
                     let enter_pressed =
                         text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                     let browsing = self.obj_browse_pending.load(Ordering::Relaxed);
-                    if ui
-                        .add_enabled(!browsing, egui::Button::new("📁 Browse…"))
-                        .on_hover_text("Browse your computer for a Wavefront .OBJ 3D mesh")
-                        .clicked()
-                    {
-                        self.spawn_obj_file_browser(ui.ctx().clone());
-                    }
+                    ui.add_enabled_ui(!browsing, |ui| {
+                        if Self::icon_button(ui, UiIcon::Folder, "Browse", false, None)
+                            .on_hover_text("Browse your computer for a Wavefront .OBJ 3D mesh")
+                            .clicked()
+                        {
+                            self.spawn_obj_file_browser(ui.ctx().clone());
+                        }
+                    });
 
                     if ui
                         .button("Load")
@@ -1578,7 +2627,7 @@ impl LiquidApp {
                         }
                         if tri_badge.is_some()
                             && ui
-                                .small_button("↺")
+                                .small_button("Reset")
                                 .on_hover_text("Reset position, scale & rotation")
                                 .clicked()
                         {
@@ -1625,7 +2674,7 @@ impl LiquidApp {
                                 }
                                 ui.add(
                                     egui::Slider::new(radius, 0.02..=0.8)
-                                        .text("Scale (Radius)")
+                                        .text("Radius")
                                         .suffix(" m")
                                         .clamping(egui::SliderClamping::Edits),
                                 );
@@ -1764,7 +2813,6 @@ impl LiquidApp {
                                     changed = true;
                                 }
 
-                                // Move sliders (X, Y, Z)
                                 changed |= ui
                                     .add(
                                         egui::Slider::new(
@@ -1810,7 +2858,6 @@ impl LiquidApp {
                                         .changed();
                                 }
 
-                                // Scale slider (normalized: 1.0 = 1.0 meter bounding size)
                                 changed |= ui
                                     .add(
                                         egui::Slider::new(&mut mesh.scale, 0.04..=2.20)
@@ -1820,7 +2867,6 @@ impl LiquidApp {
                                     )
                                     .changed();
 
-                                // Rotate sliders (Pitch X, Yaw Y, Roll Z in degrees)
                                 let mut pitch_deg = mesh.rotation.x.to_degrees();
                                 let mut yaw_deg = mesh.rotation.y.to_degrees();
                                 let mut roll_deg = mesh.rotation.z.to_degrees();
@@ -1864,6 +2910,26 @@ impl LiquidApp {
                                 }
                             }
                         }
+
+                        egui::CollapsingHeader::new(format!(
+                            "Surface Physics ({})",
+                            collider.id
+                        ))
+                        .id_salt(("obs_surf_phys", collider.id))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut collider.restitution, 0.0..=0.8)
+                                    .text("Bounce")
+                                    .fixed_decimals(2),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut collider.friction, 0.1..=1.0)
+                                    .text("Slip")
+                                    .fixed_decimals(2),
+                            )
+                            .on_hover_text("1.0 = frictionless slip, lower = higher surface drag");
+                        });
                     }
                 }
                 if let Some(idx) = to_remove_col {
@@ -1930,20 +2996,44 @@ impl LiquidApp {
                     if faucet.enabled {
                         ui.horizontal(|ui| {
                             ui.weak("Pos:");
-                            ui.add(egui::DragValue::new(&mut faucet.position.x).speed(0.01).prefix("X:"));
-                            ui.add(egui::DragValue::new(&mut faucet.position.y).speed(0.01).prefix("Y:"));
+                            ui.add(
+                                egui::DragValue::new(&mut faucet.position.x)
+                                    .speed(0.01)
+                                    .prefix("X:"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut faucet.position.y)
+                                    .speed(0.01)
+                                    .prefix("Y:"),
+                            );
                             if !self.is_2d {
-                                ui.add(egui::DragValue::new(&mut faucet.position.z).speed(0.01).prefix("Z:"));
+                                ui.add(
+                                    egui::DragValue::new(&mut faucet.position.z)
+                                        .speed(0.01)
+                                        .prefix("Z:"),
+                                );
                             } else {
                                 faucet.position.z = 0.0;
                             }
                         });
                         ui.horizontal(|ui| {
                             ui.weak("Vel:");
-                            ui.add(egui::DragValue::new(&mut faucet.direction.x).speed(0.05).prefix("Vx:"));
-                            ui.add(egui::DragValue::new(&mut faucet.direction.y).speed(0.05).prefix("Vy:"));
+                            ui.add(
+                                egui::DragValue::new(&mut faucet.direction.x)
+                                    .speed(0.05)
+                                    .prefix("Vx:"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut faucet.direction.y)
+                                    .speed(0.05)
+                                    .prefix("Vy:"),
+                            );
                             if !self.is_2d {
-                                ui.add(egui::DragValue::new(&mut faucet.direction.z).speed(0.05).prefix("Vz:"));
+                                ui.add(
+                                    egui::DragValue::new(&mut faucet.direction.z)
+                                        .speed(0.05)
+                                        .prefix("Vz:"),
+                                );
                             } else {
                                 faucet.direction.z = 0.0;
                             }
@@ -1951,21 +3041,18 @@ impl LiquidApp {
                         match &mut faucet.shape {
                             FaucetShape::Circle { radius } => {
                                 ui.add(
-                                    egui::Slider::new(radius, 0.005..=0.40)
-                                        .text("Radius (m)"),
+                                    egui::Slider::new(radius, 0.005..=0.40).text("Radius (m)"),
                                 );
                                 ui.add(
-                                    egui::Slider::new(&mut faucet.spray_spread, 0.0..=0.5)
+                                    egui::Slider::new(&mut faucet.spray_spread, 0.0..=0.6)
                                         .text("Spray Angle"),
                                 );
                             }
                             FaucetShape::Rectangle { width, depth } => {
-                                ui.add(
-                                    egui::Slider::new(width, 0.05..=1.2).text("Width (m)"),
-                                );
+                                ui.add(egui::Slider::new(width, 0.05..=1.4).text("Width (m)"));
                                 if !self.is_2d {
                                     ui.add(
-                                        egui::Slider::new(depth, 0.01..=0.5).text("Depth (m)"),
+                                        egui::Slider::new(depth, 0.01..=0.6).text("Depth (m)"),
                                     );
                                 }
                             }
@@ -1982,7 +3069,10 @@ impl LiquidApp {
                                 }
                             }
                         }
-                        ui.add(egui::Slider::new(&mut faucet.flow_rate, 25.0..=3000.0).text("Rate (p/s)"));
+                        ui.add(
+                            egui::Slider::new(&mut faucet.flow_rate, 25.0..=4000.0)
+                                .text("Rate (p/s)"),
+                        );
                     }
                 }
                 if let Some(idx) = to_remove {
@@ -2019,8 +3109,21 @@ impl LiquidApp {
                         d.id = id;
                         self.solver.drains.push(d);
                     }
+                    if ui.button("+ Point Sink").clicked() {
+                        let id = self.next_drain_id;
+                        self.next_drain_id += 1;
+                        let mut d = Drain::new(
+                            format!("Sink #{}", id),
+                            CubeFace::Custom,
+                            Vec3::new(0.0, 0.35, 0.0),
+                            0.14,
+                        );
+                        d.id = id;
+                        self.solver.drains.push(d);
+                    }
                 });
 
+                let sim_bounds = self.solver.bounds;
                 let mut to_remove: Option<usize> = None;
                 for (idx, drain) in self.solver.drains.iter_mut().enumerate() {
                     ui.separator();
@@ -2032,7 +3135,55 @@ impl LiquidApp {
                         }
                     });
                     if drain.enabled {
-                        ui.add(egui::Slider::new(&mut drain.radius, 0.04..=0.5).text("Radius"));
+                        egui::ComboBox::from_id_salt(("drain_face", drain.id))
+                            .selected_text(drain.face.name())
+                            .width(210.0)
+                            .show_ui(ui, |ui| {
+                                for &face in CubeFace::ALL {
+                                    if self.is_2d
+                                        && matches!(face, CubeFace::Back | CubeFace::Front)
+                                    {
+                                        continue;
+                                    }
+                                    ui.selectable_value(&mut drain.face, face, face.name());
+                                }
+                            });
+                        ui.add(
+                            egui::Slider::new(&mut drain.radius, 0.03..=0.60)
+                                .text("Radius")
+                                .suffix(" m"),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.weak("Offset:");
+                            if !matches!(drain.face, CubeFace::Left | CubeFace::Right) {
+                                ui.add(
+                                    egui::DragValue::new(&mut drain.position.x)
+                                        .speed(0.01)
+                                        .range(sim_bounds.min.x..=sim_bounds.max.x)
+                                        .prefix("X:"),
+                                );
+                            }
+                            if !matches!(drain.face, CubeFace::Floor | CubeFace::Ceiling) {
+                                ui.add(
+                                    egui::DragValue::new(&mut drain.position.y)
+                                        .speed(0.01)
+                                        .range(sim_bounds.min.y..=sim_bounds.max.y)
+                                        .prefix("Y:"),
+                                );
+                            }
+                            if !self.is_2d
+                                && !matches!(drain.face, CubeFace::Back | CubeFace::Front)
+                            {
+                                ui.add(
+                                    egui::DragValue::new(&mut drain.position.z)
+                                        .speed(0.01)
+                                        .range(sim_bounds.min.z..=sim_bounds.max.z)
+                                        .prefix("Z:"),
+                                );
+                            } else {
+                                drain.position.z = 0.0;
+                            }
+                        });
                     }
                 }
                 if let Some(idx) = to_remove {
@@ -2042,120 +3193,231 @@ impl LiquidApp {
     }
 
     fn draw_physics_tab(&mut self, ui: &mut egui::Ui) {
-        Self::section_card(ui, "Compute Acceleration", |ui| {
-            if self.gpu_solver.is_some() {
-                let prev = self.use_gpu;
-                ui.checkbox(&mut self.use_gpu, "Enable Vulkan GPU Compute");
-                if !prev && self.use_gpu {
-                    if let Some(ref mut gpu) = self.gpu_solver {
-                        gpu.sync_particles(
-                            self.solver.bounds,
-                            &self.solver.config,
-                            &self.solver.particles,
-                            true,
-                        );
+        // 1. Curated Physical Fluid Substance Presets
+        Self::section_card(ui, "Fluid Substance Preset", |ui| {
+            let mut chosen = self.fluid_preset;
+            egui::ComboBox::from_id_salt("fluid_phys_preset")
+                .selected_text(chosen.name())
+                .width(268.0)
+                .show_ui(ui, |ui| {
+                    for &p in FluidPhysicsPreset::ALL {
+                        if ui.selectable_value(&mut chosen, p, p.name()).clicked() {
+                            self.apply_fluid_preset(p);
+                        }
+                    }
+                });
+
+            ui.horizontal_wrapped(|ui| {
+                for &(p, lbl) in &[
+                    (FluidPhysicsPreset::Water, "Water"),
+                    (FluidPhysicsPreset::Ocean, "Ocean"),
+                    (FluidPhysicsPreset::Oil, "Oil"),
+                    (FluidPhysicsPreset::Honey, "Honey"),
+                    (FluidPhysicsPreset::Mercury, "Mercury"),
+                    (FluidPhysicsPreset::Lava, "Lava"),
+                ] {
+                    if ui
+                        .selectable_label(self.fluid_preset == p, lbl)
+                        .clicked()
+                    {
+                        self.apply_fluid_preset(p);
                     }
                 }
-                ui.weak(format!("Adapter: {}", self.gpu_device_name));
-            } else {
-                ui.weak("Vulkan GPU unavailable — using multi-core Rayon CPU solver.");
+            });
+
+            if self.fluid_preset != FluidPhysicsPreset::Custom {
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Mesh,
+                    "Match Visual Material & Colormap",
+                    false,
+                    Some(egui::vec2(ui.available_width(), 24.0)),
+                )
+                .on_hover_text("Automatically sync liquid optical material & particle colormap to match this substance")
+                .clicked()
+                {
+                    self.apply_matching_visual_material();
+                }
             }
         });
 
         ui.add_space(6.0);
 
-        Self::section_card(ui, "Natural Fluid Dynamics (PBF)", |ui| {
-            ui.add(
-                egui::Slider::new(&mut self.solver.config.vorticity, 0.0..=0.18)
-                    .text("Vorticity Swirl")
-                    .fixed_decimals(3),
-            )
-            .on_hover_text("Macklin & Müller vorticity confinement: restores energetic eddies while keeping calm pools still");
+        // 2. Primary Natural Fluid Dynamics Controls
+        Self::section_card(ui, "Core Fluid Dynamics", |ui| {
+            let mut edited = false;
 
-            ui.add(
-                egui::Slider::new(&mut self.solver.config.surface_tension, 0.0..=0.25)
-                    .text("Surface Cohesion")
-                    .fixed_decimals(3),
-            )
-            .on_hover_text("Akinci free-surface tension: forms rounded droplets, sheets, and cohesive splashes");
+            edited |= ui
+                .add(
+                    egui::Slider::new(&mut self.solver.config.gravity.y, -25.0..=5.0)
+                        .text("Gravity Y")
+                        .suffix(" m/s²"),
+                )
+                .changed();
 
-            ui.add(
-                egui::Slider::new(&mut self.solver.config.viscosity, 0.0..=0.35)
-                    .text("XSPH Viscosity")
-                    .fixed_decimals(3),
-            );
+            edited |= ui
+                .add(
+                    egui::Slider::new(&mut self.solver.config.viscosity, 0.0..=0.95)
+                        .text("Viscosity")
+                        .fixed_decimals(3),
+                )
+                .on_hover_text("XSPH shear viscosity: 0.03–0.08 crisp water, 0.35 oil, 0.72+ honey/lava")
+                .changed();
+
+            edited |= ui
+                .add(
+                    egui::Slider::new(&mut self.solver.config.surface_tension, 0.0..=0.30)
+                        .text("Surface Tension")
+                        .fixed_decimals(3),
+                )
+                .on_hover_text("Akinci free-surface cohesion: pulls airborne sheets into natural rounded droplets")
+                .changed();
+
+            edited |= ui
+                .add(
+                    egui::Slider::new(&mut self.solver.config.vorticity, 0.0..=0.20)
+                        .text("Vorticity Swirl")
+                        .fixed_decimals(3),
+                )
+                .on_hover_text("Macklin & Müller vorticity confinement: preserves energetic turbulent eddies while keeping calm pools still")
+                .changed();
+
+            edited |= ui
+                .add(
+                    egui::Slider::new(&mut self.solver.config.air_drag, 0.0..=2.0)
+                        .text("Spray Air Drag")
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("Aerodynamic drag acting strictly on sparse airborne splash droplets so mist arcs naturally instead of flying ballistically")
+                .changed();
+
+            if edited {
+                self.fluid_preset = FluidPhysicsPreset::Custom;
+            }
 
             ui.separator();
+            ui.add(
+                egui::Slider::new(&mut self.sim_speed, 0.10..=2.00)
+                    .text("Sim Speed")
+                    .suffix("x")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("Time-scale multiplier (e.g. 0.25x for cinematic slow-motion splashes)");
 
-            ui.add(
-                egui::Slider::new(&mut self.solver.config.gravity.y, -25.0..=5.0)
-                    .text("Gravity Y (m/s²)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.solver.config.solver_iterations, 1..=8)
-                    .text("Pressure Iterations"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.solver.config.substeps, 1..=4).text("Substeps / Frame"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.solver.config.boundary_friction, 0.5..=1.0)
-                    .text("Wall Slip"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.solver.config.restitution, 0.0..=0.2)
-                    .text("Restitution"),
-            );
-
-            if ui.small_button("↺ Restore Natural Water Defaults").clicked() {
-                let def = SolverConfig::default();
-                self.solver.config.vorticity = def.vorticity;
-                self.solver.config.surface_tension = def.surface_tension;
-                self.solver.config.viscosity = def.viscosity;
-                self.solver.config.gravity = def.gravity;
-                self.solver.config.solver_iterations = def.solver_iterations;
-                self.solver.config.substeps = def.substeps;
-                self.solver.config.boundary_friction = def.boundary_friction;
-                self.solver.config.restitution = def.restitution;
+            if Self::icon_button(ui, UiIcon::Reset, "Restore Pure Water Defaults", false, None)
+                .clicked()
+            {
+                self.apply_fluid_preset(FluidPhysicsPreset::Water);
+                self.solver.config.gravity = Vec3::new(0.0, -9.81, 0.0);
+                self.sim_speed = 1.0;
             }
         });
 
         ui.add_space(6.0);
 
-        Self::section_card(ui, "Interactive Viewport Forces", |ui| {
-            ui.weak(if self.is_2d {
-                "Left Drag: Attract • Shift+Left Drag: Repel • Middle Drag: Pan"
-            } else {
-                "Left Drag: Attract • Shift+Left Drag: Repel • Middle: Pan • Right: Orbit"
+        // 3. Collapsed Advanced Solver, Lateral Gravity, Boundary & Compute Backend
+        egui::CollapsingHeader::new("Advanced Solver, Gravity Tilt & Compute")
+            .default_open(false)
+            .show(ui, |ui| {
+                Self::section_card(ui, "Solver & Boundary Parameters", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.config.substeps, 1..=10)
+                            .text("Substeps / Frame"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.config.solver_iterations, 1..=10)
+                            .text("Pressure Iters"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.config.tensile_k, 0.0..=0.012)
+                            .text("Tensile Anti-Clump")
+                            .fixed_decimals(4),
+                    )
+                    .on_hover_text("Monaghan artificial pressure preventing particle pairing at free surfaces");
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.config.max_velocity, 3.0..=40.0)
+                            .text("Max Speed")
+                            .suffix(" m/s"),
+                    );
+
+                    ui.separator();
+                    ui.label("Lateral Gravity Tilt:");
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.config.gravity.x, -12.0..=12.0)
+                            .text("Gravity X")
+                            .suffix(" m/s²"),
+                    );
+                    if !self.is_2d {
+                        ui.add(
+                            egui::Slider::new(&mut self.solver.config.gravity.z, -12.0..=12.0)
+                                .text("Gravity Z")
+                                .suffix(" m/s²"),
+                        );
+                    }
+
+                    ui.separator();
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.config.boundary_friction, 0.2..=1.0)
+                            .text("Wall Slip")
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text("1.0 = free-slip glass walls, lower = viscous wall drag");
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.config.restitution, 0.0..=0.4)
+                            .text("Wall Bounce")
+                            .fixed_decimals(2),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.mouse_force_strength, 5.0..=140.0)
+                            .text("Cursor Force"),
+                    );
+
+                    ui.separator();
+                    if self.gpu_solver.is_some() {
+                        let prev = self.use_gpu;
+                        ui.checkbox(&mut self.use_gpu, "Vulkan GPU Compute Acceleration");
+                        if !prev && self.use_gpu {
+                            if let Some(ref mut gpu) = self.gpu_solver {
+                                gpu.sync_particles(
+                                    self.solver.bounds,
+                                    &self.solver.config,
+                                    &self.solver.particles,
+                                    false,
+                                );
+                            }
+                        }
+                        ui.weak(format!("Adapter: {}", self.gpu_device_name));
+                    } else {
+                        ui.weak("Vulkan GPU unavailable — using multi-core Rayon CPU solver.");
+                    }
+                });
             });
-            ui.add(
-                egui::Slider::new(&mut self.solver.mouse_force_strength, 10.0..=120.0)
-                    .text("Cursor Force"),
-            );
-        });
     }
 
     fn draw_surface_tab(&mut self, ui: &mut egui::Ui) {
         // 1. Primary Render Mode Selector (Particles vs Surface Mesh)
-        Self::section_card(ui, "Fluid Representation Mode (GUI & CLI)", |ui| {
+        Self::section_card(ui, "Fluid Representation", |ui| {
             ui.horizontal(|ui| {
-                if ui
-                    .add_sized(
-                        [142.0, 28.0],
-                        egui::Button::new("⚪ SPH Spheres")
-                            .selected(self.render_mode == RenderMode::Particles),
-                    )
-                    .clicked()
+                let w = (ui.available_width() - 6.0) * 0.5;
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Spheres,
+                    "SPH Spheres",
+                    self.render_mode == RenderMode::Particles,
+                    Some(egui::vec2(w, 28.0)),
+                )
+                .clicked()
                 {
                     self.render_mode = RenderMode::Particles;
                 }
-                if ui
-                    .add_sized(
-                        [142.0, 28.0],
-                        egui::Button::new("💎 3D Surface Mesh")
-                            .selected(self.render_mode == RenderMode::SurfaceMesh),
-                    )
-                    .clicked()
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Mesh,
+                    "3D Surface Mesh",
+                    self.render_mode == RenderMode::SurfaceMesh,
+                    Some(egui::vec2(w, 28.0)),
+                )
+                .clicked()
                 {
                     self.render_mode = RenderMode::SurfaceMesh;
                     self.mesh_dirty = true;
@@ -2163,10 +3425,10 @@ impl LiquidApp {
             });
             ui.weak(match self.render_mode {
                 RenderMode::Particles => {
-                    "Fast glossy instanced sphere impostors with Fresnel rim lighting."
+                    "Instanced analytical ray-sphere impostors with Fresnel rim lighting & whitewater foam."
                 }
                 RenderMode::SurfaceMesh => {
-                    "Continuous Marching Cubes liquid isosurface with Beer-Lambert color, textures & PBR light."
+                    "Continuous Marching Cubes isosurface with Beer-Lambert absorption, textures & PBR light."
                 }
             });
         });
@@ -2175,18 +3437,10 @@ impl LiquidApp {
 
         if self.render_mode == RenderMode::Particles {
             Self::section_card(ui, "Particle Sphere Shading & Colormap", |ui| {
-                ui.checkbox(&mut self.lit_spheres, "Glossy Fresnel & Specular Spheres");
-                ui.checkbox(&mut self.enable_culling, "Frustum Viewport Culling");
-                ui.add(
-                    egui::Slider::new(&mut self.display_size_factor, 0.5..=1.8)
-                        .text("Sphere Scale"),
-                );
-
-                ui.separator();
                 ui.label("Color Field:");
                 egui::ComboBox::from_id_salt("p_color_mode")
                     .selected_text(self.color_mode.name())
-                    .width(260.0)
+                    .width(268.0)
                     .show_ui(ui, |ui| {
                         for &mode in ColorMode::ALL {
                             ui.selectable_value(&mut self.color_mode, mode, mode.name());
@@ -2194,247 +3448,422 @@ impl LiquidApp {
                     });
 
                 ui.label("Colormap Gradient:");
-                ui.horizontal(|ui| {
-                    for &(cm, label) in &[
-                        (ColorMapType::Ocean, "Ocean"),
-                        (ColorMapType::Turbo, "Turbo"),
-                        (ColorMapType::Viridis, "Viridis"),
-                        (ColorMapType::Fire, "Fire"),
-                    ] {
-                        if ui.selectable_label(self.color_map == cm, label).clicked() {
+                egui::ComboBox::from_id_salt("p_color_map")
+                    .selected_text(self.color_map.name())
+                    .width(268.0)
+                    .show_ui(ui, |ui| {
+                        for &cm in ColorMapType::ALL {
+                            ui.selectable_value(&mut self.color_map, cm, cm.name());
+                        }
+                    });
+
+                ui.horizontal_wrapped(|ui| {
+                    for &cm in ColorMapType::ALL {
+                        if ui
+                            .selectable_label(self.color_map == cm, cm.name())
+                            .clicked()
+                        {
                             self.color_map = cm;
                         }
                     }
                 });
+
+                ui.separator();
+                ui.add(
+                    egui::Slider::new(&mut self.display_size_factor, 0.5..=2.0)
+                        .text("Sphere Scale")
+                        .fixed_decimals(2),
+                );
+                ui.checkbox(&mut self.lit_spheres, "Glossy Fresnel & Specular Shading");
+                ui.checkbox(
+                    &mut self.particle_foam,
+                    "Dynamic Aerated Whitewater Foam",
+                )
+                .on_hover_text("Highlights fast, low-density crest & splash droplets as bright whitewater foam");
+                ui.checkbox(&mut self.enable_culling, "Frustum Viewport Culling");
             });
-            return;
+        } else {
+            // === Surface Mesh Controls (Clean Primary + Collapsed Advanced Drawers) ===
+            Self::section_card(ui, "Material Preset & Liquid Color", |ui| {
+                let mut chosen_preset = self.mesh_config.preset;
+                egui::ComboBox::from_id_salt("mesh_mat_preset")
+                    .selected_text(chosen_preset.name())
+                    .width(268.0)
+                    .show_ui(ui, |ui| {
+                        for &p in FluidMaterialPreset::ALL {
+                            if ui
+                                .selectable_value(&mut chosen_preset, p, p.name())
+                                .clicked()
+                            {
+                                p.apply(&mut self.mesh_config);
+                            }
+                        }
+                    });
+
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.label("Shallow / Surface:");
+                    if ui
+                        .color_edit_button_rgb(&mut self.mesh_config.shallow_color)
+                        .changed()
+                    {
+                        self.mesh_config.preset = FluidMaterialPreset::Custom;
+                    }
+                    ui.monospace(SurfaceMeshConfig::format_hex(self.mesh_config.shallow_color));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Deep Absorption:  ");
+                    if ui
+                        .color_edit_button_rgb(&mut self.mesh_config.deep_color)
+                        .changed()
+                    {
+                        self.mesh_config.preset = FluidMaterialPreset::Custom;
+                    }
+                    ui.monospace(SurfaceMeshConfig::format_hex(self.mesh_config.deep_color));
+                });
+
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.mesh_config.opacity, 0.08..=1.0)
+                            .text("Surface Opacity"),
+                    )
+                    .changed()
+                {
+                    self.mesh_config.preset = FluidMaterialPreset::Custom;
+                }
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.mesh_config.absorption, 0.1..=7.0)
+                            .text("Volume Absorption"),
+                    )
+                    .changed()
+                {
+                    self.mesh_config.preset = FluidMaterialPreset::Custom;
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.mesh_config.foam_intensity, 0.0..=1.0)
+                        .text("Crest Foam"),
+                );
+            });
+
+            ui.add_space(6.0);
+
+            Self::section_card(ui, "Procedural Surface Texture", |ui| {
+                egui::ComboBox::from_id_salt("mesh_tex_mode")
+                    .selected_text(self.mesh_config.texture_mode.name())
+                    .width(268.0)
+                    .show_ui(ui, |ui| {
+                        for &tm in MeshTextureMode::ALL {
+                            ui.selectable_value(&mut self.mesh_config.texture_mode, tm, tm.name());
+                        }
+                    });
+
+                if self.mesh_config.texture_mode != MeshTextureMode::None {
+                    ui.add(
+                        egui::Slider::new(&mut self.mesh_config.texture_scale, 0.8..=20.0)
+                            .text("Texture Scale"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.mesh_config.texture_strength, 0.0..=1.0)
+                            .text("Bump / Intensity"),
+                    );
+                }
+            });
+
+            ui.add_space(6.0);
+
+            egui::CollapsingHeader::new("Advanced PBR Optics & Refraction")
+                .default_open(false)
+                .show(ui, |ui| {
+                    Self::section_card(ui, "Dielectric & Metallic Optics", |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("IOR:");
+                            for &(ior_val, label) in &[
+                                (1.333f32, "Water 1.33"),
+                                (1.470f32, "Glycerin 1.47"),
+                                (1.520f32, "Glass 1.52"),
+                                (2.400f32, "Chrome 2.4"),
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        (self.mesh_config.ior - ior_val).abs() < 0.02,
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    self.mesh_config.ior = ior_val;
+                                }
+                            }
+                        });
+
+                        ui.add(
+                            egui::Slider::new(&mut self.mesh_config.ior, 1.02..=2.60)
+                                .text("Fresnel IOR")
+                                .fixed_decimals(3),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.mesh_config.roughness, 0.015..=0.80)
+                                .text("GGX Roughness")
+                                .fixed_decimals(3),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.mesh_config.specular_intensity, 0.0..=3.0)
+                                .text("Sun Specular"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.mesh_config.refraction_strength, 0.0..=1.2)
+                                .text("Refraction"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.mesh_config.subsurface_scattering,
+                                0.0..=1.6,
+                            )
+                            .text("Subsurface Glow"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.mesh_config.env_reflection, 0.0..=2.2)
+                                .text("Sky Reflection"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.mesh_config.metallic, 0.0..=1.0)
+                                .text("Metallic"),
+                        );
+                        ui.checkbox(
+                            &mut self.mesh_config.cast_shadows,
+                            "Cast Colored Shadows & Caustics (MP4 / PNG)",
+                        );
+                    });
+                });
+
+            egui::CollapsingHeader::new("Advanced Isosurface Meshing Grid")
+                .default_open(false)
+                .show(ui, |ui| {
+                    Self::section_card(ui, "Marching Cubes Reconstruction", |ui| {
+                        let mut geom_changed = false;
+                        geom_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.mesh_config.voxel_scale, 0.40..=1.35)
+                                    .text("Voxel Scale"),
+                            )
+                            .on_hover_text("Smaller = finer surface triangles; larger = faster preview")
+                            .changed();
+                        geom_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.mesh_config.iso_value, 0.16..=0.75)
+                                    .text("Iso Threshold"),
+                            )
+                            .changed();
+                        geom_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.mesh_config.smoothing_passes, 0..=10)
+                                    .text("Taubin Smooth"),
+                            )
+                            .changed();
+                        geom_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.mesh_config.kernel_scale, 0.7..=1.6)
+                                    .text("Kernel Support"),
+                            )
+                            .changed();
+
+                        if geom_changed {
+                            self.mesh_dirty = true;
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.weak(format!(
+                                "Mesh: {} tris ({:.1} ms)",
+                                self.cached_surface_mesh.triangle_count(),
+                                self.last_mesh_time_ms
+                            ));
+                            if Self::icon_button(ui, UiIcon::Save, "Export .OBJ", false, None)
+                                .clicked()
+                            {
+                                self.export_current_surface_obj();
+                            }
+                        });
+                    });
+                });
         }
 
-        // === Surface Mesh Controls (Material, Color, Texture, Light Behavior, Geometry) ===
-        Self::section_card(ui, "Material Preset & Liquid Color", |ui| {
-            let mut chosen_preset = self.mesh_config.preset;
-            egui::ComboBox::from_id_salt("mesh_mat_preset")
-                .selected_text(chosen_preset.name())
-                .width(275.0)
+        ui.add_space(6.0);
+
+        // Shared Studio Backdrop, Sun Lighting & Camera Turntable (applies to BOTH Spheres & Mesh!)
+        Self::section_card(ui, "Studio Environment, Sun & Camera", |ui| {
+            ui.label("Sky & Backdrop:");
+            egui::ComboBox::from_id_salt("studio_env_preset")
+                .selected_text(self.mesh_config.env_preset.name())
+                .width(268.0)
                 .show_ui(ui, |ui| {
-                    for &p in FluidMaterialPreset::ALL {
-                        if ui
-                            .selectable_value(&mut chosen_preset, p, p.name())
-                            .clicked()
-                        {
-                            p.apply(&mut self.mesh_config);
-                        }
+                    for &ep in EnvironmentPreset::ALL {
+                        ui.selectable_value(&mut self.mesh_config.env_preset, ep, ep.name());
                     }
                 });
 
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Shallow / Surface:");
-                if ui
-                    .color_edit_button_rgb(&mut self.mesh_config.shallow_color)
-                    .changed()
-                {
-                    self.mesh_config.preset = FluidMaterialPreset::Custom;
-                }
-                ui.monospace(SurfaceMeshConfig::format_hex(self.mesh_config.shallow_color));
-            });
+            ui.add(
+                egui::Slider::new(&mut self.mesh_config.exposure, 0.35..=2.40)
+                    .text("Exposure")
+                    .fixed_decimals(2),
+            );
 
             ui.horizontal(|ui| {
-                ui.label("Deep Absorption:  ");
-                if ui
-                    .color_edit_button_rgb(&mut self.mesh_config.deep_color)
-                    .changed()
-                {
-                    self.mesh_config.preset = FluidMaterialPreset::Custom;
-                }
-                ui.monospace(SurfaceMeshConfig::format_hex(self.mesh_config.deep_color));
+                ui.checkbox(&mut self.mesh_config.show_grid, "Floor Grid");
+                ui.checkbox(&mut self.mesh_config.show_wireframe, "Chamber Wireframe");
             });
 
-            if ui
-                .add(
-                    egui::Slider::new(&mut self.mesh_config.opacity, 0.08..=1.0)
-                        .text("Surface Opacity"),
-                )
-                .changed()
-            {
-                self.mesh_config.preset = FluidMaterialPreset::Custom;
-            }
-            if ui
-                .add(
-                    egui::Slider::new(&mut self.mesh_config.absorption, 0.1..=7.0)
-                        .text("Volume Absorption"),
-                )
-                .changed()
-            {
-                self.mesh_config.preset = FluidMaterialPreset::Custom;
-            }
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.foam_intensity, 0.0..=1.0)
-                    .text("Crest Foam"),
-            );
-        });
-
-        ui.add_space(6.0);
-
-        Self::section_card(ui, "Procedural Surface Texture", |ui| {
-            egui::ComboBox::from_id_salt("mesh_tex_mode")
-                .selected_text(self.mesh_config.texture_mode.name())
-                .width(275.0)
-                .show_ui(ui, |ui| {
-                    for &tm in MeshTextureMode::ALL {
-                        ui.selectable_value(&mut self.mesh_config.texture_mode, tm, tm.name());
-                    }
-                });
-
-            if self.mesh_config.texture_mode != MeshTextureMode::None {
-                ui.add(
-                    egui::Slider::new(&mut self.mesh_config.texture_scale, 0.8..=20.0)
-                        .text("Texture Scale"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.mesh_config.texture_strength, 0.0..=1.0)
-                        .text("Bump / Intensity"),
-                );
-            }
-        });
-
-        ui.add_space(6.0);
-
-        Self::section_card(ui, "Light Behavior & Optical Physics", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("IOR Preset:");
-                for &(ior_val, label) in &[
-                    (1.333f32, "Water 1.33"),
-                    (1.490f32, "Amber 1.49"),
-                    (1.520f32, "Glass 1.52"),
-                    (2.400f32, "Chrome 2.4"),
-                ] {
-                    if ui
-                        .selectable_label((self.mesh_config.ior - ior_val).abs() < 0.02, label)
-                        .clicked()
-                    {
-                        self.mesh_config.ior = ior_val;
-                    }
-                }
-            });
-
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.ior, 1.02..=2.60)
-                    .text("Fresnel IOR")
-                    .fixed_decimals(3),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.roughness, 0.015..=0.80)
-                    .text("GGX Roughness")
-                    .fixed_decimals(3),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.specular_intensity, 0.0..=3.0)
-                    .text("Sun Specular"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.refraction_strength, 0.0..=1.2)
-                    .text("Refraction"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.subsurface_scattering, 0.0..=1.6)
-                    .text("Subsurface Glow"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.env_reflection, 0.0..=2.2)
-                    .text("Sky Reflection"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.metallic, 0.0..=1.0).text("Metallic"),
-            );
-
-            ui.separator();
-            ui.label("Studio Key Sun & Shadows:");
             let mut sun_changed = false;
             sun_changed |= ui
                 .add(
                     egui::Slider::new(&mut self.sun_azimuth_deg, -180.0..=180.0)
-                        .text("Sun Azimuth (°)"),
+                        .text("Sun Azimuth")
+                        .suffix("°"),
                 )
                 .changed();
             sun_changed |= ui
                 .add(
                     egui::Slider::new(&mut self.sun_elevation_deg, 8.0..=88.0)
-                        .text("Sun Elevation (°)"),
+                        .text("Sun Elevation")
+                        .suffix("°"),
                 )
                 .changed();
             if sun_changed {
                 self.update_dir_from_sun_angles();
             }
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.light_intensity, 0.1..=3.0)
-                    .text("Sun Radiance"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.mesh_config.ambient_intensity, 0.05..=1.0)
-                    .text("Ambient Fill"),
-            );
-            ui.checkbox(
-                &mut self.mesh_config.cast_shadows,
-                "Cast Colored Shadows & Caustics (CLI/MP4)",
-            );
-        });
 
-        ui.add_space(6.0);
+            egui::CollapsingHeader::new("Advanced Sun Radiance & Camera Lens")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.mesh_config.light_intensity, 0.1..=3.5)
+                            .text("Sun Radiance"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.mesh_config.ambient_intensity, 0.05..=1.2)
+                            .text("Ambient Fill"),
+                    );
 
-        Self::section_card(ui, "Isosurface Meshing Geometry", |ui| {
-            let mut geom_changed = false;
-            geom_changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.mesh_config.voxel_scale, 0.45..=1.35)
-                        .text("Voxel Scale"),
-                )
-                .on_hover_text("Smaller = finer surface triangles; larger = faster preview")
-                .changed();
-            geom_changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.mesh_config.iso_value, 0.18..=0.75)
-                        .text("Iso Threshold"),
-                )
-                .changed();
-            geom_changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.mesh_config.smoothing_passes, 0..=6)
-                        .text("Taubin Smooth"),
-                )
-                .changed();
+                    ui.separator();
+                    let mut fov_deg = self.camera.fov_y.to_degrees();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut fov_deg, 20.0..=90.0)
+                                .text("Camera FOV")
+                                .suffix("°"),
+                        )
+                        .changed()
+                    {
+                        self.camera.fov_y = fov_deg.to_radians();
+                    }
 
-            if geom_changed {
-                self.mesh_dirty = true;
-            }
-
-            ui.horizontal(|ui| {
-                ui.weak(format!(
-                    "Mesh: {} tris ({:.1} ms)",
-                    self.cached_surface_mesh.triangle_count(),
-                    self.last_mesh_time_ms
-                ));
-                if ui.small_button("💾 Export .OBJ").clicked() {
-                    self.export_current_surface_obj();
-                }
-            });
+                    if !self.is_2d {
+                        ui.add(
+                            egui::Slider::new(&mut self.camera_orbit_speed_deg, -60.0..=60.0)
+                                .text("Turntable Orbit")
+                                .suffix(" °/s"),
+                        )
+                        .on_hover_text("Automatic 360° turntable camera rotation in viewport & MP4 renders");
+                        ui.add(
+                            egui::Slider::new(&mut self.camera.distance, 0.8..=12.0)
+                                .text("Cam Distance")
+                                .suffix(" m"),
+                        );
+                    }
+                    if Self::icon_button(ui, UiIcon::Camera, "Reset Camera", false, None).clicked()
+                    {
+                        self.reset_camera_framing();
+                    }
+                });
         });
     }
 
     fn draw_render_cli_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        // 1. Direct Studio MP4 Video Renderer
-        Self::section_card(ui, "Studio MP4 Video Renderer (GUI)", |ui| {
+        // 1. Single-Frame Studio Snapshot & Geometry Export (PNG / PLY / OBJ)
+        Self::section_card(ui, "Frame Snapshot & 3D Geometry Export", |ui| {
             ui.horizontal(|ui| {
-                ui.label("Render Mode:");
-                ui.selectable_value(&mut self.render_mode, RenderMode::Particles, "⚪ Spheres");
-                if ui
-                    .selectable_value(
-                        &mut self.render_mode,
-                        RenderMode::SurfaceMesh,
-                        "💎 Surface Mesh",
-                    )
-                    .clicked()
+                ui.label("Export Dir:");
+                ui.text_edit_singleline(&mut self.export_path);
+            });
+
+            if Self::icon_button(
+                ui,
+                UiIcon::Image,
+                &format!(
+                    "Capture Studio PNG ({}x{})",
+                    self.video_width, self.video_height
+                ),
+                false,
+                Some(egui::vec2(ui.available_width(), 27.0)),
+            )
+            .on_hover_text("Render current frame with full studio SSAA, shadows & optics to a lossless PNG file (Shortcut: P)")
+            .clicked()
+            {
+                self.export_current_png();
+            }
+
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 6.0) * 0.5;
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Save,
+                    "Save Cloud (.ply)",
+                    false,
+                    Some(egui::vec2(w, 25.0)),
+                )
+                .clicked()
                 {
+                    self.export_current_frame();
+                }
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Mesh,
+                    "Save Mesh (.obj)",
+                    false,
+                    Some(egui::vec2(w, 25.0)),
+                )
+                .clicked()
+                {
+                    self.export_current_surface_obj();
+                }
+            });
+
+            ui.checkbox(&mut self.export_sequence, "Auto-record PLY sequence while playing");
+            if self.export_sequence {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 185, 65),
+                    format!("Recording frame {:05}", self.exported_frames_count),
+                );
+            }
+        });
+
+        ui.add_space(6.0);
+
+        // 2. Direct Studio MP4 Video Renderer
+        Self::section_card(ui, "Studio MP4 Video Renderer", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Mode:");
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Spheres,
+                    "Spheres",
+                    self.render_mode == RenderMode::Particles,
+                    None,
+                )
+                .clicked()
+                {
+                    self.render_mode = RenderMode::Particles;
+                }
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Mesh,
+                    "Surface Mesh",
+                    self.render_mode == RenderMode::SurfaceMesh,
+                    None,
+                )
+                .clicked()
+                {
+                    self.render_mode = RenderMode::SurfaceMesh;
                     self.mesh_dirty = true;
                 }
             });
@@ -2450,6 +3879,7 @@ impl LiquidApp {
                     (1280usize, 720usize, "720p"),
                     (1920usize, 1080usize, "1080p"),
                     (2560usize, 1440usize, "1440p"),
+                    (3840usize, 2160usize, "4K"),
                 ] {
                     if ui
                         .selectable_label(self.video_width == w && self.video_height == h, lbl)
@@ -2457,6 +3887,25 @@ impl LiquidApp {
                     {
                         self.video_width = w;
                         self.video_height = h;
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Optics Tier:");
+                for &rq in CliRenderQuality::ALL {
+                    let short = match rq {
+                        CliRenderQuality::Standard => "Standard",
+                        CliRenderQuality::Studio => "Studio 2x",
+                        CliRenderQuality::Cinema => "Cinema 3x",
+                        CliRenderQuality::Master => "Master 4x",
+                    };
+                    if ui
+                        .selectable_label(self.gui_render_quality == rq, short)
+                        .on_hover_text(rq.name())
+                        .clicked()
+                    {
+                        self.gui_render_quality = rq;
                     }
                 }
             });
@@ -2469,7 +3918,7 @@ impl LiquidApp {
 
             ui.horizontal(|ui| {
                 ui.label("FPS:");
-                for &f in &[30u32, 60, 120] {
+                for &f in &[24u32, 30, 60, 120] {
                     if ui
                         .selectable_label(self.cli_fps == f, format!("{}", f))
                         .clicked()
@@ -2510,28 +3959,27 @@ impl LiquidApp {
                         .show_percentage()
                         .text(format!("Frame {}/{} ({:.1}s)", done, total, elapsed)),
                 );
-                if ui.button("⏹ Stop & Save Current Progress").clicked() {
+                if ui.button("Stop & Finalize Video").clicked() {
                     self.bg_render_cancel.store(true, Ordering::SeqCst);
                 }
                 ctx.request_repaint();
-            } else {
-                let render_btn = egui::Button::new(
-                    egui::RichText::new("🎬 Render MP4 Video Now")
-                        .strong()
-                        .color(egui::Color32::WHITE),
-                )
-                .fill(egui::Color32::from_rgb(20, 118, 212));
-
-                if ui.add_sized([ui.available_width(), 30.0], render_btn).clicked() {
-                    self.start_gui_mp4_render();
-                }
+            } else if Self::icon_button(
+                ui,
+                UiIcon::Film,
+                "Render MP4 Video Now",
+                true,
+                Some(egui::vec2(ui.available_width(), 30.0)),
+            )
+            .clicked()
+            {
+                self.start_gui_mp4_render();
             }
         });
 
         ui.add_space(6.0);
 
-        // 2. CLI Command Builder
-        Self::section_card(ui, "CLI Command Builder", |ui| {
+        // 3. CLI Command Builder
+        Self::section_card(ui, "Runnable CLI Command Builder", |ui| {
             ui.horizontal_wrapped(|ui| {
                 for &m in CliCommandMode::ALL {
                     if ui.selectable_label(self.cli_mode == m, m.name()).clicked() {
@@ -2549,11 +3997,12 @@ impl LiquidApp {
             );
 
             ui.horizontal(|ui| {
-                if ui.button("📋 Copy CLI Command").clicked() {
+                if Self::icon_button(ui, UiIcon::Copy, "Copy CLI Command", false, None).clicked() {
                     ctx.copy_text(cmd.clone());
                     self.status_message = "Copied CLI command to clipboard!".to_string();
                 }
-                if ui.button("💎 Copy Mesh MP4 CLI").clicked() {
+                if Self::icon_button(ui, UiIcon::Mesh, "Copy Mesh MP4 CLI", false, None).clicked()
+                {
                     let prev_mode = self.cli_mode;
                     let prev_rm = self.render_mode;
                     self.cli_mode = CliCommandMode::Mp4Video;
@@ -2567,31 +4016,6 @@ impl LiquidApp {
                 }
             });
         });
-
-        ui.add_space(6.0);
-
-        // 3. Blender PLY & Wavefront OBJ Export
-        Self::section_card(ui, "Geometry & Point Cloud Export", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Folder:");
-                ui.text_edit_singleline(&mut self.export_path);
-            });
-            ui.horizontal(|ui| {
-                if ui.button("💾 Save Frame (.ply)").clicked() {
-                    self.export_current_frame();
-                }
-                if ui.button("💎 Save Surface (.obj)").clicked() {
-                    self.export_current_surface_obj();
-                }
-            });
-            ui.checkbox(&mut self.export_sequence, "Auto-record PLY sequence");
-            if self.export_sequence {
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 185, 65),
-                    format!("● Recording frame {:05}", self.exported_frames_count),
-                );
-            }
-        });
     }
 }
 
@@ -2602,9 +4026,100 @@ impl eframe::App for LiquidApp {
             self.theme_applied = true;
         }
 
-        // Keyboard shortcuts (Space to toggle play/pause when not typing in text fields)
-        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-            self.is_playing = !self.is_playing;
+        // Studio keyboard shortcuts (only when not typing into a text input widget)
+        if !ctx.wants_keyboard_input() {
+            let mut key_step = false;
+            let mut key_reset = false;
+            let mut key_cam = false;
+            let mut key_mesh = false;
+            let mut key_grid = false;
+            let mut key_wire = false;
+            let mut key_orbit = false;
+            let mut key_png = false;
+            let mut key_help = false;
+
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::Space) {
+                    self.is_playing = !self.is_playing;
+                }
+                if i.key_pressed(egui::Key::Period) {
+                    key_step = true;
+                }
+                if i.key_pressed(egui::Key::R) && !i.modifiers.command && !i.modifiers.ctrl {
+                    key_reset = true;
+                }
+                if i.key_pressed(egui::Key::C) && !i.modifiers.command && !i.modifiers.ctrl {
+                    key_cam = true;
+                }
+                if i.key_pressed(egui::Key::M) {
+                    key_mesh = true;
+                }
+                if i.key_pressed(egui::Key::G) {
+                    key_grid = true;
+                }
+                if i.key_pressed(egui::Key::B) {
+                    key_wire = true;
+                }
+                if i.key_pressed(egui::Key::O) {
+                    key_orbit = true;
+                }
+                if i.key_pressed(egui::Key::P) || i.key_pressed(egui::Key::F12) {
+                    key_png = true;
+                }
+                if i.key_pressed(egui::Key::F1)
+                    || (i.key_pressed(egui::Key::Slash) && i.modifiers.shift)
+                {
+                    key_help = true;
+                }
+            });
+
+            if key_step {
+                let dt = self.fixed_dt * self.sim_speed;
+                self.step_simulation_once(dt);
+                ctx.request_repaint();
+            }
+            if key_reset {
+                self.load_preset(self.current_preset);
+            }
+            if key_cam {
+                self.reset_camera_framing();
+            }
+            if key_mesh {
+                self.render_mode = match self.render_mode {
+                    RenderMode::Particles => {
+                        self.mesh_dirty = true;
+                        RenderMode::SurfaceMesh
+                    }
+                    RenderMode::SurfaceMesh => RenderMode::Particles,
+                };
+            }
+            if key_grid {
+                self.mesh_config.show_grid = !self.mesh_config.show_grid;
+            }
+            if key_wire {
+                self.mesh_config.show_wireframe = !self.mesh_config.show_wireframe;
+            }
+            if key_orbit && !self.is_2d {
+                self.camera_orbit_speed_deg = if self.camera_orbit_speed_deg.abs() > 0.5 {
+                    0.0
+                } else {
+                    18.0
+                };
+            }
+            if key_png {
+                self.export_current_png();
+            }
+            if key_help {
+                self.show_shortcuts_modal = !self.show_shortcuts_modal;
+            }
+        }
+
+        // Turntable camera auto-orbit
+        let cam_dt = self.last_camera_tick.elapsed().as_secs_f32().min(0.1);
+        self.last_camera_tick = Instant::now();
+        if !self.is_2d && self.camera_orbit_speed_deg.abs() > 0.05 {
+            self.camera.azimuth += self.camera_orbit_speed_deg.to_radians() * cam_dt;
+            ctx.request_repaint();
         }
 
         // Calculate FPS smoothly
@@ -2634,11 +4149,20 @@ impl eframe::App for LiquidApp {
             .exact_height(42.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
+                    // Brand logo icon + title
+                    let (logo_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 20.0), egui::Sense::hover());
+                    Self::paint_icon(
+                        ui.painter(),
+                        logo_rect.center(),
+                        UiIcon::Wave,
+                        egui::Color32::from_rgb(86, 188, 255),
+                    );
                     ui.label(
-                        egui::RichText::new("🌊 LiquidRust")
+                        egui::RichText::new("LiquidRust")
                             .strong()
                             .size(15.5)
-                            .color(egui::Color32::from_rgb(235, 244, 255)),
+                            .color(egui::Color32::from_rgb(236, 245, 255)),
                     );
 
                     // Version pill / Update badge right next to app title
@@ -2646,7 +4170,7 @@ impl eframe::App for LiquidApp {
                     match &upd_snap.phase {
                         UpdatePhase::UpdateAvailable(info) => {
                             let upd_btn = egui::Button::new(
-                                egui::RichText::new(format!("⬆ Update {}", info.tag_name))
+                                egui::RichText::new(format!("Update {}", info.tag_name))
                                     .strong()
                                     .size(11.5)
                                     .color(egui::Color32::from_rgb(10, 24, 18)),
@@ -2674,7 +4198,7 @@ impl eframe::App for LiquidApp {
                                 0
                             };
                             let dl_btn = egui::Button::new(
-                                egui::RichText::new(format!("⬇ {}%", pct))
+                                egui::RichText::new(format!("DL {}%", pct))
                                     .strong()
                                     .size(11.5)
                                     .color(egui::Color32::WHITE),
@@ -2702,33 +4226,14 @@ impl eframe::App for LiquidApp {
                         }
                     }
 
-                    let active_fill = egui::Color32::from_rgb(14, 116, 184);
-                    let idle_fill = egui::Color32::from_rgb(32, 41, 54);
-                    let btn_3d = egui::Button::new(
-                        egui::RichText::new("🌐 3D")
-                            .strong()
-                            .size(13.0)
-                            .color(if !self.is_2d { egui::Color32::WHITE } else { egui::Color32::from_rgb(175, 190, 210) }),
-                    )
-                    .fill(if !self.is_2d { active_fill } else { idle_fill });
-                    if ui
-                        .add(btn_3d)
+                    if Self::icon_button(ui, UiIcon::Cube3D, "3D", !self.is_2d, None)
                         .on_hover_text("Switch to 3D Volumetric simulation")
                         .clicked()
                         && self.is_2d
                     {
                         self.set_2d(false);
                     }
-
-                    let btn_2d = egui::Button::new(
-                        egui::RichText::new("▭ 2D")
-                            .strong()
-                            .size(13.0)
-                            .color(if self.is_2d { egui::Color32::WHITE } else { egui::Color32::from_rgb(175, 190, 210) }),
-                    )
-                    .fill(if self.is_2d { active_fill } else { idle_fill });
-                    if ui
-                        .add(btn_2d)
+                    if Self::icon_button(ui, UiIcon::Plane2D, "2D", self.is_2d, None)
                         .on_hover_text("Switch to 2D Planar simulation")
                         .clicked()
                         && !self.is_2d
@@ -2738,22 +4243,20 @@ impl eframe::App for LiquidApp {
 
                     ui.separator();
 
-                    let play_label = if self.is_playing {
-                        "⏸ Pause"
+                    let (play_icon, play_lbl) = if self.is_playing {
+                        (UiIcon::Pause, "Pause")
                     } else {
-                        "▶ Play"
+                        (UiIcon::Play, "Play")
                     };
-                    if ui
-                        .button(egui::RichText::new(play_label).strong())
+                    if Self::icon_button(ui, play_icon, play_lbl, self.is_playing, None)
                         .on_hover_text("Play / Pause simulation (Space)")
                         .clicked()
                     {
                         self.is_playing = !self.is_playing;
                     }
 
-                    if ui
-                        .button("⏭ Step")
-                        .on_hover_text("Advance single simulation frame")
+                    if Self::icon_button(ui, UiIcon::Step, "Step", false, None)
+                        .on_hover_text("Advance single simulation frame (.)")
                         .clicked()
                     {
                         let dt = self.fixed_dt * self.sim_speed;
@@ -2761,23 +4264,18 @@ impl eframe::App for LiquidApp {
                         ctx.request_repaint();
                     }
 
-                    if ui.button("↺ Reset").clicked() {
+                    if Self::icon_button(ui, UiIcon::Reset, "Reset", false, None)
+                        .on_hover_text("Reset scene particles (R)")
+                        .clicked()
+                    {
                         self.load_preset(self.current_preset);
                     }
 
-                    if ui
-                        .button("🎥 Cam")
-                        .on_hover_text("Reset camera framing")
+                    if Self::icon_button(ui, UiIcon::Camera, "Cam", false, None)
+                        .on_hover_text("Reset camera framing (C)")
                         .clicked()
                     {
-                        if self.is_2d {
-                            self.camera.azimuth = 0.0;
-                            self.camera.elevation = 0.0;
-                            self.camera.target = Vec3::new(0.0, 0.6, 0.0);
-                            self.camera.distance = 2.4;
-                        } else {
-                            self.camera.reset();
-                        }
+                        self.reset_camera_framing();
                     }
 
                     ui.separator();
@@ -2803,30 +4301,34 @@ impl eframe::App for LiquidApp {
                     ui.separator();
 
                     // Quick Render Mode Toggle right in top bar
-                    if ui
-                        .selectable_label(
-                            self.render_mode == RenderMode::Particles,
-                            "⚪ Spheres",
-                        )
-                        .clicked()
+                    if Self::icon_button(
+                        ui,
+                        UiIcon::Spheres,
+                        "Spheres",
+                        self.render_mode == RenderMode::Particles,
+                        None,
+                    )
+                    .on_hover_text("Instanced SPH sphere shading (M)")
+                    .clicked()
                     {
                         self.render_mode = RenderMode::Particles;
                     }
-                    if ui
-                        .selectable_label(
-                            self.render_mode == RenderMode::SurfaceMesh,
-                            "💎 Mesh",
-                        )
-                        .clicked()
+                    if Self::icon_button(
+                        ui,
+                        UiIcon::Mesh,
+                        "Mesh",
+                        self.render_mode == RenderMode::SurfaceMesh,
+                        None,
+                    )
+                    .on_hover_text("3D Marching Cubes liquid surface mesh (M)")
+                    .clicked()
                     {
                         self.render_mode = RenderMode::SurfaceMesh;
                         self.mesh_dirty = true;
-                        self.active_tab = InspectorTab::Surface;
                     }
 
                     ui.separator();
 
-                    // Compact Speed pills
                     for &(spd, lbl) in &[(0.25f32, "0.25x"), (0.5f32, "0.5x"), (1.0f32, "1.0x")] {
                         if ui
                             .selectable_label((self.sim_speed - spd).abs() < 0.03, lbl)
@@ -2836,10 +4338,29 @@ impl eframe::App for LiquidApp {
                         }
                     }
 
-                    // Right-aligned zero-jitter monospace telemetry pills
+                    // Right-aligned zero-jitter monospace telemetry pills + quick actions
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("📋 CLI")
+                        if Self::icon_button(
+                            ui,
+                            UiIcon::Help,
+                            "",
+                            self.show_shortcuts_modal,
+                            Some(egui::vec2(24.0, 24.0)),
+                        )
+                        .on_hover_text("Keyboard & Mouse Shortcuts (? / F1)")
+                        .clicked()
+                        {
+                            self.show_shortcuts_modal = !self.show_shortcuts_modal;
+                        }
+
+                        if Self::icon_button(ui, UiIcon::Image, "PNG", false, None)
+                            .on_hover_text("Save Studio PNG screenshot to exports folder (P / F12)")
+                            .clicked()
+                        {
+                            self.export_current_png();
+                        }
+
+                        if Self::icon_button(ui, UiIcon::Copy, "CLI", false, None)
                             .on_hover_text("Copy runnable CLI command to clipboard")
                             .clicked()
                         {
@@ -2888,11 +4409,19 @@ impl eframe::App for LiquidApp {
             .exact_height(24.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    let backend_str = if self.use_gpu && self.gpu_solver.is_some() {
-                        format!("⚡ Vulkan: {}", self.gpu_device_name)
+                    let (b_icon, backend_str) = if self.use_gpu && self.gpu_solver.is_some() {
+                        (UiIcon::Bolt, format!("Vulkan: {}", self.gpu_device_name))
                     } else {
-                        "⚙ CPU (Rayon Multi-Core)".to_string()
+                        (UiIcon::Sliders, "CPU (Rayon Multi-Core)".to_string())
                     };
+                    let (ic_r, _) =
+                        ui.allocate_exact_size(egui::vec2(13.0, 14.0), egui::Sense::hover());
+                    Self::paint_icon(
+                        ui.painter(),
+                        ic_r.center(),
+                        b_icon,
+                        egui::Color32::from_rgb(112, 184, 255),
+                    );
                     ui.label(
                         egui::RichText::new(backend_str)
                             .size(11.0)
@@ -2902,14 +4431,14 @@ impl eframe::App for LiquidApp {
                     ui.label(
                         egui::RichText::new(&self.status_message)
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(190, 202, 222)),
+                            .color(egui::Color32::from_rgb(194, 206, 226)),
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.weak(if self.is_2d {
-                            "Space: Play/Pause • Left-Drag: Attract • Shift+Left-Drag: Repel • Middle-Drag: Pan • Scroll: Zoom"
+                            "Space: Play • R: Reset • M: Mesh • P: PNG • ?: Help • L-Drag: Pull • Shift+L-Drag: Push"
                         } else {
-                            "Space: Play/Pause • Left-Drag: Attract • Shift+Left-Drag: Repel • Middle-Drag: Pan • Right-Drag: Orbit"
+                            "Space: Play • R: Reset • M: Mesh • O: Orbit • P: PNG • ?: Help • R-Drag: Orbit"
                         });
                     });
                 });
@@ -2917,24 +4446,27 @@ impl eframe::App for LiquidApp {
 
         // 3. Left Studio Inspector Panel with 4 Organized Tabs
         egui::SidePanel::left("studio_inspector")
-            .default_width(326.0)
-            .min_width(305.0)
-            .max_width(420.0)
+            .default_width(332.0)
+            .min_width(310.0)
+            .max_width(430.0)
             .show(ctx, |ui| {
                 ui.add_space(3.0);
                 ui.horizontal(|ui| {
-                    for &(tab, label) in &[
-                        (InspectorTab::Scene, "🌊 Scene"),
-                        (InspectorTab::Physics, "⚙ Physics"),
-                        (InspectorTab::Surface, "💎 Surface"),
-                        (InspectorTab::RenderCli, "🎬 Render"),
+                    let tab_w = ((ui.available_width() - 21.0) / 4.0).max(68.0);
+                    for &(tab, icon, label) in &[
+                        (InspectorTab::Scene, UiIcon::Wave, "Scene"),
+                        (InspectorTab::Physics, UiIcon::Sliders, "Physics"),
+                        (InspectorTab::Surface, UiIcon::Mesh, "Visuals"),
+                        (InspectorTab::RenderCli, UiIcon::Film, "Export"),
                     ] {
-                        if ui
-                            .add_sized(
-                                [74.0, 26.0],
-                                egui::Button::new(label).selected(self.active_tab == tab),
-                            )
-                            .clicked()
+                        if Self::icon_button(
+                            ui,
+                            icon,
+                            label,
+                            self.active_tab == tab,
+                            Some(egui::vec2(tab_w, 26.0)),
+                        )
+                        .clicked()
                         {
                             self.active_tab = tab;
                         }
@@ -2956,8 +4488,11 @@ impl eframe::App for LiquidApp {
             });
 
         // 4. Central Viewport: Custom OpenGL 3D Render (Particles OR Real-Time Surface Mesh)
+        let bg_rgb = self.mesh_config.env_preset.viewport_bg_rgb8();
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(9, 13, 20)))
+            .frame(
+                egui::Frame::NONE.fill(egui::Color32::from_rgb(bg_rgb[0], bg_rgb[1], bg_rgb[2])),
+            )
             .show(ctx, |ui| {
                 let available_size = ui.available_size();
                 let (rect, response) =
@@ -3021,6 +4556,13 @@ impl eframe::App for LiquidApp {
                 let colliders = self.solver.colliders.clone();
                 let faucets = self.solver.faucets.clone();
                 let drains = self.solver.drains.clone();
+                let show_grid = self.mesh_config.show_grid;
+                let show_wireframe = self.mesh_config.show_wireframe;
+                let exposure = self.mesh_config.exposure;
+                let env_preset = self.mesh_config.env_preset;
+                let light_dir = self.mesh_config.light_dir;
+                let light_int = self.mesh_config.light_intensity;
+                let amb_int = self.mesh_config.ambient_intensity;
 
                 if self.render_mode == RenderMode::SurfaceMesh {
                     if self.mesh_dirty {
@@ -3043,6 +4585,10 @@ impl eframe::App for LiquidApp {
                     let callback = egui_glow::CallbackFn::new(move |info, painter| {
                         if let Ok(mut guard) = renderer_arc.lock() {
                             if let Some(ref mut renderer) = *guard {
+                                renderer.show_grid = show_grid;
+                                renderer.show_wireframe = show_wireframe;
+                                renderer.exposure = exposure;
+                                renderer.env_preset = env_preset;
                                 let gl = painter.gl();
                                 let vp = info.viewport_in_pixels();
                                 if vp.width_px > 0 && vp.height_px > 0 {
@@ -3089,15 +4635,19 @@ impl eframe::App for LiquidApp {
                         callback: Arc::new(callback),
                     });
                 } else {
-                    // Populate persistent vertex buffer with parallel frustum culling (no redundant CPU sort!)
+                    // Populate persistent vertex buffer with parallel frustum culling
                     let enable_culling = self.enable_culling;
                     let color_mode = self.color_mode;
                     let color_map = self.color_map;
+                    let particle_foam = self.particle_foam;
                     let rest_density = self.solver.config.rest_density;
                     let sim_bounds = self.solver.bounds;
                     self.render_vertices.clear();
                     self.render_vertices.par_extend(
                         self.solver.particles.par_iter().filter_map(|p| {
+                            if !p.position.is_finite() {
+                                return None;
+                            }
                             if enable_culling {
                                 let clip = view_proj
                                     * glam::Vec4::new(p.position.x, p.position.y, p.position.z, 1.0);
@@ -3119,28 +4669,14 @@ impl eframe::App for LiquidApp {
                                     return None;
                                 }
                             }
-                            let t = match color_mode {
-                                ColorMode::Velocity => (p.speed() / 2.4).clamp(0.0, 1.0),
-                                ColorMode::Pressure => {
-                                    (p.pressure / (rest_density * 0.4)).clamp(0.0, 1.0)
-                                }
-                                ColorMode::Density => {
-                                    let dev = (p.density - rest_density).abs() / rest_density;
-                                    (dev * 4.0).clamp(0.0, 1.0)
-                                }
-                                ColorMode::Height => ((p.position.y - sim_bounds.min.y)
-                                    / (sim_bounds.max.y - sim_bounds.min.y))
-                                    .clamp(0.0, 1.0),
-                                ColorMode::KineticEnergy => {
-                                    (p.kinetic_energy() / 4.0).clamp(0.0, 1.0)
-                                }
-                                ColorMode::SingleColor => -1.0,
-                            };
-                            let c = if t < 0.0 {
-                                [30, 140, 225]
-                            } else {
-                                ColorMap::sample(color_map, t)
-                            };
+                            let c = ColorMap::particle_color(
+                                p,
+                                color_mode,
+                                color_map,
+                                rest_density,
+                                &sim_bounds,
+                                particle_foam,
+                            );
                             Some(ParticleVertex {
                                 pos: p.position.to_array(),
                                 color: [
@@ -3162,6 +4698,14 @@ impl eframe::App for LiquidApp {
                     let callback = egui_glow::CallbackFn::new(move |info, painter| {
                         if let Ok(mut guard) = renderer_arc.lock() {
                             if let Some(ref mut renderer) = *guard {
+                                renderer.show_grid = show_grid;
+                                renderer.show_wireframe = show_wireframe;
+                                renderer.exposure = exposure;
+                                renderer.env_preset = env_preset;
+                                renderer.particle_light_dir = light_dir;
+                                renderer.particle_light_intensity = light_int;
+                                renderer.particle_ambient_intensity = amb_int;
+
                                 let gl = painter.gl();
                                 let vp = info.viewport_in_pixels();
                                 if vp.width_px > 0 && vp.height_px > 0 {
@@ -3213,15 +4757,23 @@ impl eframe::App for LiquidApp {
 
         // 5. Extreme Quality Confirmation Modal Pop-up
         if self.show_extreme_modal {
-            egui::Window::new("⚠️ Warning: Extreme Simulation Quality")
+            egui::Window::new("Warning: Extreme Simulation Quality")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.set_max_width(450.0);
                     ui.add_space(4.0);
-                    ui.vertical_centered(|ui| {
-                        ui.heading("⚠️ 1,000,000+ Particles Workload");
+                    ui.horizontal(|ui| {
+                        let (wr, _) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                        Self::paint_icon(
+                            ui.painter(),
+                            wr.center(),
+                            UiIcon::Warning,
+                            egui::Color32::from_rgb(255, 175, 45),
+                        );
+                        ui.heading("1,000,000+ Particles Workload");
                     });
                     ui.add_space(8.0);
                     ui.label(
@@ -3230,13 +4782,13 @@ impl eframe::App for LiquidApp {
                     );
                     ui.add_space(6.0);
                     ui.colored_label(
-                        egui::Color32::from_rgb(255, 120, 40),
-                        "⚡ System Performance & Freeze Warning:",
+                        egui::Color32::from_rgb(255, 130, 50),
+                        "System Performance & Memory Advisory:",
                     );
                     ui.label(
-                        "• Computing over 1M particles places a massive load on your GPU and system RAM.\n\
-                        • Your computer or desktop window compositor may temporarily freeze, stutter, or lag.\n\
-                        • If using CPU fallback, this could take minutes per frame. Vulkan GPU compute is strongly recommended.",
+                        "• Computing over 1M particles places a heavy load on your GPU and system RAM.\n\
+                        • Your desktop window compositor may briefly stutter during buffer allocation.\n\
+                        • Vulkan GPU compute is strongly recommended for real-time interaction.",
                     );
                     ui.add_space(12.0);
                     ui.separator();
@@ -3247,7 +4799,7 @@ impl eframe::App for LiquidApp {
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let proceed_btn = egui::Button::new(
-                                egui::RichText::new("⚠️ Proceed to 1M+")
+                                egui::RichText::new("Proceed to 1M+")
                                     .color(egui::Color32::BLACK)
                                     .strong(),
                             )
@@ -3262,7 +4814,51 @@ impl eframe::App for LiquidApp {
                 });
         }
 
-        // 6. GitHub Release Self-Updater Notification & Progress Modal
+        // 6. Keyboard & Mouse Shortcuts Reference Modal
+        if self.show_shortcuts_modal {
+            let mut open = self.show_shortcuts_modal;
+            egui::Window::new("Studio Keyboard & Mouse Controls")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(370.0);
+                    egui::Grid::new("shortcuts_grid")
+                        .num_columns(2)
+                        .spacing([22.0, 6.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for &(k, desc) in &[
+                                ("Space", "Play / Pause simulation"),
+                                (". (Period)", "Step single physics frame"),
+                                ("R", "Reset current scene preset"),
+                                ("C", "Reset camera framing"),
+                                ("M", "Toggle Spheres / 3D Surface Mesh"),
+                                ("G", "Toggle 3D studio floor grid"),
+                                ("B", "Toggle chamber & obstacle wireframes"),
+                                ("O", "Toggle 360° turntable auto-orbit"),
+                                ("P / F12", "Capture Studio PNG screenshot"),
+                                ("? / F1", "Show / hide this shortcuts window"),
+                                ("Left-Drag", "Attract fluid toward cursor ray"),
+                                ("Shift + Left-Drag", "Repel fluid away from cursor ray"),
+                                ("Right-Drag", "Orbit 3D camera around target"),
+                                ("Middle-Drag", "Pan camera target"),
+                                ("Mouse Wheel", "Zoom camera in / out"),
+                            ] {
+                                ui.monospace(
+                                    egui::RichText::new(k)
+                                        .color(egui::Color32::from_rgb(138, 198, 255)),
+                                );
+                                ui.label(desc);
+                                ui.end_row();
+                            }
+                        });
+                });
+            self.show_shortcuts_modal = open;
+        }
+
+        // 7. GitHub Release Self-Updater Notification & Progress Modal
         self.draw_updater_modal(ctx);
     }
 }
@@ -3313,6 +4909,49 @@ impl LiquidApp {
                 self.status_message = format!("OBJ error: {}", e);
             }
         }
+    }
+
+    fn spawn_scene_file_dialog(&self, ctx: egui::Context, save: bool) {
+        if self.scene_browse_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pending = Arc::clone(&self.scene_browse_pending);
+        let load_slot = Arc::clone(&self.scene_load_result);
+        let save_slot = Arc::clone(&self.scene_save_result);
+        let hint = self.scene_file_path.trim().to_string();
+
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(if save {
+                    "Save LiquidRust Studio Scene (.json)"
+                } else {
+                    "Open LiquidRust Studio Scene (.json)"
+                })
+                .add_filter("LiquidRust Scene (*.json)", &["json", "JSON"]);
+
+            if let Ok(cwd) = std::env::current_dir() {
+                dialog = dialog.set_directory(cwd);
+            }
+            if save {
+                let fname = std::path::Path::new(&hint)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("scene.json");
+                dialog = dialog.set_file_name(fname);
+                if let Some(chosen) = dialog.save_file() {
+                    if let Ok(mut g) = save_slot.lock() {
+                        *g = Some(chosen.to_string_lossy().into_owned());
+                    }
+                }
+            } else if let Some(chosen) = dialog.pick_file() {
+                if let Ok(mut g) = load_slot.lock() {
+                    *g = Some(chosen.to_string_lossy().into_owned());
+                }
+            }
+
+            pending.store(false, Ordering::SeqCst);
+            ctx.request_repaint();
+        });
     }
 
     fn spawn_obj_file_browser(&self, ctx: egui::Context) {
@@ -3368,15 +5007,15 @@ impl LiquidApp {
 
         let title = match &snap.phase {
             UpdatePhase::UpdateAvailable(info) => {
-                format!("⬆ Update Available — {}", info.tag_name)
+                format!("Update Available — {}", info.tag_name)
             }
             UpdatePhase::Downloading { info, .. } => {
-                format!("⬇ Downloading Update {}...", info.tag_name)
+                format!("Downloading Update {}...", info.tag_name)
             }
             UpdatePhase::Installing(info) => {
-                format!("⚙ Installing {}...", info.tag_name)
+                format!("Installing {}...", info.tag_name)
             }
-            _ => "🔄 LiquidRust Software Update".to_string(),
+            _ => "LiquidRust Software Update".to_string(),
         };
 
         egui::Window::new(title)
@@ -3412,7 +5051,7 @@ impl LiquidApp {
                         ui.colored_label(
                             egui::Color32::from_rgb(74, 222, 128),
                             egui::RichText::new(format!(
-                                "✔ You are running the latest version (v{}).",
+                                "You are running the latest version (v{}).",
                                 CURRENT_VERSION
                             ))
                             .strong()
@@ -3429,11 +5068,11 @@ impl LiquidApp {
                         ui.separator();
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            if ui.button("🔄 Check Again").clicked() {
+                            if ui.button("Check Again").clicked() {
                                 self.updater.spawn_check(Some(ctx.clone()), true);
                             }
                             if ui
-                                .button("↻ Reinstall & Restart")
+                                .button("Reinstall & Restart")
                                 .on_hover_text(
                                     "Download the latest asset for this release tag and restart",
                                 )
@@ -3452,43 +5091,41 @@ impl LiquidApp {
                     UpdatePhase::UpdateAvailable(info) => {
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(format!("Installed: v{}", CURRENT_VERSION))
-                                    .monospace()
-                                    .color(egui::Color32::from_rgb(168, 184, 206)),
+                                egui::RichText::new(format!(
+                                    "v{}  ->  {}",
+                                    CURRENT_VERSION, info.tag_name
+                                ))
+                                .strong()
+                                .size(15.0)
+                                .color(egui::Color32::from_rgb(104, 214, 255)),
                             );
-                            ui.label("→");
-                            ui.label(
-                                egui::RichText::new(format!("Latest: {}", info.tag_name))
-                                    .monospace()
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(74, 222, 128)),
-                            );
+                            ui.weak(format!(
+                                "• {} ({})",
+                                info.asset_name,
+                                format_bytes(info.asset_size)
+                            ));
                         });
-                        ui.weak(format!(
-                            "{} • {} ({})",
-                            info.title,
-                            info.asset_name,
-                            format_bytes(info.asset_size)
-                        ));
-
-                        if !info.notes.is_empty() {
-                            ui.add_space(8.0);
-                            egui::Frame::group(ui.style())
-                                .fill(egui::Color32::from_rgb(10, 14, 22))
+                        if !info.notes.trim().is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Release Notes:").strong().size(12.0));
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_rgb(9, 13, 21))
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    egui::Color32::from_rgb(30, 41, 61),
+                                ))
+                                .corner_radius(egui::CornerRadius::same(6))
                                 .inner_margin(egui::Margin::same(8))
                                 .show(ui, |ui| {
                                     egui::ScrollArea::vertical()
-                                        .max_height(145.0)
+                                        .max_height(160.0)
                                         .show(ui, |ui| {
                                             ui.label(
-                                                egui::RichText::new(&info.notes)
-                                                    .size(12.0)
-                                                    .color(egui::Color32::from_rgb(206, 218, 235)),
+                                                egui::RichText::new(info.notes.trim()).size(12.0),
                                             );
                                         });
                                 });
                         }
-
                         ui.add_space(12.0);
                         ui.separator();
                         ui.add_space(6.0);
@@ -3496,14 +5133,17 @@ impl LiquidApp {
                             if ui.button("Later").clicked() {
                                 self.updater.close_modal();
                             }
+                            if !info.html_url.is_empty() && ui.button("View on GitHub").clicked() {
+                                ctx.open_url(egui::OpenUrl::new_tab(&info.html_url));
+                            }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let update_btn = egui::Button::new(
-                                    egui::RichText::new("⬆ Update & Restart")
+                                let install_btn = egui::Button::new(
+                                    egui::RichText::new("Update & Restart Now")
                                         .strong()
-                                        .color(egui::Color32::from_rgb(8, 24, 16)),
+                                        .color(egui::Color32::from_rgb(10, 24, 18)),
                                 )
                                 .fill(egui::Color32::from_rgb(74, 222, 128));
-                                if ui.add(update_btn).clicked() {
+                                if ui.add(install_btn).clicked() {
                                     self.updater
                                         .spawn_download_and_apply(info.clone(), Some(ctx.clone()));
                                 }
@@ -3515,54 +5155,41 @@ impl LiquidApp {
                         downloaded_bytes,
                         total_bytes,
                     } => {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Downloading {} ({})...",
-                                info.asset_name, info.tag_name
-                            ))
-                            .strong(),
-                        );
-                        ui.add_space(6.0);
                         let frac = if *total_bytes > 0 {
                             (*downloaded_bytes as f32 / *total_bytes as f32).clamp(0.0, 1.0)
                         } else {
                             0.0
                         };
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .show_percentage()
-                                .animate(true),
-                        );
-                        ui.add_space(4.0);
-                        ui.weak(format!(
-                            "{} / {} — LiquidRust will restart automatically when ready.",
+                        ui.label(format!("Downloading {}...", info.asset_name));
+                        ui.add_space(6.0);
+                        ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!(
+                            "{} / {}",
                             format_bytes(*downloaded_bytes),
                             format_bytes(*total_bytes)
-                        ));
+                        )));
+                        ctx.request_repaint();
                     }
                     UpdatePhase::Installing(info) => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Applying update {} & restarting...",
-                                    info.tag_name
-                                ))
-                                .strong(),
-                            );
+                            ui.label(format!(
+                                "Extracting {} and replacing binary in-place...",
+                                info.asset_name
+                            ));
                         });
+                        ctx.request_repaint();
+                    }
+                    UpdatePhase::ReadyToRestart { .. } => {
+                        ui.label("Restarting into updated LiquidRust...");
                     }
                     UpdatePhase::Error(err) => {
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 110, 110),
-                            egui::RichText::new("Update Error").strong(),
+                            egui::Color32::from_rgb(255, 115, 115),
+                            format!("Update error: {}", err),
                         );
-                        ui.label(err);
                         ui.add_space(10.0);
-                        ui.separator();
-                        ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            if ui.button("🔄 Retry").clicked() {
+                            if ui.button("Retry").clicked() {
                                 self.updater.spawn_check(Some(ctx.clone()), true);
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3572,7 +5199,6 @@ impl LiquidApp {
                             });
                         });
                     }
-                    UpdatePhase::ReadyToRestart { .. } => {}
                 }
             });
     }

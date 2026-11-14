@@ -1,6 +1,7 @@
 use crate::math::Aabb;
 use crate::render::{
-    Camera, CliRenderQuality, ColorMap, ColorMapType, ColorMode, SurfaceMesh, SurfaceMeshConfig,
+    Camera, CliRenderQuality, ColorMap, ColorMapType, ColorMode, EnvironmentPreset, SurfaceMesh,
+    SurfaceMeshConfig,
 };
 use crate::sph::collider::{Collider, ColliderShape};
 use crate::sph::particle::Particle;
@@ -197,6 +198,15 @@ pub struct SoftwareRenderer {
     pub enable_culling: bool,
     pub render_quality: CliRenderQuality,
     pub ssaa_factor: usize,
+    pub show_wireframe: bool,
+    pub show_grid: bool,
+    pub env_preset: EnvironmentPreset,
+    pub exposure: f32,
+    pub particle_foam: bool,
+    pub lit_spheres: bool,
+    pub light_dir: Vec3,
+    pub light_intensity: f32,
+    pub ambient_intensity: f32,
     render_width: usize,
     render_height: usize,
     render_rgb: Vec<u8>,
@@ -236,6 +246,15 @@ impl SoftwareRenderer {
             enable_culling: true,
             render_quality,
             ssaa_factor: ssaa,
+            show_wireframe: true,
+            show_grid: true,
+            env_preset: EnvironmentPreset::StudioDark,
+            exposure: 1.0,
+            particle_foam: true,
+            lit_spheres: true,
+            light_dir: Vec3::new(0.42, 0.82, 0.38).normalize(),
+            light_intensity: 1.25,
+            ambient_intensity: 0.32,
             render_width,
             render_height,
             render_rgb: if ssaa > 1 {
@@ -382,8 +401,37 @@ impl SoftwareRenderer {
         color_map: ColorMapType,
         rest_density: f32,
     ) {
-        self.clear_active_target();
+        let is_2d = bounds.size().z <= 0.15;
+        self.render_particles_studio(
+            particles,
+            particle_radius,
+            chamber,
+            bounds,
+            &[],
+            camera,
+            color_mode,
+            color_map,
+            rest_density,
+            is_2d,
+        );
+    }
 
+    /// Studio-grade SPH particle renderer with sky environment, perspective floor grid,
+    /// solid analytic/OBJ obstacle occlusion, world-anchored sun lighting, and whitewater aeration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_particles_studio(
+        &mut self,
+        particles: &[Particle],
+        particle_radius: f32,
+        chamber: &crate::sph::chamber::Chamber,
+        bounds: Aabb,
+        colliders: &[Collider],
+        camera: &Camera,
+        color_mode: ColorMode,
+        color_map: ColorMapType,
+        rest_density: f32,
+        is_2d: bool,
+    ) {
         let width = self.render_width;
         let height = self.render_height;
         if width == 0 || height == 0 {
@@ -392,23 +440,162 @@ impl SoftwareRenderer {
         let aspect = width as f32 / height as f32;
         let view = camera.view_matrix();
         let proj = camera.projection_matrix(aspect);
-        let view_proj = proj * view;
-
-        // 1. Draw Chamber Wireframe
-        self.draw_chamber_wireframe(chamber, &bounds, view_proj);
-
-        // 2. Parallel projection of visible particles
+        let eye_pos = camera.eye_position();
         let fov_y = camera.fov_y;
         let tan_half_fov = (fov_y * 0.5).tan();
         let w_f = width as f32;
         let h_f = height as f32;
         let w_i = width as i32;
         let h_i = height as i32;
+
+        let cam_fwd = {
+            let f = (camera.target - eye_pos).normalize_or_zero();
+            if f.length_squared() > 0.5 { f } else { Vec3::NEG_Z }
+        };
+        let cam_right = {
+            let r = cam_fwd.cross(Vec3::Y).normalize_or_zero();
+            if r.length_squared() > 0.5 { r } else { Vec3::X }
+        };
+        let cam_up = cam_right.cross(cam_fwd).normalize_or_zero();
+
+        let world_light_dir = if self.light_dir.length_squared() > 0.25 {
+            self.light_dir.normalize()
+        } else {
+            Vec3::new(0.42, 0.82, 0.38).normalize()
+        };
+        let exposure = self.exposure.max(0.05);
+        let light_int = self.light_intensity;
+        let amb_int = self.ambient_intensity;
+        let show_grid = self.show_grid;
+        let (bg_low, bg_high) = self.env_preset.bg_gradient_linear();
+        let floor_y = bounds.min.y - 0.002;
+        let floor_margin = (bounds.size().x.max(bounds.size().z) * 0.85 + 0.8).max(1.6);
+
+        // 1. Render Studio Sky, Perspective 3D Floor Grid, and Solid Analytic Obstacles
+        {
+            let target_rgb = if self.ssaa_factor > 1 {
+                &mut self.render_rgb
+            } else {
+                &mut self.rgb_buffer
+            };
+            target_rgb
+                .par_chunks_mut(width * 3)
+                .zip(self.depth_buffer.par_chunks_mut(width))
+                .enumerate()
+                .for_each(|(y, (rgb_row, depth_row))| {
+                    let ndc_y = 1.0 - 2.0 * ((y as f32 + 0.5) / h_f);
+                    let sy = ndc_y * tan_half_fov;
+
+                    for x in 0..width {
+                        let ndc_x = 2.0 * ((x as f32 + 0.5) / w_f) - 1.0;
+                        let sx = ndc_x * aspect * tan_half_fov;
+                        let ray_dir = (cam_fwd + cam_right * sx + cam_up * sy).normalize();
+
+                        let sky_t = (0.5 + 0.5 * ray_dir.y).clamp(0.0, 1.0);
+                        let mut col_lin = bg_low.lerp(bg_high, sky_t);
+                        let mut best_dist = f32::INFINITY;
+
+                        if !is_2d && show_grid && ray_dir.y < -1e-4 {
+                            let t_floor = (floor_y - eye_pos.y) / ray_dir.y;
+                            if t_floor > 0.05 {
+                                let hit = eye_pos + ray_dir * t_floor;
+                                if hit.x >= bounds.min.x - floor_margin
+                                    && hit.x <= bounds.max.x + floor_margin
+                                    && hit.z >= bounds.min.z - floor_margin
+                                    && hit.z <= bounds.max.z + floor_margin
+                                {
+                                    let dx = (bounds.min.x - hit.x)
+                                        .max(0.0)
+                                        .max(hit.x - bounds.max.x);
+                                    let dz = (bounds.min.z - hit.z)
+                                        .max(0.0)
+                                        .max(hit.z - bounds.max.z);
+                                    let edge_fade = (1.0
+                                        - (dx * dx + dz * dz).sqrt() / floor_margin)
+                                        .clamp(0.0, 1.0);
+                                    if edge_fade > 0.001 {
+                                        let cell_size = 0.25f32;
+                                        let gx = (hit.x / cell_size).floor() as i32;
+                                        let gz = (hit.z / cell_size).floor() as i32;
+                                        let checker = ((gx + gz) & 1) as f32;
+                                        let mut floor_albedo = Vec3::new(0.042, 0.050, 0.066)
+                                            + Vec3::splat(checker * 0.012);
+                                        let fx = ((hit.x / cell_size).fract() + 1.0).fract();
+                                        let fz = ((hit.z / cell_size).fract() + 1.0).fract();
+                                        let dist_minor = fx.min(1.0 - fx).min(fz.min(1.0 - fz));
+                                        let line_w = (0.012 + t_floor * 0.0025).min(0.08);
+                                        let minor_line = (1.0 - dist_minor / line_w).clamp(0.0, 1.0);
+                                        floor_albedo +=
+                                            Vec3::new(0.030, 0.052, 0.085) * minor_line * 0.65;
+                                        let ndotl = world_light_dir.y.max(0.0);
+                                        let floor_lit = floor_albedo
+                                            * (amb_int * 0.95 + ndotl * light_int * 0.72);
+                                        col_lin = col_lin.lerp(floor_lit, edge_fade);
+                                        best_dist = (t_floor * ray_dir.dot(cam_fwd)).max(0.05);
+                                    }
+                                }
+                            }
+                        }
+
+                        for col in colliders {
+                            if !col.enabled {
+                                continue;
+                            }
+                            if let Some((t_hit, hit_n)) =
+                                ray_intersect_analytic_collider(&col.shape, eye_pos, ray_dir)
+                            {
+                                let z_cam = t_hit * ray_dir.dot(cam_fwd);
+                                if z_cam > 0.05 && z_cam < best_dist {
+                                    best_dist = z_cam;
+                                    col_lin = shade_solid_obstacle(
+                                        hit_n,
+                                        -ray_dir,
+                                        world_light_dir,
+                                        light_int,
+                                        amb_int,
+                                    );
+                                }
+                            }
+                        }
+
+                        depth_row[x] = best_dist;
+                        let srgb = tonemap_to_srgb(col_lin * exposure);
+                        let idx = x * 3;
+                        rgb_row[idx] = srgb[0];
+                        rgb_row[idx + 1] = srgb[1];
+                        rgb_row[idx + 2] = srgb[2];
+                    }
+                });
+        }
+
+        // Rasterize any custom TriangleMesh colliders into depth + color buffers
+        for col in colliders {
+            if !col.enabled {
+                continue;
+            }
+            if let ColliderShape::Mesh(ref tri_mesh) = col.shape {
+                self.rasterize_solid_triangle_mesh(
+                    tri_mesh,
+                    view,
+                    proj,
+                    eye_pos,
+                    world_light_dir,
+                    light_int * exposure,
+                    amb_int * exposure,
+                );
+            }
+        }
+
+        // 2. Parallel projection of visible particles
         let enable_culling = self.enable_culling;
+        let particle_foam = self.particle_foam;
 
         let projected_particles: Vec<ProjectedParticle> = particles
             .par_iter()
             .filter_map(|p| {
+                if !p.position.is_finite() {
+                    return None;
+                }
                 let p_world = Vec4::new(p.position.x, p.position.y, p.position.z, 1.0);
                 let p_cam = view * p_world;
 
@@ -444,8 +631,14 @@ impl SoftwareRenderer {
                     return None;
                 }
 
-                let base_rgb =
-                    Self::calc_particle_color(p, color_mode, color_map, rest_density, &bounds);
+                let base_rgb = ColorMap::particle_color(
+                    p,
+                    color_mode,
+                    color_map,
+                    rest_density,
+                    &bounds,
+                    particle_foam,
+                );
 
                 Some(ProjectedParticle {
                     px,
@@ -474,8 +667,17 @@ impl SoftwareRenderer {
             }
         }
 
-        let light_dir = Vec3::new(0.42, 0.82, 0.38).normalize();
+        // Transform world sun direction into eye space so camera orbit preserves world lighting!
+        let eye_ld = (Mat3::from_mat4(view) * world_light_dir).normalize_or_zero();
+        let light_dir = if eye_ld.length_squared() > 0.25 {
+            eye_ld
+        } else {
+            Vec3::new(0.42, 0.82, 0.38).normalize()
+        };
         let half_dir = (light_dir + Vec3::new(0.0, 0.0, 1.0)).normalize();
+        let lit_spheres = self.lit_spheres;
+        let (sky_hor, _, _) = self.env_preset.sky_reflection_linear();
+        let rim_srgb = sky_hor.clamp(Vec3::ZERO, Vec3::ONE).powf(1.0 / 2.2) * 255.0;
 
         let target_rgb = if self.ssaa_factor > 1 {
             &mut self.render_rgb
@@ -527,19 +729,42 @@ impl SoftwareRenderer {
                                 if depth < depth_band[pixel_idx] {
                                     depth_band[pixel_idx] = depth;
 
-                                    let normal = Vec3::new(dx, -dy, z_norm);
-                                    let diff = normal.dot(light_dir).max(0.0);
-                                    let hemi = 0.5 + 0.5 * normal.y;
-                                    let spec = normal.dot(half_dir).max(0.0).powi(36);
-                                    let fresnel = 0.025 + 0.975 * (1.0 - z_norm).powi(4);
+                                    let (lit_r, lit_g, lit_b) = if lit_spheres {
+                                        let normal = Vec3::new(dx, -dy, z_norm);
+                                        let diff = normal.dot(light_dir).max(0.0);
+                                        let hemi = 0.5 + 0.5 * normal.y;
+                                        let spec =
+                                            normal.dot(half_dir).max(0.0).powi(36) * light_int * 0.85;
+                                        let fresnel = 0.025 + 0.975 * (1.0 - z_norm).powi(4);
 
-                                    let shade = 0.28 + 0.16 * hemi + 0.62 * diff;
-                                    let lit_r = (base_r * shade + 145.0 * spec + fresnel * 95.0)
-                                        .clamp(0.0, 255.0) as u8;
-                                    let lit_g = (base_g * shade + 150.0 * spec + fresnel * 135.0)
-                                        .clamp(0.0, 255.0) as u8;
-                                    let lit_b = (base_b * shade + 160.0 * spec + fresnel * 175.0)
-                                        .clamp(0.0, 255.0) as u8;
+                                        let shade =
+                                            amb_int * (0.70 + 0.45 * hemi) + 0.52 * light_int * diff;
+                                        let r = ((base_r * shade
+                                            + 150.0 * spec
+                                            + fresnel * rim_srgb.x * 0.65)
+                                            * exposure)
+                                            .clamp(0.0, 255.0)
+                                            as u8;
+                                        let g = ((base_g * shade
+                                            + 156.0 * spec
+                                            + fresnel * rim_srgb.y * 0.65)
+                                            * exposure)
+                                            .clamp(0.0, 255.0)
+                                            as u8;
+                                        let b = ((base_b * shade
+                                            + 165.0 * spec
+                                            + fresnel * rim_srgb.z * 0.65)
+                                            * exposure)
+                                            .clamp(0.0, 255.0)
+                                            as u8;
+                                        (r, g, b)
+                                    } else {
+                                        (
+                                            (base_r * exposure).clamp(0.0, 255.0) as u8,
+                                            (base_g * exposure).clamp(0.0, 255.0) as u8,
+                                            (base_b * exposure).clamp(0.0, 255.0) as u8,
+                                        )
+                                    };
 
                                     let rgb_idx = pixel_idx * 3;
                                     rgb_band[rgb_idx] = lit_r;
@@ -551,6 +776,11 @@ impl SoftwareRenderer {
                     }
                 }
             });
+
+        // 4. Draw depth-aware Chamber Wireframe
+        if self.show_wireframe {
+            self.draw_chamber_wireframe_depth(chamber, &bounds, view, proj, [78, 136, 205]);
+        }
 
         self.resolve_ssaa_to_output();
     }
@@ -625,6 +855,9 @@ impl SoftwareRenderer {
         // 1. Render Studio Sky, 3D Perspective Floor Grid (+ Soft Fluid Shadows/Caustics), and Analytic Obstacles
         let w_f = width as f32;
         let h_f = height as f32;
+        let (bg_low, bg_high) = cfg.env_preset.bg_gradient_linear();
+        let exposure = cfg.exposure.max(0.05);
+        let floor_margin = (bounds.size().x.max(bounds.size().z) * 0.85 + 0.8).max(1.6);
         {
             let target_rgb = if self.ssaa_factor > 1 {
                 &mut self.render_rgb
@@ -646,16 +879,15 @@ impl SoftwareRenderer {
 
                     // Studio gradient background (linear space)
                     let sky_t = (0.5 + 0.5 * ray_dir.y).clamp(0.0, 1.0);
-                    let mut col_lin = Vec3::new(0.012, 0.016, 0.026)
-                        .lerp(Vec3::new(0.036, 0.052, 0.082), sky_t);
+                    let mut col_lin = bg_low.lerp(bg_high, sky_t);
                     let mut best_dist = f32::INFINITY;
 
                     // Studio floor plane in 3D mode
-                    if !is_2d && ray_dir.y < -1e-4 {
+                    if !is_2d && cfg.show_grid && ray_dir.y < -1e-4 {
                         let t_floor = (floor_y - eye_pos.y) / ray_dir.y;
                         if t_floor > 0.05 {
                             let hit = eye_pos + ray_dir * t_floor;
-                            let margin = 1.6;
+                            let margin = floor_margin;
                             if hit.x >= bounds.min.x - margin
                                 && hit.x <= bounds.max.x + margin
                                 && hit.z >= bounds.min.z - margin
@@ -755,7 +987,7 @@ impl SoftwareRenderer {
                     }
 
                     depth_row[x] = best_dist;
-                    let srgb = tonemap_to_srgb(col_lin);
+                    let srgb = tonemap_to_srgb(col_lin * exposure);
                     let idx = x * 3;
                     rgb_row[idx] = srgb[0];
                     rgb_row[idx + 1] = srgb[1];
@@ -1160,8 +1392,12 @@ impl SoftwareRenderer {
 
                                 // Studio Environment Reflection (blurred by roughness)
                                 let refl_dir = (-v_dir) - n * (2.0 * (-v_dir).dot(n));
-                                let env_col = sample_studio_sky(refl_dir, light_dir, rough)
-                                    * cfg.env_reflection;
+                                let env_col = sample_studio_sky(
+                                    refl_dir,
+                                    light_dir,
+                                    rough,
+                                    cfg.env_preset,
+                                ) * cfg.env_reflection;
 
                                 // GGX Direct Sun Specular
                                 let h_vec = (v_dir + light_dir).normalize_or_zero();
@@ -1211,7 +1447,7 @@ impl SoftwareRenderer {
                                 }
 
                                 solid_depth_band[pix] = front_z;
-                                let out_srgb = tonemap_to_srgb(final_lin);
+                                let out_srgb = tonemap_to_srgb(final_lin * exposure);
                                 let rgb_idx = pix * 3;
                                 rgb_band[rgb_idx] = out_srgb[0];
                                 rgb_band[rgb_idx + 1] = out_srgb[1];
@@ -1223,7 +1459,9 @@ impl SoftwareRenderer {
         }
 
         // 3. Draw subtle depth-aware Chamber Wireframe on top
-        self.draw_chamber_wireframe_depth(chamber, &bounds, view, proj, [78, 136, 205]);
+        if cfg.show_wireframe {
+            self.draw_chamber_wireframe_depth(chamber, &bounds, view, proj, [78, 136, 205]);
+        }
         self.resolve_ssaa_to_output();
     }
 
@@ -1325,41 +1563,6 @@ impl SoftwareRenderer {
                     }
                 }
             }
-        }
-    }
-
-    fn calc_particle_color(
-        p: &Particle,
-        color_mode: ColorMode,
-        color_map: ColorMapType,
-        rest_density: f32,
-        bounds: &Aabb,
-    ) -> [u8; 3] {
-        let t = match color_mode {
-            ColorMode::Velocity => (p.speed() / 2.4).clamp(0.0, 1.0),
-            ColorMode::Pressure => (p.pressure / (rest_density * 0.4)).clamp(0.0, 1.0),
-            ColorMode::Density => {
-                let dev = (p.density - rest_density).abs() / rest_density;
-                (dev * 4.0).clamp(0.0, 1.0)
-            }
-            ColorMode::Height => {
-                ((p.position.y - bounds.min.y) / (bounds.max.y - bounds.min.y)).clamp(0.0, 1.0)
-            }
-            ColorMode::KineticEnergy => (p.kinetic_energy() / 4.0).clamp(0.0, 1.0),
-            ColorMode::SingleColor => return [30, 140, 225],
-        };
-        ColorMap::sample(color_map, t)
-    }
-
-    fn draw_chamber_wireframe(
-        &mut self,
-        chamber: &crate::sph::chamber::Chamber,
-        bounds: &Aabb,
-        view_proj: Mat4,
-    ) {
-        let color = [80, 140, 210];
-        for (p0, p1) in chamber.generate_wireframe_lines(bounds) {
-            self.draw_3d_line(p0, p1, view_proj, color);
         }
     }
 
@@ -1475,84 +1678,6 @@ impl SoftwareRenderer {
             }
         }
     }
-
-    fn draw_3d_line(&mut self, p0: Vec3, p1: Vec3, view_proj: Mat4, color: [u8; 3]) {
-        let c0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
-        let c1 = view_proj * Vec4::new(p1.x, p1.y, p1.z, 1.0);
-
-        if c0.w <= 0.0 || c1.w <= 0.0 {
-            return;
-        }
-
-        let rw = self.render_width;
-        let rh = self.render_height;
-        let w = rw as f32;
-        let h = rh as f32;
-
-        let x0 = ((c0.x / c0.w) * 0.5 + 0.5) * w;
-        let y0 = (1.0 - ((c0.y / c0.w) * 0.5 + 0.5)) * h;
-        let x1 = ((c1.x / c1.w) * 0.5 + 0.5) * w;
-        let y1 = (1.0 - ((c1.y / c1.w) * 0.5 + 0.5)) * h;
-
-        let target_rgb = if self.ssaa_factor > 1 {
-            &mut self.render_rgb
-        } else {
-            &mut self.rgb_buffer
-        };
-        Self::draw_bresenham_line_in(
-            target_rgb,
-            rw,
-            rh,
-            x0 as i32,
-            y0 as i32,
-            x1 as i32,
-            y1 as i32,
-            color,
-        );
-    }
-
-    fn draw_bresenham_line_in(
-        target_rgb: &mut [u8],
-        rw: usize,
-        rh: usize,
-        mut x0: i32,
-        mut y0: i32,
-        x1: i32,
-        y1: i32,
-        color: [u8; 3],
-    ) {
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-
-        let w = rw as i32;
-        let h = rh as i32;
-
-        loop {
-            if x0 >= 0 && x0 < w && y0 >= 0 && y0 < h {
-                let idx = (y0 as usize * rw + x0 as usize) * 3;
-                target_rgb[idx] = color[0];
-                target_rgb[idx + 1] = color[1];
-                target_rgb[idx + 2] = color[2];
-            }
-
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
-            }
-        }
-    }
 }
 
 #[inline]
@@ -1603,14 +1728,17 @@ fn tonemap_to_srgb(col: Vec3) -> [u8; 3] {
 }
 
 #[inline]
-fn sample_studio_sky(refl_dir: Vec3, light_dir: Vec3, roughness: f32) -> Vec3 {
+fn sample_studio_sky(
+    refl_dir: Vec3,
+    light_dir: Vec3,
+    roughness: f32,
+    env_preset: EnvironmentPreset,
+) -> Vec3 {
     let r = refl_dir.normalize_or_zero();
     let up = r.y.clamp(-1.0, 1.0);
 
-    // Horizon-to-zenith studio sky + dark floor bounce
-    let horizon = Vec3::new(0.24, 0.36, 0.52);
-    let zenith = Vec3::new(0.08, 0.16, 0.30);
-    let ground = Vec3::new(0.025, 0.032, 0.045);
+    // Horizon-to-zenith studio sky + floor bounce from EnvironmentPreset
+    let (horizon, zenith, ground) = env_preset.sky_reflection_linear();
 
     let mut sky = if up >= 0.0 {
         horizon.lerp(zenith, up.powf(0.65))

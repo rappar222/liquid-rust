@@ -1,16 +1,20 @@
 use clap::Parser;
 use eframe::egui;
 use glam::Vec3;
-use liquid_rust::export::{Mp4Encoder, PlyExporter, SoftwareRenderer};
+use liquid_rust::export::{Mp4Encoder, PlyExporter, PngExporter, SoftwareRenderer};
 use liquid_rust::gpu::GpuSphSolver;
 use liquid_rust::render::{
-    Camera, CliRenderQuality, ColorMapType, ColorMode, FluidMaterialPreset, MeshTextureMode,
-    RenderMode, SurfaceMesh, SurfaceMeshConfig,
+    Camera, CliRenderQuality, ColorMap, ColorMapType, ColorMode, EnvironmentPreset,
+    FluidMaterialPreset, MeshTextureMode, RenderMode, SurfaceMesh, SurfaceMeshConfig,
+};
+use liquid_rust::scene_io::{
+    CameraDto, ChamberDto, ColliderDto, DrainDto, FaucetDto, SceneConfigFile, SolverConfigDto,
+    SurfaceMeshDto, VisualsDto,
 };
 use liquid_rust::sph::{
     compute_lattice_rest_density, compute_lattice_rest_density_2d, Chamber, ChamberShape,
-    Collider, ColliderShape, CubeFace, Drain, Faucet, SceneGenerator, ScenePreset,
-    SimulationQuality, SolverConfig, SphSolver,
+    Collider, ColliderShape, CubeFace, Drain, Faucet, FluidPhysicsPreset, SceneGenerator,
+    ScenePreset, SimulationQuality, SolverConfig, SphSolver,
 };
 use liquid_rust::LiquidApp;
 use std::path::PathBuf;
@@ -23,288 +27,393 @@ use std::time::Instant;
     name = "liquid-rust",
     author = "Radu <rappar222>",
     version,
-    about = "Studio-grade 2D/3D SPH Fluid Simulator in Rust with Surface Meshing, PBR Optics, Real-Time Viewport & MP4/OBJ/PLY Export"
+    about = "Studio-grade 2D/3D SPH Fluid Simulator in Rust with Surface Meshing, PBR Optics, Real-Time Viewport & MP4/PNG/OBJ/PLY Export"
 )]
 struct Args {
-    /// Run in headless mode without opening GUI window
-    #[arg(long)]
-    headless: bool,
+    // ======================== SCENE & CONTAINER ========================
+    /// Load a portable LiquidRust studio scene (.json); explicit CLI flags override loaded fields
+    #[arg(long, help_heading = "Scene & Container")]
+    scene: Option<PathBuf>,
 
-    /// Run CLI headless rendering in 2D mode (GUI uses the built-in 3D / 2D switch button)
-    #[arg(long = "2d", alias = "two-d")]
-    mode_2d: bool,
+    /// Save the configured studio scene (preset, physics, chamber, objects, visuals) to a .json file
+    #[arg(long, help_heading = "Scene & Container")]
+    save_scene: Option<PathBuf>,
 
     /// Scene preset: dam-break, double-dam, splash, obstacle, tornado, zero-g, empty
-    #[arg(long)]
+    #[arg(long, help_heading = "Scene & Container")]
     preset: Option<String>,
 
-    /// Particle quality / resolution: draft, medium, high, ultra, cinematic, extreme (interactive + CLI), or offline CLI-only tiers: studio (~2.5M), film (~4.9M), master (~8.2M)
-    #[arg(long, short = 'q', default_value = "medium")]
-    quality: String,
+    /// Run simulation in 2D planar mode (GUI also has a live 3D / 2D toggle button)
+    #[arg(long = "2d", alias = "two-d", help_heading = "Scene & Container")]
+    mode_2d: bool,
 
-    /// Custom particle radius override (smaller = higher quality & finer fluid)
-    #[arg(long)]
-    particle_radius: Option<f32>,
+    /// Bounding box / chamber type: box (cuboid), sphere (globe), bathtub (tub) [default: box]
+    #[arg(
+        long,
+        visible_aliases = ["chamber-type", "box-type", "bounds-type", "bounding-box-type"],
+        help_heading = "Scene & Container"
+    )]
+    chamber_shape: Option<String>,
 
-    /// Custom particle spacing override (smaller = denser fluid lattice)
-    #[arg(long)]
-    spacing: Option<f32>,
-
-    /// Target number of particles to spawn (automatically calculates optimal spacing and radius)
-    #[arg(long, alias = "particle-count")]
-    particles: Option<usize>,
-
-    /// Total simulation duration in seconds (e.g. --time 4.0 for a 4-second video). Overrides --frames.
-    #[arg(long, short = 't', alias = "duration")]
-    time: Option<f32>,
-
-    /// Number of simulation frames to run (used if --time is not specified)
-    #[arg(long, default_value_t = 120)]
-    frames: usize,
-
-    /// Framerate (FPS) for video export and simulation stepping
-    #[arg(long, default_value_t = 60)]
-    fps: u32,
-
-    /// Simulation speed multiplier (e.g. 0.5 for 2x slow-mo, 0.25 for 4x slow-mo ASMR, 1.0 realtime)
-    #[arg(long, alias = "sim-speed", default_value_t = 1.0)]
-    speed: f32,
-
-    /// Custom time step dt per frame in seconds (defaults to 1.0 / fps * speed)
-    #[arg(long)]
-    dt: Option<f32>,
-
-    // === Selectable Fluid Render Mode & Surface Meshing ===
-    /// Fluid rendering representation: 'particles' (SPH spheres) or 'mesh' (3D Marching Cubes surface mesh)
-    #[arg(long, default_value = "particles")]
-    render_mode: String,
-
-    /// Enable continuous 3D surface meshing for renders & viewport (shortcut for --render-mode mesh)
-    #[arg(long, alias = "mesh")]
-    surface_mesh: bool,
-
-    /// Surface mesh material preset: water, ocean, lagoon, amber, wine, emerald, milk, chrome, custom
-    #[arg(long, default_value = "water")]
-    mesh_material: String,
-
-    /// Shallow / thin-film surface liquid color as hex '#RRGGBB' or 'R,G,B' (0..1 or 0..255)
-    #[arg(long)]
-    mesh_color: Option<String>,
-
-    /// Deep volume Beer-Lambert absorption color as hex '#RRGGBB' or 'R,G,B'
-    #[arg(long)]
-    mesh_deep_color: Option<String>,
-
-    /// Base liquid surface opacity [0.05..1.0]
-    #[arg(long)]
-    mesh_opacity: Option<f32>,
-
-    /// Beer-Lambert optical volume absorption density [0.0..8.0]
-    #[arg(long)]
-    mesh_absorption: Option<f32>,
-
-    /// Aerated whitewater wave-crest foam intensity [0.0..1.0]
-    #[arg(long)]
-    mesh_foam: Option<f32>,
-
-    /// Procedural triplanar surface texture: none, ripples, caustics, foam, grid
-    #[arg(long, default_value = "ripples")]
-    mesh_texture: String,
-
-    /// Spatial frequency scale for procedural surface texture (default: 6.0)
-    #[arg(long)]
-    mesh_texture_scale: Option<f32>,
-
-    /// Bump & pattern strength for procedural surface texture [0.0..1.0] (default: 0.28)
-    #[arg(long)]
-    mesh_texture_strength: Option<f32>,
-
-    /// Optical Index of Refraction (IOR) for Schlick Fresnel (e.g. 1.333 water, 1.52 glass, 2.40 chrome)
-    #[arg(long)]
-    mesh_ior: Option<f32>,
-
-    /// GGX microfacet surface roughness [0.015..1.0] (smaller = mirror-sharp highlights)
-    #[arg(long)]
-    mesh_roughness: Option<f32>,
-
-    /// Direct sun specular highlight intensity multiplier
-    #[arg(long)]
-    mesh_specular: Option<f32>,
-
-    /// Screen-space refraction background distortion strength [0.0..1.5]
-    #[arg(long)]
-    mesh_refraction: Option<f32>,
-
-    /// Subsurface wave-crest back-scatter glow intensity [0.0..2.0]
-    #[arg(long)]
-    mesh_sss: Option<f32>,
-
-    /// Studio sky & horizon Fresnel reflection intensity [0.0..2.5]
-    #[arg(long)]
-    mesh_reflection: Option<f32>,
-
-    /// Metallic reflectance factor [0.0..1.0]
-    #[arg(long)]
-    mesh_metallic: Option<f32>,
-
-    /// Marching Cubes voxel size multiplier relative to particle radius (smaller = finer mesh, default: 0.72)
-    #[arg(long)]
-    mesh_scale: Option<f32>,
-
-    /// Isosurface density threshold [0.15..0.80] (default: 0.42)
-    #[arg(long)]
-    mesh_iso: Option<f32>,
-
-    /// Volume-preserving Taubin mesh smoothing iterations (default: 3)
-    #[arg(long)]
-    mesh_smooth: Option<usize>,
-
-    /// Directional key sun vector 'x,y,z' (e.g. '0.42,0.82,0.38')
-    #[arg(long, allow_hyphen_values = true)]
-    light_dir: Option<String>,
-
-    /// Key directional sun radiance multiplier (default: 1.25)
-    #[arg(long)]
-    light_intensity: Option<f32>,
-
-    /// Hemisphere ambient light fill intensity (default: 0.32)
-    #[arg(long)]
-    ambient: Option<f32>,
-
-    /// Disable colored liquid floor shadows & underwater caustics in surface-mesh renders
-    #[arg(long)]
-    no_shadows: bool,
-
-    // === Physics & Particle Shading Overrides ===
-    /// Vorticity confinement swirl strength (default: 0.045)
-    #[arg(long)]
-    vorticity: Option<f32>,
-
-    /// Akinci free-surface cohesion / surface tension strength (default: 0.025)
-    #[arg(long)]
-    surface_tension: Option<f32>,
-
-    /// XSPH artificial viscosity damping (default: 0.025)
-    #[arg(long)]
-    viscosity: Option<f32>,
-
-    /// Particle color mode (for --render-mode particles): velocity, pressure, density, height, energy, single
-    #[arg(long, default_value = "velocity")]
-    color_mode: String,
-
-    /// Particle colormap gradient (for --render-mode particles): ocean, turbo, viridis, fire
-    #[arg(long, default_value = "ocean")]
-    color_map: String,
-
-    // === Camera Framing Overrides ===
-    /// Camera horizontal orbit azimuth angle in degrees
-    #[arg(long, allow_hyphen_values = true)]
-    camera_azimuth: Option<f32>,
-
-    /// Camera vertical orbit elevation angle in degrees
-    #[arg(long, allow_hyphen_values = true)]
-    camera_elevation: Option<f32>,
-
-    /// Camera orbit distance from target in meters
-    #[arg(long)]
-    camera_distance: Option<f32>,
-
-    /// Camera look-at target 'x,y,z'
-    #[arg(long, allow_hyphen_values = true)]
-    camera_target: Option<String>,
-
-    // === Scene Objects ===
-    /// Add custom obstacle: 'sphere:x,y,z:r', 'box:x,y,z:w,h,d', 'cylinder:x,y,z:r:h', or 'obj:path:x,y,z:scale'
-    #[arg(long = "obstacle", action = clap::ArgAction::Append)]
-    obstacles: Vec<String>,
-
-    /// Add custom faucet: 'waterfall:x,y,z:width[:rate[:depth]]', 'shower:x,y,z:radius[:rate[:spread]]', 'circle:x,y,z:radius[:rate[:vx,vy,vz[:spread]]]', 'tap:x,y,z[:radius[:rate[:vx,vy,vz]]]', 'stream:x,y,z:vx,vy,vz[:rate[:spread[:radius]]]'
-    #[arg(long = "faucet", action = clap::ArgAction::Append)]
-    faucets: Vec<String>,
-
-    /// Add custom drain: 'floor:radius' or 'floor:x,z:radius', '<face>:radius' (floor|ceiling|left|right|back|front), or 'custom:x,y,z:radius'
-    #[arg(long = "drain", action = clap::ArgAction::Append)]
-    drains: Vec<String>,
-
-    /// Bounding box / chamber type: box (cuboid), sphere (globe), bathtub (tub)
-    #[arg(long, default_value = "box", visible_aliases = ["chamber-type", "box-type", "bounds-type", "bounding-box-type"])]
-    chamber_shape: String,
-
-    /// Bounding box / chamber scale factor: uniform (e.g. 1.5), 2D (e.g. 1.5,1.2), or 3D (e.g. 1.5,1.2,1.0)
-    #[arg(long, visible_aliases = ["box-scale", "bounds-scale", "bounding-box-scale"])]
+    /// Bounding box / chamber scale factor: uniform (1.5), 2D (1.5,1.2), or 3D (1.5,1.2,1.0)
+    #[arg(
+        long,
+        visible_aliases = ["box-scale", "bounds-scale", "bounding-box-scale"],
+        help_heading = "Scene & Container"
+    )]
     chamber_scale: Option<String>,
 
     /// Bounding box / chamber dimensions in meters: D, W,H (2D), or W,H,D (e.g. 2.0,1.5,1.0 or 2.0x1.5x1.0)
-    #[arg(long, visible_aliases = ["box-size", "bounds-size", "bounding-box-size"])]
+    #[arg(
+        long,
+        visible_aliases = ["box-size", "bounds-size", "bounding-box-size"],
+        help_heading = "Scene & Container"
+    )]
     chamber_size: Option<String>,
 
     /// Bathtub backrest slope ratio (relative to length, 0.05..0.5; default 0.28)
-    #[arg(long)]
+    #[arg(long, help_heading = "Scene & Container")]
     tub_slope: Option<f32>,
 
     /// Bathtub bottom fillet radius ratio (relative to width, 0.01..0.45; default 0.16)
-    #[arg(long)]
+    #[arg(long, help_heading = "Scene & Container")]
     tub_fillet: Option<f32>,
 
-    // === Outputs & Compute ===
+    /// Oscillating hydraulic wave-maker paddle amplitude in meters along the left wall (0.0 = off)
+    #[arg(long, alias = "wave-amplitude", help_heading = "Scene & Container")]
+    wave_amp: Option<f32>,
+
+    /// Wave-maker oscillation frequency in Hz [default: 0.85]
+    #[arg(long, alias = "wave-frequency", help_heading = "Scene & Container")]
+    wave_freq: Option<f32>,
+
+    /// Add obstacle: 'sphere:x,y,z:r[:bounce[:slip]]', 'box:x,y,z:w,h,d', 'cylinder:x,y,z:r:h', or 'obj:path:x,y,z:scale[:rx,ry,rz]'
+    #[arg(long = "obstacle", action = clap::ArgAction::Append, help_heading = "Scene & Container")]
+    obstacles: Vec<String>,
+
+    /// Add faucet: 'waterfall:x,y,z:width[:rate[:depth]]', 'shower:x,y,z:radius[:rate[:spread]]', 'circle:x,y,z:radius[:rate[:vx,vy,vz[:spread]]]', 'tap:x,y,z[:radius[:rate[:vx,vy,vz]]]', 'stream:x,y,z:vx,vy,vz[:rate[:spread[:radius]]]'
+    #[arg(long = "faucet", action = clap::ArgAction::Append, help_heading = "Scene & Container")]
+    faucets: Vec<String>,
+
+    /// Add drain: 'floor:radius' or 'floor:x,z:radius', '<face>:radius' (floor|ceiling|left|right|back|front), or 'custom:x,y,z:radius'
+    #[arg(long = "drain", action = clap::ArgAction::Append, help_heading = "Scene & Container")]
+    drains: Vec<String>,
+
+    // ======================== RESOLUTION & TIMELINE ========================
+    /// Particle quality tier: draft, medium [default], high, ultra, cinematic, extreme, or CLI-only: studio (~2.5M), film (~4.9M), master (~8.2M)
+    #[arg(long, short = 'q', help_heading = "Resolution & Timeline")]
+    quality: Option<String>,
+
+    /// Custom particle radius override in meters (smaller = finer fluid)
+    #[arg(long, help_heading = "Resolution & Timeline")]
+    particle_radius: Option<f32>,
+
+    /// Custom initial particle lattice spacing override in meters
+    #[arg(long, help_heading = "Resolution & Timeline")]
+    spacing: Option<f32>,
+
+    /// Target number of particles to spawn (automatically computes optimal spacing & radius)
+    #[arg(long, alias = "particle-count", help_heading = "Resolution & Timeline")]
+    particles: Option<usize>,
+
+    /// Total simulation duration in seconds (e.g. --time 4.0). Overrides --frames
+    #[arg(long, short = 't', alias = "duration", help_heading = "Resolution & Timeline")]
+    time: Option<f32>,
+
+    /// Number of simulation frames to run when --time is not specified [default: 120]
+    #[arg(long, help_heading = "Resolution & Timeline")]
+    frames: Option<usize>,
+
+    /// Framerate (FPS) for video export and simulation stepping
+    #[arg(long, default_value_t = 60, help_heading = "Resolution & Timeline")]
+    fps: u32,
+
+    /// Simulation time-scale speed multiplier (e.g. 0.25 for 4x slow-mo, 1.0 realtime)
+    #[arg(long, alias = "sim-speed", help_heading = "Resolution & Timeline")]
+    speed: Option<f32>,
+
+    /// Custom base timestep dt per frame in seconds (defaults to 1.0 / fps * speed)
+    #[arg(long, help_heading = "Resolution & Timeline")]
+    dt: Option<f32>,
+
+    // ======================== FLUID PHYSICS & SOLVER ========================
+    /// Physical substance preset: water, ocean, oil, honey, glycerin, mercury, lava, zero-g
+    #[arg(long, alias = "substance", help_heading = "Fluid Physics & Solver")]
+    fluid_preset: Option<String>,
+
+    /// Gravity acceleration in m/s² as vertical scalar (e.g. -9.81 or 0) or 3D vector 'gx,gy,gz'
+    #[arg(long, allow_hyphen_values = true, help_heading = "Fluid Physics & Solver")]
+    gravity: Option<String>,
+
+    /// XSPH shear viscosity coefficient [0.0..1.0]
+    #[arg(long, help_heading = "Fluid Physics & Solver")]
+    viscosity: Option<f32>,
+
+    /// Akinci free-surface cohesion / surface tension strength [0.0..0.5]
+    #[arg(long, help_heading = "Fluid Physics & Solver")]
+    surface_tension: Option<f32>,
+
+    /// Macklin & Müller vorticity confinement swirl strength [0.0..0.5]
+    #[arg(long, help_heading = "Fluid Physics & Solver")]
+    vorticity: Option<f32>,
+
+    /// Aerodynamic drag on sparse airborne splash droplets [0.0..5.0; default: 0.35]
+    #[arg(long, help_heading = "Fluid Physics & Solver")]
+    air_drag: Option<f32>,
+
+    /// Boundary wall collision restitution / bounce [0.0..1.0; default: 0.0]
+    #[arg(long, help_heading = "Fluid Physics & Solver")]
+    restitution: Option<f32>,
+
+    /// Boundary wall slip factor [0.0..1.0; 1.0 = free slip, lower = higher drag]
+    #[arg(long, visible_alias = "boundary-friction", help_heading = "Fluid Physics & Solver")]
+    friction: Option<f32>,
+
+    /// Number of PBF physics substeps per frame [1..32]
+    #[arg(long, help_heading = "Fluid Physics & Solver")]
+    substeps: Option<usize>,
+
+    /// Number of PBF pressure-projection solver iterations per substep [1..32]
+    #[arg(long, visible_alias = "solver-iterations", help_heading = "Fluid Physics & Solver")]
+    iterations: Option<usize>,
+
+    /// Monaghan tensile anti-clumping correction factor [0.0..0.05]
+    #[arg(long, help_heading = "Fluid Physics & Solver")]
+    tensile_k: Option<f32>,
+
+    /// Safety maximum particle speed clamp in m/s [default: 15.0]
+    #[arg(long, help_heading = "Fluid Physics & Solver")]
+    max_velocity: Option<f32>,
+
+    // ======================== VISUALS, ENVIRONMENT & CAMERA ========================
+    /// Fluid rendering representation: 'particles' (SPH spheres) or 'mesh' (3D Marching Cubes surface mesh) [default: particles]
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    render_mode: Option<String>,
+
+    /// Enable continuous 3D surface meshing for renders & viewport (shortcut for --render-mode mesh)
+    #[arg(long, alias = "mesh", help_heading = "Visuals, Environment & Camera")]
+    surface_mesh: bool,
+
+    /// Particle color field: velocity [default], foam, vorticity, pressure, density, height, energy, single
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    color_mode: Option<String>,
+
+    /// Particle colormap gradient: ocean [default], turbo, viridis, plasma, inferno, fire, ice
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    color_map: Option<String>,
+
+    /// Visual sphere radius multiplier for particle mode [default: 1.25]
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    particle_scale: Option<f32>,
+
+    /// Disable dynamic aerated whitewater crest highlights in particle sphere mode
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    no_particle_foam: bool,
+
+    /// Render flat unlit discs instead of 3D Fresnel-lit spheres in particle mode
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    unlit_spheres: bool,
+
+    /// Studio lighting & sky backdrop preset: studio [default], daylight, sunset, arctic, abyssal
+    #[arg(long, visible_alias = "environment", help_heading = "Visuals, Environment & Camera")]
+    env_preset: Option<String>,
+
+    /// Filmic camera exposure multiplier [0.2..3.5; default: 1.0]
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    exposure: Option<f32>,
+
+    /// Hide the 3D studio floor reference grid
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    no_grid: bool,
+
+    /// Hide chamber, obstacle & emitter wireframe overlays
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    no_wireframe: bool,
+
+    /// Directional key sun vector 'x,y,z' (e.g. '0.42,0.82,0.38')
+    #[arg(long, allow_hyphen_values = true, help_heading = "Visuals, Environment & Camera")]
+    light_dir: Option<String>,
+
+    /// Key directional sun radiance multiplier [default: 1.25]
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    light_intensity: Option<f32>,
+
+    /// Hemisphere ambient light fill intensity [default: 0.32]
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    ambient: Option<f32>,
+
+    /// Disable colored liquid floor shadows & underwater caustics in surface-mesh renders
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    no_shadows: bool,
+
+    /// Camera horizontal orbit azimuth angle in degrees
+    #[arg(long, allow_hyphen_values = true, help_heading = "Visuals, Environment & Camera")]
+    camera_azimuth: Option<f32>,
+
+    /// Camera vertical orbit elevation angle in degrees
+    #[arg(long, allow_hyphen_values = true, help_heading = "Visuals, Environment & Camera")]
+    camera_elevation: Option<f32>,
+
+    /// Camera orbit distance from target in meters
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    camera_distance: Option<f32>,
+
+    /// Camera look-at target 'x,y,z'
+    #[arg(long, allow_hyphen_values = true, help_heading = "Visuals, Environment & Camera")]
+    camera_target: Option<String>,
+
+    /// Camera vertical field-of-view in degrees [15..110; default: 45]
+    #[arg(long, help_heading = "Visuals, Environment & Camera")]
+    fov: Option<f32>,
+
+    /// Automatic 360° turntable camera orbit angular speed in degrees/sec [default: 0]
+    #[arg(long, allow_hyphen_values = true, help_heading = "Visuals, Environment & Camera")]
+    camera_orbit: Option<f32>,
+
+    // ======================== SURFACE MESH & PBR OPTICS ========================
+    /// Surface mesh material preset: water [default], ocean, lagoon, amber, wine, emerald, milk, chrome, custom
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_material: Option<String>,
+
+    /// Shallow / thin-film surface liquid color as hex '#RRGGBB' or 'R,G,B'
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_color: Option<String>,
+
+    /// Deep volume Beer-Lambert absorption color as hex '#RRGGBB' or 'R,G,B'
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_deep_color: Option<String>,
+
+    /// Base liquid surface opacity [0.05..1.0]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_opacity: Option<f32>,
+
+    /// Beer-Lambert optical volume absorption density [0.0..10.0]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_absorption: Option<f32>,
+
+    /// Aerated whitewater wave-crest foam intensity [0.0..1.5]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_foam: Option<f32>,
+
+    /// Procedural triplanar surface texture: none, ripples [default], caustics, foam, grid
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_texture: Option<String>,
+
+    /// Spatial frequency scale for procedural surface texture [default: 6.0]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_texture_scale: Option<f32>,
+
+    /// Bump & pattern strength for procedural surface texture [0.0..1.0; default: 0.28]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_texture_strength: Option<f32>,
+
+    /// Optical Index of Refraction (IOR) for Schlick Fresnel (e.g. 1.333 water, 1.52 glass, 2.40 chrome)
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_ior: Option<f32>,
+
+    /// GGX microfacet surface roughness [0.01..1.0] (smaller = mirror-sharp highlights)
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_roughness: Option<f32>,
+
+    /// Direct sun specular highlight intensity multiplier
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_specular: Option<f32>,
+
+    /// Screen-space refraction background distortion strength [0.0..2.0]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_refraction: Option<f32>,
+
+    /// Subsurface wave-crest back-scatter glow intensity [0.0..3.0]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_sss: Option<f32>,
+
+    /// Studio sky & horizon Fresnel reflection intensity [0.0..4.0]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_reflection: Option<f32>,
+
+    /// Metallic reflectance factor [0.0..1.0]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_metallic: Option<f32>,
+
+    /// Marching Cubes voxel size multiplier relative to particle radius [default: 0.72]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_scale: Option<f32>,
+
+    /// Isosurface density threshold [0.10..0.90; default: 0.42]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_iso: Option<f32>,
+
+    /// Volume-preserving Taubin mesh smoothing iterations [default: 5]
+    #[arg(long, help_heading = "Surface Mesh & PBR Optics")]
+    mesh_smooth: Option<usize>,
+
+    // ======================== EXPORT, COMPUTE & UPDATES ========================
+    /// Run in headless CLI mode without opening an interactive window
+    #[arg(long, help_heading = "Export, Compute & Updates")]
+    headless: bool,
+
     /// Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
-    #[arg(long)]
+    #[arg(long, help_heading = "Export, Compute & Updates")]
     export_mp4: Option<PathBuf>,
 
-    /// [CLI only] Offline render quality preset (SSAA, high-res surface mesh, soft shadows, dispersion, CRF): standard, studio, cinema, master
-    #[arg(long, alias = "rq")]
-    render_quality: Option<String>,
+    /// Export the final simulated frame (or frame 0 with --frames 0) as a studio PNG image
+    #[arg(long, visible_alias = "screenshot", help_heading = "Export, Compute & Updates")]
+    export_png: Option<PathBuf>,
 
-    /// [CLI only] Output video resolution preset: 480p, 720p, 1k (1080p), 2k (1440p), 3k, 4k (2160p), 5k, 6k, 8k (4320p), optional -vertical/-portrait, or WxH (e.g. 2560x1440)
-    #[arg(long, visible_alias = "res")]
-    resolution: Option<String>,
-
-    /// Video export width in pixels
-    #[arg(long, default_value_t = 1280)]
-    video_width: usize,
-
-    /// Video export height in pixels
-    #[arg(long, default_value_t = 720)]
-    video_height: usize,
-
-    /// Directory to export PLY point cloud frames (optional)
-    #[arg(long)]
+    /// Directory to export binary PLY point-cloud frames
+    #[arg(long, help_heading = "Export, Compute & Updates")]
     export_ply: Option<PathBuf>,
 
-    /// Directory to export reconstructed Wavefront .OBJ surface mesh sequence (optional)
-    #[arg(long)]
+    /// Directory to export reconstructed Wavefront .OBJ surface mesh sequence
+    #[arg(long, help_heading = "Export, Compute & Updates")]
     export_obj: Option<PathBuf>,
 
+    /// Offline render quality preset (SSAA, high-res mesh, soft shadows, dispersion, CRF): standard, studio, cinema, master
+    #[arg(long, alias = "rq", help_heading = "Export, Compute & Updates")]
+    render_quality: Option<String>,
+
+    /// Output image/video resolution preset: 480p, 720p, 1080p, 1440p, 4k, 8k, optional -vertical/-portrait, or WxH
+    #[arg(long, visible_alias = "res", help_heading = "Export, Compute & Updates")]
+    resolution: Option<String>,
+
+    /// Video / PNG export width in pixels
+    #[arg(long, default_value_t = 1280, help_heading = "Export, Compute & Updates")]
+    video_width: usize,
+
+    /// Video / PNG export height in pixels
+    #[arg(long, default_value_t = 720, help_heading = "Export, Compute & Updates")]
+    video_height: usize,
+
     /// Force CPU multi-threaded solver instead of GPU acceleration
-    #[arg(long)]
+    #[arg(long, help_heading = "Export, Compute & Updates")]
     cpu: bool,
 
     /// Explicitly enable GPU acceleration (default: auto-detected Vulkan)
-    #[arg(long)]
+    #[arg(long, help_heading = "Export, Compute & Updates")]
     gpu: bool,
 
-    /// Enable particle frustum and viewport culling during rendering (default: enabled)
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Enable particle frustum and viewport culling during rendering [default: true]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, help_heading = "Export, Compute & Updates")]
     culling: bool,
 
     /// Disable frustum and viewport particle culling (renders all particles)
-    #[arg(long, alias = "no-cull")]
+    #[arg(long, alias = "no-cull", help_heading = "Export, Compute & Updates")]
     no_culling: bool,
 
     /// Print performance benchmark statistics
-    #[arg(long)]
+    #[arg(long, help_heading = "Export, Compute & Updates")]
     benchmark: bool,
 
     /// Check GitHub Releases for a newer LiquidRust version and exit
-    #[arg(long)]
+    #[arg(long, help_heading = "Export, Compute & Updates")]
     check_update: bool,
 
     /// Download and install the latest LiquidRust release from GitHub in-place
-    #[arg(long, alias = "self-update")]
+    #[arg(long, alias = "self-update", help_heading = "Export, Compute & Updates")]
     update: bool,
 
     /// Force reinstalling the latest GitHub release even if version matches
-    #[arg(long)]
+    #[arg(long, help_heading = "Export, Compute & Updates")]
     force_update: bool,
 }
 
@@ -321,15 +430,15 @@ fn format_time(seconds: f64) -> String {
 
 fn parse_preset(name: Option<&str>, has_faucets: bool) -> ScenePreset {
     match name {
-        Some(s) => match s.to_lowercase().as_str() {
+        Some(s) => match s.trim().to_lowercase().as_str() {
             "dam-break" | "dambreak" | "dam" => ScenePreset::DamBreak,
             "double-dam" | "doubledam" | "double" | "double-dam-break" | "doubledambreak" => {
                 ScenePreset::DoubleDamBreak
             }
-            "splash" | "droplet" | "dropletsplash" => ScenePreset::DropletSplash,
-            "obstacle" | "drop" | "obstacledrop" => ScenePreset::ObstacleDrop,
-            "tornado" | "vortex" => ScenePreset::VortexTornado,
-            "zero-g" | "zerog" | "blobs" => ScenePreset::ZeroGravityBlobs,
+            "splash" | "droplet" | "dropletsplash" | "droplet-splash" => ScenePreset::DropletSplash,
+            "obstacle" | "drop" | "obstacledrop" | "obstacle-drop" => ScenePreset::ObstacleDrop,
+            "tornado" | "vortex" | "vortex-tornado" => ScenePreset::VortexTornado,
+            "zero-g" | "zerog" | "blobs" | "zero-gravity" => ScenePreset::ZeroGravityBlobs,
             "empty" | "none" | "basin" | "faucet" => ScenePreset::Empty,
             _ => {
                 eprintln!("Unknown preset '{}', defaulting to dam-break", s);
@@ -357,6 +466,7 @@ fn parse_quality(name: &str) -> SimulationQuality {
         "studio" | "photoreal" => SimulationQuality::Studio,
         "film" | "vfx-max" => SimulationQuality::Film,
         "master" | "hyper" | "insane-cli" => SimulationQuality::Master,
+        "custom" => SimulationQuality::Custom,
         _ => {
             eprintln!("Unknown quality '{}', defaulting to 'medium'", name);
             SimulationQuality::Medium
@@ -457,34 +567,61 @@ fn resolve_video_dimensions(args: &Args) -> (usize, usize) {
 }
 
 fn parse_color_mode(s: &str) -> ColorMode {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "pressure" => ColorMode::Pressure,
-        "density" => ColorMode::Density,
-        "height" | "y" => ColorMode::Height,
-        "energy" | "kinetic" => ColorMode::KineticEnergy,
-        "single" | "solid" | "flat" => ColorMode::SingleColor,
-        _ => ColorMode::Velocity,
+    if let Some(cm) = ColorMode::from_slug(s) {
+        cm
+    } else {
+        eprintln!("Warning: unknown --color-mode '{}', defaulting to 'velocity'", s);
+        ColorMode::Velocity
     }
 }
 
 fn parse_color_map(s: &str) -> ColorMapType {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "turbo" | "rainbow" => ColorMapType::Turbo,
-        "viridis" => ColorMapType::Viridis,
-        "fire" | "magma" | "lava" => ColorMapType::Fire,
-        _ => ColorMapType::Ocean,
+    if let Some(cm) = ColorMapType::from_slug(s) {
+        cm
+    } else {
+        eprintln!("Warning: unknown --color-map '{}', defaulting to 'ocean'", s);
+        ColorMapType::Ocean
     }
 }
 
-fn build_mesh_config(args: &Args) -> SurfaceMeshConfig {
-    let mut cfg = SurfaceMeshConfig::default();
-    let preset = FluidMaterialPreset::from_slug(&args.mesh_material);
-    preset.apply(&mut cfg);
+fn parse_gravity_arg(raw: &str) -> Result<Vec3, String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| c == '(' || c == ')' || c == '[' || c == ']');
+    if !trimmed.contains(',') {
+        let gy = trimmed
+            .parse::<f32>()
+            .map_err(|e| format!("invalid gravity scalar '{}': {}", raw, e))?;
+        if !gy.is_finite() {
+            return Err("gravity must be finite".to_string());
+        }
+        return Ok(Vec3::new(0.0, gy, 0.0));
+    }
+    parse_vec3(trimmed)
+}
+
+fn build_mesh_config(args: &Args, base_scene: Option<&SceneConfigFile>) -> SurfaceMeshConfig {
+    let mut cfg = if let Some(sc) = base_scene {
+        sc.visuals.mesh.to_config()
+    } else {
+        let mut def = SurfaceMeshConfig::default();
+        FluidMaterialPreset::ClearWater.apply(&mut def);
+        def
+    };
+
+    if let Some(ref mat) = args.mesh_material {
+        let preset = FluidMaterialPreset::from_slug(mat);
+        preset.apply(&mut cfg);
+    }
 
     if let Some(ref c) = args.mesh_color {
         if let Some(rgb) = SurfaceMeshConfig::parse_rgb(c) {
             cfg.shallow_color = rgb;
-            if args.mesh_material.eq_ignore_ascii_case("custom") {
+            if args
+                .mesh_material
+                .as_deref()
+                .map_or(false, |m| m.eq_ignore_ascii_case("custom"))
+            {
                 cfg.preset = FluidMaterialPreset::Custom;
             }
         } else {
@@ -511,7 +648,9 @@ fn build_mesh_config(args: &Args) -> SurfaceMeshConfig {
         cfg.foam_intensity = v.clamp(0.0, 1.5);
     }
 
-    cfg.texture_mode = MeshTextureMode::from_slug(&args.mesh_texture);
+    if let Some(ref tex) = args.mesh_texture {
+        cfg.texture_mode = MeshTextureMode::from_slug(tex);
+    }
     if let Some(v) = args.mesh_texture_scale {
         cfg.texture_scale = v.clamp(0.2, 40.0);
     }
@@ -549,6 +688,25 @@ fn build_mesh_config(args: &Args) -> SurfaceMeshConfig {
     if let Some(v) = args.mesh_smooth {
         cfg.smoothing_passes = v.min(24);
     }
+    if let Some(ref ep) = args.env_preset {
+        if let Some(parsed_ep) = EnvironmentPreset::from_slug(ep) {
+            cfg.env_preset = parsed_ep;
+        } else {
+            eprintln!(
+                "Warning: unknown --env-preset '{}' (expected studio, daylight, sunset, arctic, abyssal)",
+                ep
+            );
+        }
+    }
+    if let Some(exp) = args.exposure {
+        cfg.exposure = exp.clamp(0.2, 3.5);
+    }
+    if args.no_grid {
+        cfg.show_grid = false;
+    }
+    if args.no_wireframe {
+        cfg.show_wireframe = false;
+    }
     if let Some(ref ldir) = args.light_dir {
         if let Ok(v) = parse_vec3(ldir) {
             if v.length_squared() > 1e-4 {
@@ -571,13 +729,20 @@ fn build_mesh_config(args: &Args) -> SurfaceMeshConfig {
     cfg
 }
 
-fn build_camera(args: &Args) -> Camera {
-    let mut cam = Camera::default();
-    if args.mode_2d {
+fn build_camera(args: &Args, base_scene: Option<&SceneConfigFile>, is_2d: bool) -> (Camera, f32) {
+    let (mut cam, mut orbit_deg) = if let Some(sc) = base_scene {
+        (sc.camera.to_camera(), sc.camera.orbit_speed_deg)
+    } else {
+        (Camera::default(), 0.0)
+    };
+    if is_2d {
         cam.azimuth = 0.0;
         cam.elevation = 0.0;
-        cam.target = Vec3::new(0.0, 0.6, 0.0);
-        cam.distance = 2.4;
+        if base_scene.is_none() {
+            cam.target = Vec3::new(0.0, 0.6, 0.0);
+            cam.distance = 2.4;
+        }
+        orbit_deg = 0.0;
     }
     if let Some(az_deg) = args.camera_azimuth {
         cam.azimuth = az_deg.to_radians();
@@ -593,7 +758,73 @@ fn build_camera(args: &Args) -> Camera {
             cam.target = v;
         }
     }
-    cam
+    if let Some(fov_deg) = args.fov {
+        cam.fov_y = fov_deg.clamp(15.0, 110.0).to_radians();
+    }
+    if let Some(orb) = args.camera_orbit {
+        orbit_deg = if is_2d { 0.0 } else { orb.clamp(-360.0, 360.0) };
+    }
+    (cam, orbit_deg)
+}
+
+fn apply_cli_physics_overrides(
+    args: &Args,
+    config: &mut SolverConfig,
+    fluid_preset_out: &mut FluidPhysicsPreset,
+) {
+    if let Some(ref fp_str) = args.fluid_preset {
+        if let Some(fp) = FluidPhysicsPreset::from_slug(fp_str) {
+            fp.apply(config);
+            *fluid_preset_out = fp;
+        } else {
+            eprintln!(
+                "Warning: unknown --fluid-preset '{}' (expected water, ocean, oil, honey, glycerin, mercury, lava, zero-g)",
+                fp_str
+            );
+        }
+    }
+    if let Some(ref g_str) = args.gravity {
+        match parse_gravity_arg(g_str) {
+            Ok(g) => config.gravity = g,
+            Err(e) => eprintln!("Warning: invalid --gravity '{}': {}", g_str, e),
+        }
+    }
+    if let Some(visc) = args.viscosity {
+        config.viscosity = visc.clamp(0.0, 1.0);
+    }
+    if let Some(st) = args.surface_tension {
+        config.surface_tension = st.clamp(0.0, 0.5);
+    }
+    if let Some(vort) = args.vorticity {
+        config.vorticity = vort.clamp(0.0, 0.5);
+    }
+    if let Some(drag) = args.air_drag {
+        config.air_drag = drag.clamp(0.0, 5.0);
+    }
+    if let Some(rest) = args.restitution {
+        config.restitution = rest.clamp(0.0, 1.0);
+    }
+    if let Some(fric) = args.friction {
+        config.boundary_friction = fric.clamp(0.0, 1.0);
+    }
+    if let Some(sub) = args.substeps {
+        config.substeps = sub.clamp(1, 32);
+    }
+    if let Some(iters) = args.iterations {
+        config.solver_iterations = iters.clamp(1, 32);
+    }
+    if let Some(tk) = args.tensile_k {
+        config.tensile_k = tk.clamp(0.0, 0.05);
+    }
+    if let Some(mv) = args.max_velocity {
+        config.max_velocity = mv.clamp(1.0, 100.0);
+    }
+    if let Some(wa) = args.wave_amp {
+        config.wave_amplitude = wa.clamp(0.0, 2.0);
+    }
+    if let Some(wf) = args.wave_freq {
+        config.wave_frequency = wf.clamp(0.05, 10.0);
+    }
 }
 
 fn clean_spec(spec: &str) -> Vec<String> {
@@ -643,59 +874,41 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
     let kind = parts[0].to_lowercase();
     let name = format!("Obstacle #{} ({})", index + 1, kind);
 
-    match kind.as_str() {
+    let (mut col, extra_start) = match kind.as_str() {
         "sphere" => {
             if parts.len() < 3 {
                 return Err(format!(
-                    "Invalid sphere spec '{}'. Format: sphere:x,y,z:radius",
+                    "Invalid sphere spec '{}'. Format: sphere:x,y,z:radius[:restitution[:friction]]",
                     spec
                 ));
             }
             let pos = parse_vec3(&parts[1])?;
-            let radius = parts[2]
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| format!("invalid radius: {}", e))?;
-            let mut col = Collider::sphere(pos, radius);
-            col.name = name;
-            col.id = (index + 1) as u32;
-            Ok(col)
+            let radius = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
+            (Collider::sphere(pos, radius), 3usize)
         }
         "box" | "cube" => {
             if parts.len() < 3 {
                 return Err(format!(
-                    "Invalid box spec '{}'. Format: box:x,y,z:w,h,d",
+                    "Invalid box spec '{}'. Format: box:x,y,z:w,h,d[:restitution[:friction]]",
                     spec
                 ));
             }
             let pos = parse_vec3(&parts[1])?;
             let size = parse_vec3(&parts[2])?;
             let half = size * 0.5;
-            let mut col = Collider::box_obstacle(pos - half, pos + half);
-            col.name = name;
-            col.id = (index + 1) as u32;
-            Ok(col)
+            (Collider::box_obstacle(pos - half, pos + half), 3usize)
         }
         "cylinder" => {
             if parts.len() < 4 {
                 return Err(format!(
-                    "Invalid cylinder spec '{}'. Format: cylinder:x,y,z:radius:height",
+                    "Invalid cylinder spec '{}'. Format: cylinder:x,y,z:radius:height[:restitution[:friction]]",
                     spec
                 ));
             }
             let pos = parse_vec3(&parts[1])?;
-            let radius = parts[2]
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| format!("invalid radius: {}", e))?;
-            let height = parts[3]
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| format!("invalid height: {}", e))?;
-            let mut col = Collider::cylinder(pos, radius, height);
-            col.name = name;
-            col.id = (index + 1) as u32;
-            Ok(col)
+            let radius = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
+            let height = parse_f32_checked(&parts[3], "height", Some(0.0))?;
+            (Collider::cylinder(pos, radius, height), 4usize)
         }
         "obj" | "mesh" => {
             if parts.len() < 4 {
@@ -706,27 +919,37 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
             }
             let path = parts[1].trim();
             let pos = parse_vec3(&parts[2])?;
-            let scale = parts[3]
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| format!("invalid scale: {}", e))?;
+            let scale = parse_f32_checked(&parts[3], "scale", Some(0.0))?;
             let rot_rad = if parts.len() >= 5 {
                 let deg = parse_vec3(&parts[4])?;
                 glam::Vec3::new(deg.x.to_radians(), deg.y.to_radians(), deg.z.to_radians())
             } else {
                 glam::Vec3::ZERO
             };
-            let mut col = Collider::load_obj_transformed(path, pos, scale, rot_rad)
+            let mut c = Collider::load_obj_transformed(path, pos, scale, rot_rad)
                 .map_err(|e| format!("failed to load OBJ '{}': {}", path, e))?;
-            col.name = format!("OBJ #{} ({})", index + 1, path);
-            col.id = (index + 1) as u32;
-            Ok(col)
+            c.name = format!("OBJ #{} ({})", index + 1, path);
+            c.id = (index + 1) as u32;
+            return Ok(c);
         }
-        _ => Err(format!(
-            "Unknown obstacle type '{}'. Expected 'sphere', 'box', 'cylinder', or 'obj'",
-            kind
-        )),
+        _ => {
+            return Err(format!(
+                "Unknown obstacle type '{}'. Expected 'sphere', 'box', 'cylinder', or 'obj'",
+                kind
+            ))
+        }
+    };
+
+    col.name = name;
+    col.id = (index + 1) as u32;
+    if parts.len() > extra_start {
+        col.restitution = parse_f32_checked(&parts[extra_start], "restitution", None)?.clamp(0.0, 1.0);
     }
+    if parts.len() > extra_start + 1 {
+        col.friction =
+            parse_f32_checked(&parts[extra_start + 1], "friction", None)?.clamp(0.0, 1.0);
+    }
+    Ok(col)
 }
 
 fn parse_f32_checked(raw: &str, label: &str, min_exclusive: Option<f32>) -> Result<f32, String> {
@@ -921,10 +1144,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
     let (face, pos, radius) = match kind.as_str() {
         "floor" | "bottom" => {
             if parts.len() == 2 {
-                let r = parts[1]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[1], "radius", Some(0.0))?;
                 (CubeFace::Floor, glam::Vec3::ZERO, r)
             } else if parts.len() >= 3 {
                 let xz: Vec<&str> = parts[1].split(',').collect();
@@ -942,10 +1162,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
                     .trim()
                     .parse::<f32>()
                     .map_err(|e| format!("invalid z: {}", e))?;
-                let r = parts[2]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
                 (CubeFace::Floor, glam::Vec3::new(x, 0.0, z), r)
             } else {
                 return Err(format!(
@@ -956,10 +1173,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
         }
         "ceiling" | "top" => {
             if parts.len() == 2 {
-                let r = parts[1]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[1], "radius", Some(0.0))?;
                 (CubeFace::Ceiling, glam::Vec3::ZERO, r)
             } else if parts.len() >= 3 {
                 let xz: Vec<&str> = parts[1].split(',').collect();
@@ -977,10 +1191,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
                     .trim()
                     .parse::<f32>()
                     .map_err(|e| format!("invalid z: {}", e))?;
-                let r = parts[2]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
                 (CubeFace::Ceiling, glam::Vec3::new(x, 0.0, z), r)
             } else {
                 return Err(format!(
@@ -991,10 +1202,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
         }
         "left" => {
             if parts.len() == 2 {
-                let r = parts[1]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[1], "radius", Some(0.0))?;
                 (CubeFace::Left, glam::Vec3::ZERO, r)
             } else if parts.len() >= 3 {
                 let yz: Vec<&str> = parts[1].split(',').collect();
@@ -1012,10 +1220,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
                     .trim()
                     .parse::<f32>()
                     .map_err(|e| format!("invalid z: {}", e))?;
-                let r = parts[2]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
                 (CubeFace::Left, glam::Vec3::new(0.0, y, z), r)
             } else {
                 return Err(format!(
@@ -1026,10 +1231,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
         }
         "right" => {
             if parts.len() == 2 {
-                let r = parts[1]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[1], "radius", Some(0.0))?;
                 (CubeFace::Right, glam::Vec3::ZERO, r)
             } else if parts.len() >= 3 {
                 let yz: Vec<&str> = parts[1].split(',').collect();
@@ -1047,10 +1249,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
                     .trim()
                     .parse::<f32>()
                     .map_err(|e| format!("invalid z: {}", e))?;
-                let r = parts[2]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
                 (CubeFace::Right, glam::Vec3::new(0.0, y, z), r)
             } else {
                 return Err(format!(
@@ -1061,10 +1260,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
         }
         "back" => {
             if parts.len() == 2 {
-                let r = parts[1]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[1], "radius", Some(0.0))?;
                 (CubeFace::Back, glam::Vec3::ZERO, r)
             } else if parts.len() >= 3 {
                 let xy: Vec<&str> = parts[1].split(',').collect();
@@ -1082,10 +1278,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
                     .trim()
                     .parse::<f32>()
                     .map_err(|e| format!("invalid y: {}", e))?;
-                let r = parts[2]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
                 (CubeFace::Back, glam::Vec3::new(x, y, 0.0), r)
             } else {
                 return Err(format!(
@@ -1096,10 +1289,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
         }
         "front" => {
             if parts.len() == 2 {
-                let r = parts[1]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[1], "radius", Some(0.0))?;
                 (CubeFace::Front, glam::Vec3::ZERO, r)
             } else if parts.len() >= 3 {
                 let xy: Vec<&str> = parts[1].split(',').collect();
@@ -1117,10 +1307,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
                     .trim()
                     .parse::<f32>()
                     .map_err(|e| format!("invalid y: {}", e))?;
-                let r = parts[2]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid radius: {}", e))?;
+                let r = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
                 (CubeFace::Front, glam::Vec3::new(x, y, 0.0), r)
             } else {
                 return Err(format!(
@@ -1137,10 +1324,7 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
                 ));
             }
             let pos = parse_vec3(&parts[1])?;
-            let r = parts[2]
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| format!("invalid radius: {}", e))?;
+            let r = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
             (CubeFace::Custom, pos, r)
         }
         _ => {
@@ -1171,31 +1355,42 @@ fn parse_chamber_floats(raw: &str, flag_name: &str) -> Result<Vec<f32>, String> 
     Ok(vals)
 }
 
-fn parse_chamber(args: &Args) -> Result<Chamber, String> {
-    let chamber_shape = match args.chamber_shape.trim().to_lowercase().as_str() {
-        "box" | "cuboid" | "rect" | "rectangle" | "" => ChamberShape::Box,
-        "sphere" | "globe" | "ball" | "circle" => ChamberShape::Sphere,
-        "bathtub" | "tub" | "bath" => ChamberShape::Bathtub,
-        other => {
-            return Err(format!(
-                "Unknown bounding box / chamber type '{}'. Valid options: box, sphere, bathtub",
-                other
-            ))
-        }
+fn parse_chamber_with_base(
+    args: &Args,
+    base_scene: Option<&SceneConfigFile>,
+    is_2d: bool,
+) -> Result<Chamber, String> {
+    let mut chamber = if let Some(sc) = base_scene {
+        sc.chamber.to_chamber()
+    } else {
+        Chamber::new(ChamberShape::Box)
     };
-    let mut chamber = Chamber::new(chamber_shape);
+
+    if let Some(ref shape_raw) = args.chamber_shape {
+        chamber.shape = match shape_raw.trim().to_lowercase().as_str() {
+            "box" | "cuboid" | "rect" | "rectangle" | "" => ChamberShape::Box,
+            "sphere" | "globe" | "ball" | "circle" => ChamberShape::Sphere,
+            "bathtub" | "tub" | "bath" => ChamberShape::Bathtub,
+            other => {
+                return Err(format!(
+                    "Unknown bounding box / chamber type '{}'. Valid options: box, sphere, bathtub",
+                    other
+                ))
+            }
+        };
+    }
 
     if let Some(ref size_str) = args.chamber_size {
         let vals = parse_chamber_floats(size_str, "chamber-size")?;
         chamber.base_size = match vals.as_slice() {
             [s] => {
-                if args.mode_2d {
+                if is_2d {
                     Vec3::new(*s, *s, 0.1)
                 } else {
                     Vec3::splat(*s)
                 }
             }
-            [w, h] => Vec3::new(*w, *h, if args.mode_2d { 0.1 } else { 0.9 }),
+            [w, h] => Vec3::new(*w, *h, if is_2d { 0.1 } else { 0.9 }),
             [w, h, d] => Vec3::new(*w, *h, *d),
             _ => {
                 return Err(format!(
@@ -1232,85 +1427,134 @@ fn parse_chamber(args: &Args) -> Result<Chamber, String> {
     Ok(chamber)
 }
 
+#[cfg(test)]
+fn parse_chamber(args: &Args) -> Result<Chamber, String> {
+    parse_chamber_with_base(args, None, args.mode_2d)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_headless(
     args: Args,
+    loaded_scene: Option<SceneConfigFile>,
+    is_2d: bool,
+    preset: ScenePreset,
+    quality: SimulationQuality,
     chamber: Chamber,
     parsed_colliders: Vec<Collider>,
     parsed_faucets: Vec<Faucet>,
     parsed_drains: Vec<Drain>,
 ) {
-    let preset = parse_preset(args.preset.as_deref(), !parsed_faucets.is_empty());
-    let quality = parse_quality(&args.quality);
     let cli_render_quality = resolve_cli_render_quality(&args, quality);
     let (video_width, video_height) = resolve_video_dimensions(&args);
     let fps = args.fps.max(1);
+    let sim_speed = args
+        .speed
+        .unwrap_or_else(|| loaded_scene.as_ref().map_or(1.0, |s| s.sim_speed))
+        .clamp(0.05, 4.0);
+
     let render_mode = if args.surface_mesh {
         RenderMode::SurfaceMesh
+    } else if let Some(ref rm) = args.render_mode {
+        RenderMode::from_slug(rm)
+    } else if let Some(ref sc) = loaded_scene {
+        sc.visuals.parsed_render_mode()
     } else {
-        RenderMode::from_slug(&args.render_mode)
+        RenderMode::Particles
     };
-    let mut mesh_cfg = build_mesh_config(&args);
+
+    let mut mesh_cfg = build_mesh_config(&args, loaded_scene.as_ref());
     cli_render_quality.apply_to_mesh_config(
         &mut mesh_cfg,
         args.mesh_smooth.is_some(),
         args.mesh_scale.is_some(),
     );
-    let camera = build_camera(&args);
-    let color_mode = parse_color_mode(&args.color_mode);
-    let color_map = parse_color_map(&args.color_map);
+    let (mut camera, orbit_deg) = build_camera(&args, loaded_scene.as_ref(), is_2d);
+    let orbit_rad_per_sec = orbit_deg.to_radians();
+    let wall_frame_dt = 1.0 / fps as f32;
 
-    let (total_frames, dt) = if let Some(t) = args.time {
-        let f = (t * fps as f32).round().max(1.0) as usize;
-        let delta_t = (1.0 / fps as f32) * args.speed;
-        (f, delta_t)
+    let color_mode = args
+        .color_mode
+        .as_deref()
+        .map(parse_color_mode)
+        .unwrap_or_else(|| {
+            loaded_scene
+                .as_ref()
+                .map_or(ColorMode::Velocity, |s| s.visuals.parsed_color_mode())
+        });
+    let color_map = args
+        .color_map
+        .as_deref()
+        .map(parse_color_map)
+        .unwrap_or_else(|| {
+            loaded_scene
+                .as_ref()
+                .map_or(ColorMapType::Ocean, |s| s.visuals.parsed_color_map())
+        });
+    let particle_scale = args
+        .particle_scale
+        .unwrap_or_else(|| {
+            loaded_scene
+                .as_ref()
+                .map_or(1.25, |s| s.visuals.particle_scale)
+        })
+        .clamp(0.3, 3.0);
+    let particle_foam = if args.no_particle_foam {
+        false
     } else {
-        let base_dt = args.dt.unwrap_or(1.0 / fps as f32);
-        let delta_t = base_dt * args.speed;
-        (args.frames, delta_t)
+        loaded_scene
+            .as_ref()
+            .map_or(true, |s| s.visuals.particle_foam)
+    };
+    let lit_spheres = if args.unlit_spheres {
+        false
+    } else {
+        loaded_scene
+            .as_ref()
+            .map_or(true, |s| s.visuals.lit_spheres)
+    };
+    let use_culling = if args.no_culling {
+        false
+    } else {
+        args.culling
+            && loaded_scene
+                .as_ref()
+                .map_or(true, |s| s.visuals.enable_culling)
     };
 
-    println!("=== liquid-rust studio render / headless mode ===");
-    println!("Preset:      {:?}", preset);
-    println!("Quality:     {} ({:?})", quality.name_for(args.mode_2d), quality);
-    println!("Render Mode: {}", render_mode.name());
-    if cli_render_quality != CliRenderQuality::Standard || args.export_mp4.is_some() || args.export_obj.is_some() {
-        println!(
-            "CLI Optics:  {} | SSAA {}x | Shadow {}px | Mesh max {:.0} cells | H.264 {} CRF {}",
-            cli_render_quality.name(),
-            cli_render_quality.ssaa_factor(),
-            cli_render_quality.shadow_res(),
-            mesh_cfg.max_grid_cells,
-            cli_render_quality.ffmpeg_preset(),
-            cli_render_quality.ffmpeg_crf(),
-        );
-    }
-    if render_mode == RenderMode::SurfaceMesh {
-        println!(
-            "Mesh Optics: Material={} | Shallow={} | Deep={} | Texture={} (scale {:.1}, str {:.2}) | IOR={:.3} | Rough={:.3}",
-            mesh_cfg.preset.name(),
-            SurfaceMeshConfig::format_hex(mesh_cfg.shallow_color),
-            SurfaceMeshConfig::format_hex(mesh_cfg.deep_color),
-            mesh_cfg.texture_mode.name(),
-            mesh_cfg.texture_scale,
-            mesh_cfg.texture_strength,
-            mesh_cfg.ior,
-            mesh_cfg.roughness,
-        );
-    }
-    if (args.speed - 1.0).abs() > 1e-4 {
-        println!("Sim Speed:   {:.2}x", args.speed);
-    }
-    println!(
-        "Timeline:    {} frames ({:.2}s @ {} fps, dt={:.5}s)",
-        total_frames,
-        total_frames as f32 / fps as f32,
-        fps,
-        dt
-    );
+    let save_scene_only = args.save_scene.is_some()
+        && !args.headless
+        && !args.benchmark
+        && args.export_mp4.is_none()
+        && args.export_png.is_none()
+        && args.export_ply.is_none()
+        && args.export_obj.is_none()
+        && args.time.is_none()
+        && args.frames.is_none();
+
+    let (total_frames, dt) = if let Some(t) = args.time {
+        let f = (t * fps as f32).round().max(0.0) as usize;
+        let delta_t = (1.0 / fps as f32) * sim_speed;
+        (f, delta_t)
+    } else {
+        let f = args.frames.unwrap_or(if save_scene_only { 0 } else { 120 });
+        let base_dt = args.dt.unwrap_or(1.0 / fps as f32);
+        let delta_t = base_dt * sim_speed;
+        (f, delta_t)
+    };
 
     let bounds = chamber.compute_bounds();
-    let mut config = SolverConfig::default();
-    quality.apply(&mut config, args.mode_2d);
+    let mut config = if let Some(ref sc) = loaded_scene {
+        sc.solver.to_config()
+    } else {
+        SolverConfig::default()
+    };
+    let mut fluid_preset = loaded_scene
+        .as_ref()
+        .map_or(FluidPhysicsPreset::Water, |s| s.parsed_fluid_preset());
+
+    if loaded_scene.is_none() || args.quality.is_some() {
+        quality.apply(&mut config, is_2d);
+    }
 
     if let Some(target_n) = args.particles {
         let approx_vol = match preset {
@@ -1335,27 +1579,153 @@ fn run_headless(
     if let Some(s) = args.spacing {
         config.spacing = s;
     }
-    if let Some(vort) = args.vorticity {
-        config.vorticity = vort.clamp(0.0, 0.5);
-    }
-    if let Some(st) = args.surface_tension {
-        config.surface_tension = st.clamp(0.0, 0.5);
-    }
-    if let Some(visc) = args.viscosity {
-        config.viscosity = visc.clamp(0.0, 1.0);
-    }
-    config.rest_density = if args.mode_2d {
+    config.rest_density = if is_2d {
         compute_lattice_rest_density_2d(config.smoothing_length, config.spacing)
     } else {
         compute_lattice_rest_density(config.smoothing_length, config.spacing)
     };
 
+    let loaded_solver_override = loaded_scene.as_ref().map(|_| config.clone());
+
     let mut solver = SphSolver::new(bounds, config);
-    if args.mode_2d {
+    if is_2d {
         solver.set_2d(true);
     }
     solver.set_chamber(chamber);
     SceneGenerator::setup_scene(&mut solver, preset);
+
+    // Preserve loaded JSON solver parameters if no preset override was requested, then apply explicit CLI physics flags
+    if let Some(sc_cfg) = loaded_solver_override {
+        if args.preset.is_none() {
+            solver.config = sc_cfg;
+        }
+    }
+    apply_cli_physics_overrides(&args, &mut solver.config, &mut fluid_preset);
+
+    if let Some(ref sc) = loaded_scene {
+        if args.preset.is_none() {
+            solver.colliders.clear();
+        }
+        for (i, c_dto) in sc.colliders.iter().enumerate() {
+            if let Some(col) = c_dto.to_collider((i + 1) as u32) {
+                solver.colliders.push(col);
+            }
+        }
+        for (i, f_dto) in sc.faucets.iter().enumerate() {
+            solver.faucets.push(f_dto.to_faucet((i + 1) as u32));
+        }
+        for (i, d_dto) in sc.drains.iter().enumerate() {
+            solver.drains.push(d_dto.to_drain((i + 1) as u32));
+        }
+    }
+
+    let base_col_id = solver.colliders.len() as u32;
+    for (idx, mut col) in parsed_colliders.into_iter().enumerate() {
+        col.id = base_col_id + idx as u32 + 1;
+        solver.colliders.push(col);
+    }
+    let base_faucet_id = solver.faucets.len() as u32;
+    for (idx, mut faucet) in parsed_faucets.into_iter().enumerate() {
+        faucet.id = base_faucet_id + idx as u32 + 1;
+        solver.faucets.push(faucet);
+    }
+    let base_drain_id = solver.drains.len() as u32;
+    for (idx, mut drain) in parsed_drains.into_iter().enumerate() {
+        drain.id = base_drain_id + idx as u32 + 1;
+        solver.drains.push(drain);
+    }
+
+    // Save portable .json scene if --save-scene was requested
+    if let Some(ref save_path) = args.save_scene {
+        let scene_out = SceneConfigFile {
+            version: 1,
+            preset: preset.slug().to_string(),
+            quality: quality.slug().to_string(),
+            fluid_preset: fluid_preset.slug().to_string(),
+            is_2d,
+            sim_speed,
+            mouse_strength: solver.mouse_force_strength,
+            solver: SolverConfigDto::from_config(&solver.config),
+            chamber: ChamberDto::from_chamber(&solver.chamber),
+            colliders: solver
+                .colliders
+                .iter()
+                .map(ColliderDto::from_collider)
+                .collect(),
+            faucets: solver
+                .faucets
+                .iter()
+                .map(FaucetDto::from_faucet)
+                .collect(),
+            drains: solver.drains.iter().map(DrainDto::from_drain).collect(),
+            camera: CameraDto::from_camera(&camera, orbit_deg),
+            visuals: VisualsDto {
+                render_mode: render_mode.slug().to_string(),
+                color_mode: color_mode.slug().to_string(),
+                color_map: color_map.slug().to_string(),
+                particle_scale,
+                particle_foam,
+                lit_spheres,
+                enable_culling: use_culling,
+                mesh: SurfaceMeshDto::from_config(&mesh_cfg),
+            },
+        };
+        match scene_out.save_to_path(save_path) {
+            Ok(_) => println!("Saved studio scene JSON to: {}", save_path.display()),
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        if save_scene_only {
+            return;
+        }
+    }
+
+    println!("=== liquid-rust studio render / headless mode ===");
+    println!("Preset:      {} ({:?})", preset.name(), preset);
+    println!("Substance:   {}", fluid_preset.name());
+    println!("Quality:     {} ({:?})", quality.name_for(is_2d), quality);
+    println!("Render Mode: {} | Env: {}", render_mode.name(), mesh_cfg.env_preset.name());
+    if cli_render_quality != CliRenderQuality::Standard
+        || args.export_mp4.is_some()
+        || args.export_png.is_some()
+        || args.export_obj.is_some()
+    {
+        println!(
+            "CLI Optics:  {} | SSAA {}x | Shadow {}px | Mesh max {:.0} cells | H.264 {} CRF {}",
+            cli_render_quality.name(),
+            cli_render_quality.ssaa_factor(),
+            cli_render_quality.shadow_res(),
+            mesh_cfg.max_grid_cells,
+            cli_render_quality.ffmpeg_preset(),
+            cli_render_quality.ffmpeg_crf(),
+        );
+    }
+    if render_mode == RenderMode::SurfaceMesh {
+        println!(
+            "Mesh Optics: Material={} | Shallow={} | Deep={} | Texture={} (scale {:.1}, str {:.2}) | IOR={:.3} | Rough={:.3}",
+            mesh_cfg.preset.name(),
+            SurfaceMeshConfig::format_hex(mesh_cfg.shallow_color),
+            SurfaceMeshConfig::format_hex(mesh_cfg.deep_color),
+            mesh_cfg.texture_mode.name(),
+            mesh_cfg.texture_scale,
+            mesh_cfg.texture_strength,
+            mesh_cfg.ior,
+            mesh_cfg.roughness,
+        );
+    }
+    if (sim_speed - 1.0).abs() > 1e-4 {
+        println!("Sim Speed:   {:.2}x", sim_speed);
+    }
+    println!(
+        "Timeline:    {} frames ({:.2}s @ {} fps, dt={:.5}s)",
+        total_frames,
+        total_frames as f32 / fps as f32,
+        fps,
+        dt
+    );
+
     let bsz = solver.bounds.size();
     println!(
         "Bounds:      {} ({:.2} x {:.2} x {:.2} m)",
@@ -1364,19 +1734,16 @@ fn run_headless(
         bsz.y,
         bsz.z
     );
-
-    for col in parsed_colliders {
+    for col in &solver.colliders {
         println!("  + Obstacle: {} (id: {})", col.name, col.id);
-        solver.colliders.push(col);
     }
-    for faucet in parsed_faucets {
+    for faucet in &solver.faucets {
         println!(
             "  + Faucet: {} (id: {}, rate: {:.0} p/s)",
             faucet.name, faucet.id, faucet.flow_rate
         );
-        solver.faucets.push(faucet);
     }
-    for drain in parsed_drains {
+    for drain in &solver.drains {
         println!(
             "  + Drain: {} (id: {}, face: {}, radius: {:.2})",
             drain.name,
@@ -1384,7 +1751,6 @@ fn run_headless(
             drain.face.name(),
             drain.radius
         );
-        solver.drains.push(drain);
     }
 
     let particle_count = solver.particle_count();
@@ -1393,10 +1759,10 @@ fn run_headless(
         particle_count, solver.config.particle_radius, solver.config.spacing
     );
 
-    let mut gpu_solver = if !args.cpu {
+    let mut gpu_solver = if !args.cpu && total_frames > 0 {
         match GpuSphSolver::new(solver.bounds, &solver.config, &solver.particles) {
             Ok(g) => {
-                println!("⚡ GPU Acceleration: ACTIVE [{}]", g.device_name);
+                println!("GPU Acceleration: ACTIVE [{}]", g.device_name);
                 Some(g)
             }
             Err(e) => {
@@ -1407,8 +1773,10 @@ fn run_headless(
                 None
             }
         }
-    } else {
+    } else if args.cpu {
         println!("Using multi-threaded Rayon CPU solver (--cpu specified)");
+        None
+    } else {
         None
     };
 
@@ -1446,10 +1814,20 @@ fn run_headless(
         None
     };
 
-    let use_culling = args.culling && !args.no_culling;
-    let mut software_renderer = if mp4_encoder.is_some() {
-        let mut rend = SoftwareRenderer::new_with_quality(video_width, video_height, cli_render_quality);
+    let mut software_renderer = if mp4_encoder.is_some() || args.export_png.is_some() {
+        let mut rend =
+            SoftwareRenderer::new_with_quality(video_width, video_height, cli_render_quality);
         rend.enable_culling = use_culling;
+        rend.lit_spheres = lit_spheres;
+        rend.particle_foam = particle_foam;
+        rend.env_preset = mesh_cfg.env_preset;
+        rend.exposure = mesh_cfg.exposure;
+        rend.show_grid = mesh_cfg.show_grid;
+        rend.show_wireframe = mesh_cfg.show_wireframe;
+        rend.light_dir = mesh_cfg.light_dir;
+        rend.light_intensity = mesh_cfg.light_intensity;
+        rend.ambient_intensity = mesh_cfg.ambient_intensity;
+
         if rend.ssaa_factor != cli_render_quality.ssaa_factor() {
             let (rw, rh) = rend.internal_dimensions();
             println!(
@@ -1498,7 +1876,7 @@ fn run_headless(
             let prev_len = solver.particles.len();
             solver.emit_faucets(dt);
             if solver.particles.len() != prev_len {
-                gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, false);
+                gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, true);
             }
             gpu.step(
                 solver.bounds,
@@ -1509,7 +1887,7 @@ fn run_headless(
                 solver.mouse_force_strength,
                 solver.mouse_force_mode,
                 dt,
-                args.mode_2d,
+                is_2d,
             );
             gpu.read_particles(&mut solver.particles);
 
@@ -1521,7 +1899,6 @@ fn run_headless(
                 use rayon::prelude::*;
                 let radius = solver.config.particle_radius;
                 let colliders = &solver.colliders;
-                let is_2d = args.mode_2d;
                 let hit = solver
                     .particles
                     .par_iter_mut()
@@ -1546,7 +1923,7 @@ fn run_headless(
 
             let drained = solver.drain_particles();
             if drained > 0 {
-                gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, true);
+                gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, false);
             }
         } else {
             solver.step(dt);
@@ -1556,8 +1933,8 @@ fn run_headless(
 
         // Build surface mesh if needed for MP4 surface-mesh rendering or .OBJ export
         let t_r = Instant::now();
-        let need_mesh =
-            (render_mode == RenderMode::SurfaceMesh && mp4_encoder.is_some()) || args.export_obj.is_some();
+        let need_mesh = (render_mode == RenderMode::SurfaceMesh && mp4_encoder.is_some())
+            || args.export_obj.is_some();
         let built_mesh = if need_mesh {
             Some(SurfaceMesh::from_particles(
                 &solver.particles,
@@ -1573,15 +1950,17 @@ fn run_headless(
         {
             match render_mode {
                 RenderMode::Particles => {
-                    rend.render_frame(
+                    rend.render_particles_studio(
                         &solver.particles,
-                        solver.config.particle_radius * 1.25,
+                        solver.config.particle_radius * particle_scale,
                         &solver.chamber,
                         solver.bounds,
+                        &solver.colliders,
                         &camera,
                         color_mode,
                         color_map,
                         solver.config.rest_density,
+                        is_2d,
                     );
                 }
                 RenderMode::SurfaceMesh => {
@@ -1594,7 +1973,7 @@ fn run_headless(
                             solver.bounds,
                             &solver.colliders,
                             anim_time,
-                            args.mode_2d,
+                            is_2d,
                         );
                     }
                 }
@@ -1603,6 +1982,8 @@ fn run_headless(
                 eprintln!("Error writing video frame {}: {}", frame, e);
             }
         }
+
+        camera.azimuth += orbit_rad_per_sec * wall_frame_dt;
 
         if let (Some(ref dir), Some(ref mesh)) = (&args.export_obj, &built_mesh) {
             let obj_path = dir.join(format!("fluid_surface_{:05}.obj", frame));
@@ -1614,16 +1995,20 @@ fn run_headless(
 
         if let Some(ref dir) = args.export_ply {
             let path = dir.join(format!("fluid_{:05}.ply", frame));
+            let rest_rho = solver.config.rest_density;
+            let bnds = solver.bounds;
             let colors: Vec<[u8; 3]> = solver
                 .particles
                 .iter()
                 .map(|p| {
-                    let speed_ratio = (p.speed() / 2.4).clamp(0.0, 1.0);
-                    [
-                        (speed_ratio * 255.0) as u8,
-                        120,
-                        ((1.0 - speed_ratio * 0.7) * 255.0) as u8,
-                    ]
+                    ColorMap::particle_color(
+                        p,
+                        color_mode,
+                        color_map,
+                        rest_rho,
+                        &bnds,
+                        particle_foam,
+                    )
                 })
                 .collect();
             if let Err(e) = PlyExporter::save_binary(&path, &solver.particles, &colors) {
@@ -1666,7 +2051,61 @@ fn run_headless(
             last_progress_print = Instant::now();
         }
     }
-    println!();
+    if total_frames > 0 {
+        println!();
+    }
+
+    // Export studio PNG screenshot of the final simulated state if --export-png was requested
+    if let (Some(ref png_path), Some(ref mut rend)) = (&args.export_png, &mut software_renderer) {
+        let t_png = Instant::now();
+        match render_mode {
+            RenderMode::Particles => {
+                rend.render_particles_studio(
+                    &solver.particles,
+                    solver.config.particle_radius * particle_scale,
+                    &solver.chamber,
+                    solver.bounds,
+                    &solver.colliders,
+                    &camera,
+                    color_mode,
+                    color_map,
+                    solver.config.rest_density,
+                    is_2d,
+                );
+            }
+            RenderMode::SurfaceMesh => {
+                let mesh = SurfaceMesh::from_particles(
+                    &solver.particles,
+                    solver.config.particle_radius,
+                    solver.config.smoothing_length,
+                    &mesh_cfg,
+                );
+                rend.render_surface_mesh_frame(
+                    &mesh,
+                    &mesh_cfg,
+                    &camera,
+                    &solver.chamber,
+                    solver.bounds,
+                    &solver.colliders,
+                    anim_time,
+                    is_2d,
+                );
+            }
+        }
+        total_mesh_render_time += t_png.elapsed().as_secs_f64();
+        match PngExporter::save_rgb(png_path, video_width, video_height, &rend.rgb_buffer) {
+            Ok(_) => println!(
+                "Saved {}x{} studio PNG image to: {}",
+                video_width,
+                video_height,
+                png_path.display()
+            ),
+            Err(e) => {
+                eprintln!("Error saving PNG {}: {}", png_path.display(), e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     if let Some(enc) = mp4_encoder {
         println!(
@@ -1685,25 +2124,31 @@ fn run_headless(
     println!("Render / Simulation complete!");
     println!("Total wall time:        {:.3}s", total_elapsed);
     println!("Frames completed:       {} / {}", completed_frames, total_frames);
-    println!(
-        "Avg physics step:       {:.2} ms/frame",
-        (total_sim_time / effective_frames as f64) * 1000.0
-    );
+    if completed_frames > 0 {
+        println!(
+            "Avg physics step:       {:.2} ms/frame",
+            (total_sim_time / effective_frames as f64) * 1000.0
+        );
+    }
     if total_mesh_render_time > 0.001 {
         println!(
             "Avg mesh + rasterize:   {:.2} ms/frame",
             (total_mesh_render_time / effective_frames as f64) * 1000.0
         );
     }
-    println!(
-        "Throughput:             {:.0} particle-steps/sec",
-        (solver.particle_count() * completed_frames) as f64 / total_sim_time.max(1e-5)
-    );
+    if completed_frames > 0 {
+        println!(
+            "Throughput:             {:.0} particle-steps/sec",
+            (solver.particle_count() * completed_frames) as f64 / total_sim_time.max(1e-5)
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_gui(
     args: Args,
+    loaded_scene: Option<SceneConfigFile>,
+    is_2d: bool,
     initial_preset: ScenePreset,
     initial_quality: SimulationQuality,
     initial_chamber: Chamber,
@@ -1711,82 +2156,132 @@ fn run_gui(
     parsed_faucets: Vec<Faucet>,
     parsed_drains: Vec<Drain>,
 ) -> Result<(), eframe::Error> {
-    if args.mode_2d {
-        eprintln!("Note: --2d is for headless CLI rendering only; switch between 3D and 2D directly using the toolbar button.");
-    }
     let window_title = "LiquidRust Studio — 2D/3D SPH & Surface Meshing";
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1360.0, 840.0])
-            .with_min_inner_size([920.0, 560.0])
+            .with_inner_size([1380.0, 860.0])
+            .with_min_inner_size([940.0, 560.0])
             .with_title(window_title),
         renderer: eframe::Renderer::Glow,
         depth_buffer: 24,
         ..Default::default()
     };
 
-    let render_mode = if args.surface_mesh {
-        RenderMode::SurfaceMesh
+    let render_mode_override = if args.surface_mesh {
+        Some(RenderMode::SurfaceMesh)
     } else {
-        RenderMode::from_slug(&args.render_mode)
+        args.render_mode.as_deref().map(RenderMode::from_slug)
     };
-    let mesh_cfg = build_mesh_config(&args);
-    let cam_override = build_camera(&args);
-    let has_cam_override = args.camera_azimuth.is_some()
+    let mesh_cfg = build_mesh_config(&args, loaded_scene.as_ref());
+    let (cam_override, orbit_override) = build_camera(&args, loaded_scene.as_ref(), is_2d);
+    let has_cam_override = loaded_scene.is_some()
+        || args.camera_azimuth.is_some()
         || args.camera_elevation.is_some()
         || args.camera_distance.is_some()
-        || args.camera_target.is_some();
+        || args.camera_target.is_some()
+        || args.fov.is_some()
+        || args.camera_orbit.is_some();
 
     eframe::run_native(
         "liquid-rust",
         native_options,
         Box::new(move |cc| {
             let mut app = LiquidApp::new(cc);
-            if (args.speed - 1.0).abs() > 1e-4 {
-                app.sim_speed = args.speed;
+
+            if let Some(ref sc) = loaded_scene {
+                app.apply_scene_config_file(sc);
+            } else {
+                if is_2d {
+                    app.set_2d(true);
+                }
+                app.solver.set_chamber(initial_chamber.clone());
+                app.load_preset(initial_preset);
+                if initial_quality != SimulationQuality::Medium {
+                    app.set_quality(initial_quality);
+                }
+            }
+
+            if args.mode_2d && !app.is_2d {
+                app.set_2d(true);
+            }
+            if args.chamber_shape.is_some()
+                || args.chamber_size.is_some()
+                || args.chamber_scale.is_some()
+                || args.tub_slope.is_some()
+                || args.tub_fillet.is_some()
+            {
+                app.solver.set_chamber(initial_chamber);
+            }
+            if args.preset.is_some() {
+                app.load_preset(initial_preset);
+            }
+            if args.quality.is_some() {
+                app.set_quality(initial_quality);
+            }
+            if let Some(spd) = args.speed {
+                app.sim_speed = spd.clamp(0.05, 4.0);
             }
             if args.cpu {
                 app.use_gpu = false;
             }
-            app.solver.set_chamber(initial_chamber);
-            app.load_preset(initial_preset);
-            if initial_quality != SimulationQuality::Medium {
-                app.set_quality(initial_quality);
-            }
-            if let Some(vort) = args.vorticity {
-                app.solver.config.vorticity = vort.clamp(0.0, 0.5);
-            }
-            if let Some(st) = args.surface_tension {
-                app.solver.config.surface_tension = st.clamp(0.0, 0.5);
-            }
-            if let Some(visc) = args.viscosity {
-                app.solver.config.viscosity = visc.clamp(0.0, 1.0);
-            }
 
-            app.render_mode = render_mode;
+            let mut fp = app.fluid_preset;
+            apply_cli_physics_overrides(&args, &mut app.solver.config, &mut fp);
+            app.fluid_preset = fp;
+
+            if let Some(rm) = render_mode_override {
+                app.render_mode = rm;
+            }
             app.mesh_config = mesh_cfg;
             app.sync_sun_angles_from_dir();
-            app.color_mode = parse_color_mode(&args.color_mode);
-            app.color_map = parse_color_map(&args.color_map);
-            app.video_width = args.video_width;
-            app.video_height = args.video_height;
-            if has_cam_override {
-                app.camera = cam_override;
+            if let Some(ref cm) = args.color_mode {
+                app.color_mode = parse_color_mode(cm);
+            }
+            if let Some(ref cmap) = args.color_map {
+                app.color_map = parse_color_map(cmap);
+            }
+            if let Some(ps) = args.particle_scale {
+                app.display_size_factor = ps.clamp(0.3, 3.0);
+            }
+            if args.no_particle_foam {
+                app.particle_foam = false;
+            }
+            if args.unlit_spheres {
+                app.lit_spheres = false;
+            }
+            if args.no_culling || !args.culling {
+                app.enable_culling = false;
             }
 
-            for c in parsed_colliders {
-                app.next_collider_id = app.next_collider_id.max(c.id + 1);
+            let (vw, vh) = resolve_video_dimensions(&args);
+            app.video_width = vw;
+            app.video_height = vh;
+            if has_cam_override {
+                app.camera = cam_override;
+                app.camera_orbit_speed_deg = orbit_override;
+            }
+
+            for mut c in parsed_colliders {
+                c.id = app.next_collider_id;
+                app.next_collider_id += 1;
                 app.solver.colliders.push(c);
             }
-            for f in parsed_faucets {
-                app.next_faucet_id = app.next_faucet_id.max(f.id + 1);
+            for mut f in parsed_faucets {
+                f.id = app.next_faucet_id;
+                app.next_faucet_id += 1;
                 app.solver.faucets.push(f);
             }
-            for d in parsed_drains {
-                app.next_drain_id = app.next_drain_id.max(d.id + 1);
+            for mut d in parsed_drains {
+                d.id = app.next_drain_id;
+                app.next_drain_id += 1;
                 app.solver.drains.push(d);
             }
+
+            if let Some(ref save_path) = args.save_scene {
+                app.save_scene_json(&save_path.to_string_lossy());
+            }
+
             Ok(Box::new(app))
         }),
     )
@@ -1805,6 +2300,18 @@ fn main() {
             false,
         ));
     }
+
+    let loaded_scene = if let Some(ref scene_path) = args.scene {
+        match SceneConfigFile::load_from_path(scene_path) {
+            Ok(sc) => Some(sc),
+            Err(e) => {
+                eprintln!("Error loading --scene '{}': {}", scene_path.display(), e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let mut parsed_colliders = Vec::new();
     for (i, spec) in args.obstacles.iter().enumerate() {
@@ -1839,8 +2346,23 @@ fn main() {
         }
     }
 
-    let preset = parse_preset(args.preset.as_deref(), !parsed_faucets.is_empty());
-    let chamber = match parse_chamber(&args) {
+    let is_2d = args.mode_2d || loaded_scene.as_ref().map_or(false, |s| s.is_2d);
+    let preset = if let Some(ref p_str) = args.preset {
+        parse_preset(Some(p_str), !parsed_faucets.is_empty())
+    } else if let Some(ref sc) = loaded_scene {
+        sc.parsed_preset()
+    } else {
+        parse_preset(None, !parsed_faucets.is_empty())
+    };
+    let quality = if let Some(ref q_str) = args.quality {
+        parse_quality(q_str)
+    } else if let Some(ref sc) = loaded_scene {
+        sc.parsed_quality()
+    } else {
+        SimulationQuality::Medium
+    };
+
+    let chamber = match parse_chamber_with_base(&args, loaded_scene.as_ref(), is_2d) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error parsing bounding box / chamber flags: {}", e);
@@ -1851,26 +2373,35 @@ fn main() {
     if args.headless
         || args.benchmark
         || args.export_mp4.is_some()
+        || args.export_png.is_some()
         || args.export_ply.is_some()
         || args.export_obj.is_some()
+        || args.save_scene.is_some()
     {
-        run_headless(args, chamber, parsed_colliders, parsed_faucets, parsed_drains);
+        run_headless(
+            args,
+            loaded_scene,
+            is_2d,
+            preset,
+            quality,
+            chamber,
+            parsed_colliders,
+            parsed_faucets,
+            parsed_drains,
+        );
     } else {
-        let mut initial_quality = parse_quality(&args.quality);
+        let mut initial_quality = quality;
         if initial_quality.is_cli_only() {
             eprintln!(
-                "Note: Quality '{}' is a high-density rendering-CLI-only mode; clamping interactive GUI to 'extreme'. Use --headless or --export-mp4 for offline CLI tiers.",
+                "Note: Quality '{}' is a high-density rendering-CLI-only mode; clamping interactive GUI to 'extreme'. Use --headless, --export-mp4, or --export-png for offline CLI tiers.",
                 initial_quality.slug()
             );
             initial_quality = SimulationQuality::Extreme;
         }
-        if args.render_quality.is_some() || args.resolution.is_some() {
-            eprintln!(
-                "Note: --render-quality and --resolution apply only to CLI offline renders (--headless, --export-mp4, --export-obj, --export-ply)."
-            );
-        }
         if let Err(e) = run_gui(
             args,
+            loaded_scene,
+            is_2d,
             preset,
             initial_quality,
             chamber,
@@ -1990,5 +2521,83 @@ mod tests {
         assert_eq!(stream_custom_r.shape, FaucetShape::Circle { radius: 0.115 });
         assert!((stream_custom_r.flow_rate - 450.0).abs() < 1e-4);
         assert!((stream_custom_r.spray_spread - 0.02).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_cli_substance_physics_and_studio_flags() {
+        let args = Args::try_parse_from([
+            "liquid-rust",
+            "--fluid-preset",
+            "mercury",
+            "--gravity",
+            "1.2,-3.71,0.0",
+            "--air-drag",
+            "0.60",
+            "--restitution",
+            "0.15",
+            "--friction",
+            "0.80",
+            "--substeps",
+            "5",
+            "--iterations",
+            "6",
+            "--tensile-k",
+            "0.0035",
+            "--max-velocity",
+            "22.0",
+            "--wave-amp",
+            "0.18",
+            "--wave-freq",
+            "1.25",
+            "--color-mode",
+            "foam",
+            "--color-map",
+            "inferno",
+            "--env-preset",
+            "sunset",
+            "--exposure",
+            "1.35",
+            "--no-grid",
+            "--no-wireframe",
+            "--fov",
+            "55.0",
+            "--camera-orbit",
+            "-24.0",
+            "--obstacle",
+            "cylinder:0,0.3,0:0.18:0.45:0.25:0.70",
+        ])
+        .expect("extended studio CLI flags should parse");
+
+        let mut cfg = SolverConfig::default();
+        let mut fp = FluidPhysicsPreset::Water;
+        apply_cli_physics_overrides(&args, &mut cfg, &mut fp);
+        assert_eq!(fp, FluidPhysicsPreset::Mercury);
+        assert!((cfg.gravity - Vec3::new(1.2, -3.71, 0.0)).length() < 1e-5);
+        assert!((cfg.air_drag - 0.60).abs() < 1e-5);
+        assert!((cfg.restitution - 0.15).abs() < 1e-5);
+        assert!((cfg.boundary_friction - 0.80).abs() < 1e-5);
+        assert_eq!(cfg.substeps, 5);
+        assert_eq!(cfg.solver_iterations, 6);
+        assert!((cfg.tensile_k - 0.0035).abs() < 1e-6);
+        assert!((cfg.max_velocity - 22.0).abs() < 1e-5);
+        assert!((cfg.wave_amplitude - 0.18).abs() < 1e-5);
+        assert!((cfg.wave_frequency - 1.25).abs() < 1e-5);
+
+        assert_eq!(parse_color_mode(args.color_mode.as_deref().unwrap()), ColorMode::Foam);
+        assert_eq!(parse_color_map(args.color_map.as_deref().unwrap()), ColorMapType::Inferno);
+
+        let mcfg = build_mesh_config(&args, None);
+        assert_eq!(mcfg.env_preset, EnvironmentPreset::GoldenSunset);
+        assert!((mcfg.exposure - 1.35).abs() < 1e-5);
+        assert!(!mcfg.show_grid);
+        assert!(!mcfg.show_wireframe);
+
+        let (cam, orb) = build_camera(&args, None, false);
+        assert!((cam.fov_y.to_degrees() - 55.0).abs() < 1e-4);
+        assert!((orb - -24.0).abs() < 1e-4);
+
+        let cyl = parse_obstacle(&args.obstacles[0], 0).unwrap();
+        assert!((cyl.restitution - 0.25).abs() < 1e-5);
+        assert!((cyl.friction - 0.70).abs() < 1e-5);
     }
 }

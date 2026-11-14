@@ -191,13 +191,26 @@ impl Collider {
 
                 if r2 < effective_r * effective_r && pos.y >= y_min && pos.y <= y_max {
                     let r = r2.sqrt();
-                    let normal = if r > 1e-6 {
-                        Vec3::new(dx / r, 0.0, dz / r)
+                    let d_side = effective_r - r;
+                    let d_top = y_max - pos.y;
+                    let d_bot = pos.y - y_min;
+
+                    let normal = if d_top <= d_side && d_top <= d_bot {
+                        pos.y = y_max;
+                        Vec3::Y
+                    } else if d_bot <= d_side && d_bot <= d_top {
+                        pos.y = y_min;
+                        Vec3::NEG_Y
                     } else {
-                        Vec3::X
+                        let radial_n = if r > 1e-6 {
+                            Vec3::new(dx / r, 0.0, dz / r)
+                        } else {
+                            Vec3::X
+                        };
+                        pos.x = center.x + radial_n.x * effective_r;
+                        pos.z = center.z + radial_n.z * effective_r;
+                        radial_n
                     };
-                    pos.x = center.x + normal.x * effective_r;
-                    pos.z = center.z + normal.z * effective_r;
 
                     let rel_vel = *vel - self.velocity;
                     let vn = rel_vel.dot(normal);

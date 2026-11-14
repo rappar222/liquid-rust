@@ -204,6 +204,31 @@ impl CubeFace {
             CubeFace::Custom => "Custom 3D Position",
         }
     }
+
+    pub fn slug(&self) -> &'static str {
+        match self {
+            CubeFace::Floor => "floor",
+            CubeFace::Left => "left",
+            CubeFace::Right => "right",
+            CubeFace::Back => "back",
+            CubeFace::Front => "front",
+            CubeFace::Ceiling => "ceiling",
+            CubeFace::Custom => "custom",
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "floor" | "bottom" => Some(CubeFace::Floor),
+            "ceiling" | "top" => Some(CubeFace::Ceiling),
+            "left" => Some(CubeFace::Left),
+            "right" => Some(CubeFace::Right),
+            "back" => Some(CubeFace::Back),
+            "front" => Some(CubeFace::Front),
+            "custom" => Some(CubeFace::Custom),
+            _ => None,
+        }
+    }
 }
 
 /// Fluid drain / sink that eliminates particles passing through its aperture

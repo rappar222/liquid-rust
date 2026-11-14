@@ -23,6 +23,32 @@ impl ChamberShape {
             ChamberShape::Bathtub => "Bathtub (Tub)",
         }
     }
+
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ChamberShape::Box => "box",
+            ChamberShape::Sphere => "sphere",
+            ChamberShape::Bathtub => "bathtub",
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "box" | "cuboid" | "cube" | "rect" => Some(ChamberShape::Box),
+            "sphere" | "globe" | "ball" => Some(ChamberShape::Sphere),
+            "bathtub" | "tub" | "bath" => Some(ChamberShape::Bathtub),
+            _ => None,
+        }
+    }
+}
+
+#[inline]
+fn safe_clamp(val: f32, min: f32, max: f32) -> f32 {
+    if min <= max {
+        val.clamp(min, max)
+    } else {
+        0.5 * (min + max)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -115,11 +141,14 @@ impl Chamber {
     }
 
     pub fn resolve_collision(&self, pos: &mut Vec3, radius: f32, bounds: &Aabb) {
+        let is_2d = (bounds.max.z - bounds.min.z) <= 0.15;
         match self.shape {
             ChamberShape::Box => {
-                pos.x = pos.x.clamp(bounds.min.x + radius, bounds.max.x - radius);
-                pos.y = pos.y.clamp(bounds.min.y + radius, bounds.max.y - radius);
-                pos.z = pos.z.clamp(bounds.min.z + radius, bounds.max.z - radius);
+                pos.x = safe_clamp(pos.x, bounds.min.x + radius, bounds.max.x - radius);
+                pos.y = safe_clamp(pos.y, bounds.min.y + radius, bounds.max.y - radius);
+                if !is_2d {
+                    pos.z = safe_clamp(pos.z, bounds.min.z + radius, bounds.max.z - radius);
+                }
             }
             ChamberShape::Sphere => {
                 let r_chamber = (bounds.max.y - bounds.min.y) * 0.5;
@@ -145,34 +174,36 @@ impl Chamber {
                 let fillet = (w * self.tub_fillet_ratio).min(w * 0.4);
 
                 // 1. Y floor and ceiling
-                pos.y = pos.y.clamp(b_min.y, b_max.y);
+                pos.y = safe_clamp(pos.y, b_min.y, b_max.y);
 
                 // 2. Sloped backrest at -X and front wall at +X
                 let norm_y = ((pos.y - bounds.min.y) / h).clamp(0.0, 1.0);
                 let x_back = b_min.x + (1.0 - norm_y) * slope_offset;
                 let x_front = b_max.x;
-                pos.x = pos.x.clamp(x_back, x_front);
+                pos.x = safe_clamp(pos.x, x_back, x_front);
 
-                // 3. Side walls at Z
-                let half_w = w * 0.5;
-                let cz = (bounds.min.z + bounds.max.z) * 0.5;
-                let z_rel = pos.z - cz;
-                let z_clamped = z_rel.clamp(-half_w + radius, half_w - radius);
-                pos.z = cz + z_clamped;
+                if !is_2d {
+                    // 3. Side walls at Z
+                    let half_w = w * 0.5;
+                    let cz = (bounds.min.z + bounds.max.z) * 0.5;
+                    let z_rel = pos.z - cz;
+                    let z_clamped = safe_clamp(z_rel, -half_w + radius, half_w - radius);
+                    pos.z = cz + z_clamped;
 
-                // 4. Fillet curves where floor meets side walls
-                if fillet > radius {
-                    let eff_fillet = fillet - radius;
-                    let dy = (pos.y - bounds.min.y) - fillet;
-                    let abs_z = (pos.z - cz).abs();
-                    let dz = abs_z - (half_w - fillet);
-                    if dy < 0.0 && dz > 0.0 {
-                        let d = (dy * dy + dz * dz).sqrt();
-                        if d > eff_fillet && d > 1e-6 {
-                            let factor = eff_fillet / d;
-                            pos.y = bounds.min.y + fillet + dy * factor;
-                            let new_z = (half_w - fillet) + dz * factor;
-                            pos.z = cz + (pos.z - cz).signum() * new_z;
+                    // 4. Fillet curves where floor meets side walls
+                    if fillet > radius {
+                        let eff_fillet = fillet - radius;
+                        let dy = (pos.y - bounds.min.y) - fillet;
+                        let abs_z = (pos.z - cz).abs();
+                        let dz = abs_z - (half_w - fillet);
+                        if dy < 0.0 && dz > 0.0 {
+                            let d = (dy * dy + dz * dz).sqrt();
+                            if d > eff_fillet && d > 1e-6 {
+                                let factor = eff_fillet / d;
+                                pos.y = bounds.min.y + fillet + dy * factor;
+                                let new_z = (half_w - fillet) + dz * factor;
+                                pos.z = cz + (pos.z - cz).signum() * new_z;
+                            }
                         }
                     }
                 }
@@ -191,8 +222,10 @@ impl Chamber {
         restitution: f32,
         friction: f32,
     ) {
+        let is_2d = (bounds.max.z - bounds.min.z) <= 0.15;
         let margin = (radius * 0.20).max(0.002);
-        let slip_floor = (1.0 - (1.0 - friction).max(0.0) * dt * 1.5).clamp(0.985, 1.0);
+        let no_slip_rate = (1.0 - friction).max(0.0) * 18.0;
+        let slip_floor = (1.0 / (1.0 + no_slip_rate * dt)).clamp(0.50, 1.0);
         let slip_wall = 1.0f32; // True free-slip smooth container walls
         let rest_threshold = 0.12; // m/s: below this normal speed, restitution is zero (inelastic resting)
         match self.shape {
@@ -235,23 +268,25 @@ impl Chamber {
                     vel.y *= slip_wall;
                     vel.z *= slip_wall;
                 }
-                if new_pos.z <= bounds.min.z + radius + margin && vel.z < 0.0 {
-                    if vel.z < -rest_threshold {
-                        vel.z = -vel.z * restitution;
-                    } else {
-                        vel.z = 0.0;
+                if !is_2d {
+                    if new_pos.z <= bounds.min.z + radius + margin && vel.z < 0.0 {
+                        if vel.z < -rest_threshold {
+                            vel.z = -vel.z * restitution;
+                        } else {
+                            vel.z = 0.0;
+                        }
+                        vel.x *= slip_wall;
+                        vel.y *= slip_wall;
                     }
-                    vel.x *= slip_wall;
-                    vel.y *= slip_wall;
-                }
-                if new_pos.z >= bounds.max.z - radius - margin && vel.z > 0.0 {
-                    if vel.z > rest_threshold {
-                        vel.z = -vel.z * restitution;
-                    } else {
-                        vel.z = 0.0;
+                    if new_pos.z >= bounds.max.z - radius - margin && vel.z > 0.0 {
+                        if vel.z > rest_threshold {
+                            vel.z = -vel.z * restitution;
+                        } else {
+                            vel.z = 0.0;
+                        }
+                        vel.x *= slip_wall;
+                        vel.y *= slip_wall;
                     }
-                    vel.x *= slip_wall;
-                    vel.y *= slip_wall;
                 }
             }
             ChamberShape::Sphere => {
@@ -310,15 +345,17 @@ impl Chamber {
                     vel.y *= slip_wall;
                     vel.z *= slip_wall;
                 }
-                if new_pos.z <= bounds.min.z + radius + margin && vel.z < 0.0 {
-                    vel.z = if vel.z < -rest_threshold { -vel.z * restitution } else { 0.0 };
-                    vel.x *= slip_wall;
-                    vel.y *= slip_wall;
-                }
-                if new_pos.z >= bounds.max.z - radius - margin && vel.z > 0.0 {
-                    vel.z = if vel.z > rest_threshold { -vel.z * restitution } else { 0.0 };
-                    vel.x *= slip_wall;
-                    vel.y *= slip_wall;
+                if !is_2d {
+                    if new_pos.z <= bounds.min.z + radius + margin && vel.z < 0.0 {
+                        vel.z = if vel.z < -rest_threshold { -vel.z * restitution } else { 0.0 };
+                        vel.x *= slip_wall;
+                        vel.y *= slip_wall;
+                    }
+                    if new_pos.z >= bounds.max.z - radius - margin && vel.z > 0.0 {
+                        vel.z = if vel.z > rest_threshold { -vel.z * restitution } else { 0.0 };
+                        vel.x *= slip_wall;
+                        vel.y *= slip_wall;
+                    }
                 }
             }
         }

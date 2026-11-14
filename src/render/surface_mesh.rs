@@ -449,6 +449,120 @@ impl CliRenderQuality {
     }
 }
 
+/// Studio lighting & sky backdrop presets shared across OpenGL viewport and offline MP4/PNG renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvironmentPreset {
+    StudioDark,
+    DaylightSky,
+    GoldenSunset,
+    ArcticLab,
+    AbyssalDeep,
+}
+
+impl EnvironmentPreset {
+    pub const ALL: &'static [EnvironmentPreset] = &[
+        EnvironmentPreset::StudioDark,
+        EnvironmentPreset::DaylightSky,
+        EnvironmentPreset::GoldenSunset,
+        EnvironmentPreset::ArcticLab,
+        EnvironmentPreset::AbyssalDeep,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            EnvironmentPreset::StudioDark => "Studio Dark (Default)",
+            EnvironmentPreset::DaylightSky => "Daylight Sky (Clear Noon)",
+            EnvironmentPreset::GoldenSunset => "Golden Sunset (Warm Rim)",
+            EnvironmentPreset::ArcticLab => "Arctic Lab (Clean Slate)",
+            EnvironmentPreset::AbyssalDeep => "Abyssal Deep (Midnight)",
+        }
+    }
+
+    pub fn slug(&self) -> &'static str {
+        match self {
+            EnvironmentPreset::StudioDark => "studio",
+            EnvironmentPreset::DaylightSky => "daylight",
+            EnvironmentPreset::GoldenSunset => "sunset",
+            EnvironmentPreset::ArcticLab => "arctic",
+            EnvironmentPreset::AbyssalDeep => "abyssal",
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "studio" | "dark" | "studio-dark" | "default" => Some(EnvironmentPreset::StudioDark),
+            "daylight" | "day" | "sky" | "noon" => Some(EnvironmentPreset::DaylightSky),
+            "sunset" | "golden" | "dusk" => Some(EnvironmentPreset::GoldenSunset),
+            "arctic" | "lab" | "light" => Some(EnvironmentPreset::ArcticLab),
+            "abyssal" | "deep" | "midnight" => Some(EnvironmentPreset::AbyssalDeep),
+            _ => None,
+        }
+    }
+
+    /// Background sky linear-space `(nadir_low, zenith_high)` gradient.
+    pub fn bg_gradient_linear(&self) -> (Vec3, Vec3) {
+        match self {
+            EnvironmentPreset::StudioDark => {
+                (Vec3::new(0.012, 0.016, 0.026), Vec3::new(0.036, 0.052, 0.082))
+            }
+            EnvironmentPreset::DaylightSky => {
+                (Vec3::new(0.090, 0.150, 0.250), Vec3::new(0.035, 0.095, 0.240))
+            }
+            EnvironmentPreset::GoldenSunset => {
+                (Vec3::new(0.110, 0.052, 0.042), Vec3::new(0.028, 0.036, 0.085))
+            }
+            EnvironmentPreset::ArcticLab => {
+                (Vec3::new(0.065, 0.082, 0.110), Vec3::new(0.110, 0.145, 0.195))
+            }
+            EnvironmentPreset::AbyssalDeep => {
+                (Vec3::new(0.003, 0.006, 0.014), Vec3::new(0.008, 0.018, 0.038))
+            }
+        }
+    }
+
+    /// Approximate sRGB `[0..255]` background color for the OpenGL viewport canvas.
+    pub fn viewport_bg_rgb8(&self) -> [u8; 3] {
+        match self {
+            EnvironmentPreset::StudioDark => [11, 13, 19],
+            EnvironmentPreset::DaylightSky => [24, 42, 72],
+            EnvironmentPreset::GoldenSunset => [30, 19, 24],
+            EnvironmentPreset::ArcticLab => [34, 42, 54],
+            EnvironmentPreset::AbyssalDeep => [5, 8, 14],
+        }
+    }
+
+    /// Linear `(horizon, zenith, ground)` reflection colors for dielectric/metallic Fresnel reflections.
+    pub fn sky_reflection_linear(&self) -> (Vec3, Vec3, Vec3) {
+        match self {
+            EnvironmentPreset::StudioDark => (
+                Vec3::new(0.24, 0.36, 0.52),
+                Vec3::new(0.08, 0.16, 0.30),
+                Vec3::new(0.025, 0.032, 0.045),
+            ),
+            EnvironmentPreset::DaylightSky => (
+                Vec3::new(0.55, 0.74, 0.95),
+                Vec3::new(0.14, 0.36, 0.76),
+                Vec3::new(0.05, 0.07, 0.10),
+            ),
+            EnvironmentPreset::GoldenSunset => (
+                Vec3::new(0.88, 0.44, 0.22),
+                Vec3::new(0.16, 0.14, 0.34),
+                Vec3::new(0.04, 0.025, 0.03),
+            ),
+            EnvironmentPreset::ArcticLab => (
+                Vec3::new(0.62, 0.70, 0.80),
+                Vec3::new(0.32, 0.42, 0.56),
+                Vec3::new(0.08, 0.10, 0.13),
+            ),
+            EnvironmentPreset::AbyssalDeep => (
+                Vec3::new(0.08, 0.20, 0.34),
+                Vec3::new(0.02, 0.06, 0.14),
+                Vec3::new(0.008, 0.012, 0.022),
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SurfaceMeshConfig {
     // 1. Meshing Geometry
@@ -470,7 +584,7 @@ pub struct SurfaceMeshConfig {
     pub texture_scale: f32,       // Spatial frequency (default 6.0)
     pub texture_strength: f32,    // Bump & pattern intensity [0.0..1.0] (default 0.30)
 
-    // 4. Light Behavior & Optics
+    // 4. Light Behavior, Studio Environment & Optics
     pub ior: f32,                 // Index of refraction (1.333 for water)
     pub roughness: f32,           // GGX microfacet roughness [0.01..1.0]
     pub specular_intensity: f32,  // Direct sun specular highlight multiplier
@@ -480,8 +594,12 @@ pub struct SurfaceMeshConfig {
     pub metallic: f32,            // Metallic reflectance [0.0..1.0]
     pub light_dir: Vec3,          // Normalized key sun direction
     pub light_intensity: f32,     // Key light radiance
-    pub ambient_intensity: f32,     // Hemisphere ambient illumination
-    pub cast_shadows: bool,         // Floor shadow & caustic projection in CLI renders
+    pub ambient_intensity: f32,   // Hemisphere ambient illumination
+    pub cast_shadows: bool,       // Floor shadow & caustic projection in CLI renders
+    pub env_preset: EnvironmentPreset, // Sky & reflection environment preset
+    pub exposure: f32,            // Filmic camera exposure multiplier (default 1.0)
+    pub show_wireframe: bool,     // Render chamber/obstacle/emitter wireframes
+    pub show_grid: bool,          // Render 3D studio floor grid
     // 5. Resolution & Smoothing Ceilings (raised for offline CLI modes)
     pub max_grid_cells: f32,        // Max marching-cubes cells along longest axis (default 260)
     pub min_voxel_size: f32,        // Minimum marching-cubes voxel size in meters (default 0.0025)
@@ -515,6 +633,10 @@ impl Default for SurfaceMeshConfig {
             light_intensity: 1.25,
             ambient_intensity: 0.32,
             cast_shadows: true,
+            env_preset: EnvironmentPreset::StudioDark,
+            exposure: 1.0,
+            show_wireframe: true,
+            show_grid: true,
             max_grid_cells: 260.0,
             min_voxel_size: 0.0025,
             max_smoothing_passes: 10,
@@ -809,7 +931,11 @@ impl SurfaceMesh {
         // Collect fluid particles
         let fluid_positions: Vec<Vec3> = particles
             .iter()
-            .filter(|p| p.particle_type == ParticleType::Fluid)
+            .filter(|p| {
+                p.particle_type == ParticleType::Fluid
+                    && p.position.is_finite()
+                    && p.velocity.is_finite()
+            })
             .map(|p| p.position)
             .collect();
         if fluid_positions.is_empty() {
@@ -817,7 +943,11 @@ impl SurfaceMesh {
         }
         let fluid_velocities: Vec<Vec3> = particles
             .iter()
-            .filter(|p| p.particle_type == ParticleType::Fluid)
+            .filter(|p| {
+                p.particle_type == ParticleType::Fluid
+                    && p.position.is_finite()
+                    && p.velocity.is_finite()
+            })
             .map(|p| p.velocity)
             .collect();
 

@@ -1743,3 +1743,201 @@ fn test_scene_json_roundtrip_and_cli_command_flags() {
     assert!((app2.mesh_config.exposure - 1.25).abs() < 1e-5);
     assert!((app2.camera_orbit_speed_deg - 12.5).abs() < 1e-5);
 }
+
+#[test]
+fn test_gpu_surface_field_parity_with_cpu_marching_cubes() {
+    use liquid_rust::gpu::{GpuSphSolver, GpuSurfaceField};
+    use liquid_rust::render::{SurfaceMesh, SurfaceMeshConfig};
+    use liquid_rust::sph::{SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver};
+    use std::sync::Arc;
+
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.5), Vec3::new(0.8, 1.0, 0.5));
+    let mut solver = SphSolver::new(bounds, SolverConfig::default());
+    solver.apply_quality(SimulationQuality::Medium);
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DamBreak);
+
+    let Ok(mut gpu) = GpuSphSolver::new(solver.bounds, &solver.config, &solver.particles) else {
+        return;
+    };
+    for _ in 0..8 {
+        gpu.step(
+            solver.bounds,
+            &solver.chamber,
+            &solver.config,
+            &solver.colliders,
+            solver.mouse_ray,
+            solver.mouse_force_strength,
+            solver.mouse_force_mode,
+            1.0 / 60.0,
+            false,
+        );
+    }
+    gpu.read_particles(&mut solver.particles);
+
+    let mut gpu_field = GpuSurfaceField::new(Arc::clone(&gpu.device), Arc::clone(&gpu.queue))
+        .expect("GpuSurfaceField creation");
+    let cfg = SurfaceMeshConfig::default();
+
+    let cpu_mesh = SurfaceMesh::from_particles(
+        &solver.particles,
+        solver.config.particle_radius,
+        solver.config.smoothing_length,
+        &cfg,
+    );
+    let gpu_mesh = SurfaceMesh::from_particles_with_gpu(
+        &solver.particles,
+        solver.config.particle_radius,
+        solver.config.smoothing_length,
+        &cfg,
+        &mut gpu_field,
+    );
+
+    assert!(!cpu_mesh.is_empty());
+    assert_eq!(cpu_mesh.vertices.len(), gpu_mesh.vertices.len());
+    assert_eq!(cpu_mesh.indices.len(), gpu_mesh.indices.len());
+
+    // Bounding box parity check across vertex positions
+    let mut max_pos_diff = 0.0f32;
+    for (cv, gv) in cpu_mesh.vertices.iter().zip(gpu_mesh.vertices.iter()) {
+        let d = (Vec3::from_array(cv.position) - Vec3::from_array(gv.position)).length();
+        max_pos_diff = max_pos_diff.max(d);
+    }
+    assert!(
+        max_pos_diff < 1e-4,
+        "GPU surface field vertex positions should match CPU within 1e-4, got {}",
+        max_pos_diff
+    );
+}
+
+#[test]
+fn test_gpu_renderer_particles_and_mesh_visual_parity() {
+    use liquid_rust::export::SoftwareRenderer;
+    use liquid_rust::gpu::{GpuRenderer, GpuSphSolver};
+    use liquid_rust::render::{
+        Camera, CliRenderQuality, ColorMapType, ColorMode, FluidMaterialPreset, SurfaceMesh,
+        SurfaceMeshConfig,
+    };
+    use liquid_rust::sph::{
+        Collider, SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver,
+    };
+    use std::sync::Arc;
+
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.5), Vec3::new(0.8, 1.0, 0.5));
+    let mut solver = SphSolver::new(bounds, SolverConfig::default());
+    solver.apply_quality(SimulationQuality::Medium);
+    solver.colliders.push(Collider::sphere(Vec3::new(0.15, 0.25, 0.0), 0.14));
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DamBreak);
+
+    let Ok(mut gpu) = GpuSphSolver::new(solver.bounds, &solver.config, &solver.particles) else {
+        return;
+    };
+    for _ in 0..5 {
+        gpu.step(
+            solver.bounds,
+            &solver.chamber,
+            &solver.config,
+            &solver.colliders,
+            solver.mouse_ray,
+            solver.mouse_force_strength,
+            solver.mouse_force_mode,
+            1.0 / 60.0,
+            false,
+        );
+    }
+    gpu.read_particles(&mut solver.particles);
+
+    let (w, h) = (320usize, 180usize);
+    let cam = Camera::default();
+    let mut gpu_rend = GpuRenderer::new_with_device(
+        Arc::clone(&gpu.device),
+        Arc::clone(&gpu.queue),
+        gpu.device_name.clone(),
+        w,
+        h,
+        CliRenderQuality::Studio,
+    )
+    .expect("GpuRenderer init");
+    let mut cpu_rend = SoftwareRenderer::new_with_quality(w, h, CliRenderQuality::Studio);
+
+    // 1. Direct GPU-buffer particle rendering (zero CPU readback path)
+    let p_buf = gpu.particle_buffer().expect("particle buffer");
+    gpu_rend.render_particles_from_gpu_buffer(
+        p_buf,
+        gpu.particle_count,
+        solver.config.particle_radius,
+        &solver.chamber,
+        solver.bounds,
+        &solver.colliders,
+        &cam,
+        ColorMode::Velocity,
+        ColorMapType::Ocean,
+        solver.config.rest_density,
+        false,
+    );
+    cpu_rend.render_particles_studio(
+        &solver.particles,
+        solver.config.particle_radius,
+        &solver.chamber,
+        solver.bounds,
+        &solver.colliders,
+        &cam,
+        ColorMode::Velocity,
+        ColorMapType::Ocean,
+        solver.config.rest_density,
+        false,
+    );
+
+    let mean_luma = |buf: &[u8]| -> f64 {
+        buf.iter().map(|&b| b as f64).sum::<f64>() / buf.len().max(1) as f64
+    };
+    let l_gpu_p = mean_luma(&gpu_rend.rgb_buffer);
+    let l_cpu_p = mean_luma(&cpu_rend.rgb_buffer);
+    assert!(
+        (l_gpu_p - l_cpu_p).abs() < 12.0,
+        "GPU vs CPU particle luma mismatch: gpu={:.2} cpu={:.2}",
+        l_gpu_p,
+        l_cpu_p
+    );
+
+    // 2. SurfaceMesh ClearWater + LiquidChrome (Mercury)
+    let mut mesh_cfg = SurfaceMeshConfig::default();
+    let mesh = SurfaceMesh::from_particles(
+        &solver.particles,
+        solver.config.particle_radius,
+        solver.config.smoothing_length,
+        &mesh_cfg,
+    );
+    for preset in [FluidMaterialPreset::ClearWater, FluidMaterialPreset::LiquidChrome] {
+        preset.apply(&mut mesh_cfg);
+        gpu_rend.render_surface_mesh_frame(
+            &mesh,
+            &mesh_cfg,
+            &cam,
+            &solver.chamber,
+            solver.bounds,
+            &solver.colliders,
+            0.25,
+            false,
+        );
+        cpu_rend.render_surface_mesh_frame(
+            &mesh,
+            &mesh_cfg,
+            &cam,
+            &solver.chamber,
+            solver.bounds,
+            &solver.colliders,
+            0.25,
+            false,
+        );
+        let lg = mean_luma(&gpu_rend.rgb_buffer);
+        let lc = mean_luma(&cpu_rend.rgb_buffer);
+        assert!(
+            (lg - lc).abs() < 15.0,
+            "{:?} GPU vs CPU luma mismatch: gpu={:.2} cpu={:.2}",
+            preset,
+            lg,
+            lc
+        );
+    }
+}
+

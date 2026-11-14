@@ -899,4 +899,14 @@ impl GpuSphSolver {
             r_buf.unmap();
         }
     }
+
+    /// Direct handle to the live GPU particle storage buffer (`array<GpuParticle>`).
+    pub fn particle_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.particle_buf.as_ref()
+    }
+
+    /// Whether the active GPU adapter permits storage buffer bindings in vertex shaders.
+    pub fn supports_vertex_storage(&self) -> bool {
+        self.device.limits().max_storage_buffers_per_shader_stage >= 1
+    }
 }

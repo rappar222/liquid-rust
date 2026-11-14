@@ -914,6 +914,428 @@ struct RawEdgeVertex {
     vel: Vec3,
 }
 
+struct SurfaceGridData {
+    fluid_positions: Vec<Vec3>,
+    fluid_velocities: Vec<Vec3>,
+    splat_radius: f32,
+    voxel_size: f32,
+    grid_min: Vec3,
+    grid_max: Vec3,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    iso: f32,
+    active_brick_coords: Vec<[usize; 3]>,
+}
+
+fn prepare_surface_grid(
+    particles: &[Particle],
+    particle_radius: f32,
+    smoothing_length: f32,
+    config: &SurfaceMeshConfig,
+) -> Option<SurfaceGridData> {
+    let mut fluid_positions = Vec::with_capacity(particles.len());
+    let mut fluid_velocities = Vec::with_capacity(particles.len());
+    let mut min_p = Vec3::splat(f32::INFINITY);
+    let mut max_p = Vec3::splat(f32::NEG_INFINITY);
+
+    for p in particles {
+        if p.particle_type == ParticleType::Fluid
+            && p.position.is_finite()
+            && p.velocity.is_finite()
+        {
+            fluid_positions.push(p.position);
+            fluid_velocities.push(p.velocity);
+            min_p = min_p.min(p.position);
+            max_p = max_p.max(p.position);
+        }
+    }
+
+    if fluid_positions.is_empty() {
+        return None;
+    }
+
+    let kernel_scale = config.kernel_scale.clamp(0.6, 2.0);
+    let splat_radius =
+        (particle_radius * 3.05).max(smoothing_length * 1.32) * kernel_scale;
+
+    let min_voxel = config.min_voxel_size.max(0.00025);
+    let mut voxel_size =
+        (particle_radius * config.voxel_scale.clamp(0.30, 1.8)).max(min_voxel);
+
+    let pad = splat_radius + voxel_size * 2.0;
+    let grid_min = min_p - Vec3::splat(pad);
+    let grid_max = max_p + Vec3::splat(pad);
+    let extent = grid_max - grid_min;
+
+    let max_axis_extent = extent.x.max(extent.y).max(extent.z);
+    let max_cells_axis = config.max_grid_cells.max(32.0);
+    if max_axis_extent / voxel_size > max_cells_axis {
+        voxel_size = max_axis_extent / max_cells_axis;
+    }
+
+    let nx = ((extent.x / voxel_size).ceil() as usize).max(2);
+    let ny = ((extent.y / voxel_size).ceil() as usize).max(2);
+    let nz = ((extent.z / voxel_size).ceil() as usize).max(2);
+
+    let bricks_x = (nx + BRICK_DIM - 1) / BRICK_DIM;
+    let bricks_y = (ny + BRICK_DIM - 1) / BRICK_DIM;
+    let bricks_z = (nz + BRICK_DIM - 1) / BRICK_DIM;
+    let total_bricks = bricks_x * bricks_y * bricks_z;
+
+    let mut brick_active = vec![false; total_bricks];
+    let inv_brick_size = 1.0 / (voxel_size * BRICK_DIM as f32);
+
+    for &pos in &fluid_positions {
+        let b_min = ((pos - Vec3::splat(splat_radius) - grid_min) * inv_brick_size)
+            .floor()
+            .as_ivec3();
+        let b_max = ((pos + Vec3::splat(splat_radius) - grid_min) * inv_brick_size)
+            .floor()
+            .as_ivec3();
+
+        let z0 = b_min.z.clamp(0, bricks_z as i32 - 1) as usize;
+        let z1 = b_max.z.clamp(0, bricks_z as i32 - 1) as usize;
+        let y0 = b_min.y.clamp(0, bricks_y as i32 - 1) as usize;
+        let y1 = b_max.y.clamp(0, bricks_y as i32 - 1) as usize;
+        let x0 = b_min.x.clamp(0, bricks_x as i32 - 1) as usize;
+        let x1 = b_max.x.clamp(0, bricks_x as i32 - 1) as usize;
+
+        for bz in z0..=z1 {
+            for by in y0..=y1 {
+                let row = (bz * bricks_y + by) * bricks_x;
+                for bx in x0..=x1 {
+                    brick_active[row + bx] = true;
+                }
+            }
+        }
+    }
+
+    let active_brick_coords: Vec<[usize; 3]> = brick_active
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &active)| {
+            if !active {
+                return None;
+            }
+            let bx = idx % bricks_x;
+            let rem = idx / bricks_x;
+            let by = rem % bricks_y;
+            let bz = rem / bricks_y;
+            Some([bx, by, bz])
+        })
+        .collect();
+
+    if active_brick_coords.is_empty() {
+        return None;
+    }
+
+    Some(SurfaceGridData {
+        fluid_positions,
+        fluid_velocities,
+        splat_radius,
+        voxel_size,
+        grid_min,
+        grid_max,
+        nx,
+        ny,
+        nz,
+        iso: config.iso_value.clamp(0.08, 0.92),
+        active_brick_coords,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_brick_mc_triangles<F>(
+    bx: usize,
+    by: usize,
+    bz: usize,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    grid_min: Vec3,
+    voxel_size: f32,
+    iso: f32,
+    mut corner_sample: F,
+) -> Vec<[RawEdgeVertex; 3]>
+where
+    F: FnMut(usize) -> (f32, Vec3),
+{
+    const STRIDE_Y: usize = BRICK_DIM + 1;
+    const STRIDE_Z: usize = STRIDE_Y * STRIDE_Y;
+
+    let gx0 = bx * BRICK_DIM;
+    let gy0 = by * BRICK_DIM;
+    let gz0 = bz * BRICK_DIM;
+    let cells_x = BRICK_DIM.min(nx.saturating_sub(gx0));
+    let cells_y = BRICK_DIM.min(ny.saturating_sub(gy0));
+    let cells_z = BRICK_DIM.min(nz.saturating_sub(gz0));
+
+    let mut tris = Vec::new();
+    for lz in 0..cells_z {
+        for ly in 0..cells_y {
+            for lx in 0..cells_x {
+                let c0 = lz * STRIDE_Z + ly * STRIDE_Y + lx;
+                let c1 = c0 + 1;
+                let c2 = c0 + STRIDE_Y + 1;
+                let c3 = c0 + STRIDE_Y;
+                let c4 = c0 + STRIDE_Z;
+                let c5 = c4 + 1;
+                let c6 = c4 + STRIDE_Y + 1;
+                let c7 = c4 + STRIDE_Y;
+
+                let (v0, vel0) = corner_sample(c0);
+                let (v1, vel1) = corner_sample(c1);
+                let (v2, vel2) = corner_sample(c2);
+                let (v3, vel3) = corner_sample(c3);
+                let (v4, vel4) = corner_sample(c4);
+                let (v5, vel5) = corner_sample(c5);
+                let (v6, vel6) = corner_sample(c6);
+                let (v7, vel7) = corner_sample(c7);
+                let v = [v0, v1, v2, v3, v4, v5, v6, v7];
+
+                let mut cube_index = 0usize;
+                if v[0] >= iso { cube_index |= 1; }
+                if v[1] >= iso { cube_index |= 2; }
+                if v[2] >= iso { cube_index |= 4; }
+                if v[3] >= iso { cube_index |= 8; }
+                if v[4] >= iso { cube_index |= 16; }
+                if v[5] >= iso { cube_index |= 32; }
+                if v[6] >= iso { cube_index |= 64; }
+                if v[7] >= iso { cube_index |= 128; }
+
+                let edge_mask = MC_EDGE_TABLE[cube_index];
+                if edge_mask == 0 {
+                    continue;
+                }
+
+                let gx = gx0 + lx;
+                let gy = gy0 + ly;
+                let gz = gz0 + lz;
+                let p0 = grid_min + Vec3::new(gx as f32, gy as f32, gz as f32) * voxel_size;
+
+                let corner_pos = [
+                    p0,
+                    p0 + Vec3::new(voxel_size, 0.0, 0.0),
+                    p0 + Vec3::new(voxel_size, voxel_size, 0.0),
+                    p0 + Vec3::new(0.0, voxel_size, 0.0),
+                    p0 + Vec3::new(0.0, 0.0, voxel_size),
+                    p0 + Vec3::new(voxel_size, 0.0, voxel_size),
+                    p0 + Vec3::new(voxel_size, voxel_size, voxel_size),
+                    p0 + Vec3::new(0.0, voxel_size, voxel_size),
+                ];
+                let corner_vel = [vel0, vel1, vel2, vel3, vel4, vel5, vel6, vel7];
+
+                let mut edge_verts = [RawEdgeVertex {
+                    key: 0,
+                    pos: Vec3::ZERO,
+                    vel: Vec3::ZERO,
+                }; 12];
+
+                for e in 0..12 {
+                    if (edge_mask & (1 << e)) != 0 {
+                        let (a, b) = MC_EDGE_CORNERS[e];
+                        let va = v[a];
+                        let vb = v[b];
+                        let denom = vb - va;
+                        let t = if denom.abs() > 1e-6 {
+                            ((iso - va) / denom).clamp(0.0, 1.0)
+                        } else {
+                            0.5
+                        };
+                        let pos = corner_pos[a].lerp(corner_pos[b], t);
+                        let vel = corner_vel[a].lerp(corner_vel[b], t);
+                        let key = pack_grid_edge_key(gx, gy, gz, e);
+                        edge_verts[e] = RawEdgeVertex { key, pos, vel };
+                    }
+                }
+
+                let row = &MC_TRI_TABLE[cube_index];
+                let mut t_idx = 0;
+                while t_idx < 15 && row[t_idx] != -1 {
+                    let e0 = row[t_idx] as usize;
+                    let e1 = row[t_idx + 1] as usize;
+                    let e2 = row[t_idx + 2] as usize;
+                    tris.push([edge_verts[e0], edge_verts[e2], edge_verts[e1]]);
+                    t_idx += 3;
+                }
+            }
+        }
+    }
+    tris
+}
+
+fn finalize_surface_mesh(
+    brick_outputs: Vec<Vec<[RawEdgeVertex; 3]>>,
+    config: &SurfaceMeshConfig,
+) -> SurfaceMesh {
+    let total_tris: usize = brick_outputs.iter().map(|v| v.len()).sum();
+    if total_tris == 0 {
+        return SurfaceMesh::default();
+    }
+
+    let mut key_to_idx: HashMap<u64, u32> = HashMap::with_capacity(total_tris);
+    let mut positions: Vec<Vec3> = Vec::with_capacity(total_tris / 2 + 16);
+    let mut velocities: Vec<Vec3> = Vec::with_capacity(total_tris / 2 + 16);
+    let mut indices: Vec<u32> = Vec::with_capacity(total_tris * 3);
+
+    for brick_tris in &brick_outputs {
+        for tri in brick_tris {
+            let mut tri_idx = [0u32; 3];
+            for k in 0..3 {
+                let ev = tri[k];
+                let v_id = *key_to_idx.entry(ev.key).or_insert_with(|| {
+                    let id = positions.len() as u32;
+                    positions.push(ev.pos);
+                    velocities.push(ev.vel);
+                    id
+                });
+                tri_idx[k] = v_id;
+            }
+            if tri_idx[0] != tri_idx[1] && tri_idx[1] != tri_idx[2] && tri_idx[2] != tri_idx[0] {
+                indices.push(tri_idx[0]);
+                indices.push(tri_idx[1]);
+                indices.push(tri_idx[2]);
+            }
+        }
+    }
+
+    let v_count = positions.len();
+    if v_count == 0 || indices.is_empty() {
+        return SurfaceMesh::default();
+    }
+
+    let smooth_iters = config
+        .smoothing_passes
+        .min(config.max_smoothing_passes.max(1));
+    if smooth_iters > 0 {
+        let mut sum_pos = vec![Vec3::ZERO; v_count];
+        let mut sum_vel = vec![Vec3::ZERO; v_count];
+        let mut valence = vec![0u32; v_count];
+
+        let taubin_step = |positions: &mut [Vec3],
+                           velocities: &mut [Vec3],
+                           sum_pos: &mut [Vec3],
+                           sum_vel: &mut [Vec3],
+                           valence: &mut [u32],
+                           factor: f32,
+                           smooth_vel: bool| {
+            sum_pos.fill(Vec3::ZERO);
+            if smooth_vel {
+                sum_vel.fill(Vec3::ZERO);
+            }
+            valence.fill(0);
+
+            for tri in indices.chunks_exact(3) {
+                let i0 = tri[0] as usize;
+                let i1 = tri[1] as usize;
+                let i2 = tri[2] as usize;
+
+                let p0 = positions[i0];
+                let p1 = positions[i1];
+                let p2 = positions[i2];
+
+                sum_pos[i0] += p1 + p2;
+                sum_pos[i1] += p2 + p0;
+                sum_pos[i2] += p0 + p1;
+
+                valence[i0] += 2;
+                valence[i1] += 2;
+                valence[i2] += 2;
+
+                if smooth_vel {
+                    let v0 = velocities[i0];
+                    let v1 = velocities[i1];
+                    let v2 = velocities[i2];
+                    sum_vel[i0] += v1 + v2;
+                    sum_vel[i1] += v2 + v0;
+                    sum_vel[i2] += v0 + v1;
+                }
+            }
+
+            for i in 0..positions.len() {
+                let deg = valence[i];
+                if deg > 0 {
+                    let inv_deg = 1.0 / deg as f32;
+                    let avg_p = sum_pos[i] * inv_deg;
+                    positions[i] += (avg_p - positions[i]) * factor;
+                    if smooth_vel {
+                        let avg_v = sum_vel[i] * inv_deg;
+                        velocities[i] = velocities[i].lerp(avg_v, 0.35);
+                    }
+                }
+            }
+        };
+
+        let lambda = 0.50f32;
+        let mu = -0.522f32;
+        for _ in 0..smooth_iters {
+            taubin_step(
+                &mut positions,
+                &mut velocities,
+                &mut sum_pos,
+                &mut sum_vel,
+                &mut valence,
+                lambda,
+                true,
+            );
+            taubin_step(
+                &mut positions,
+                &mut velocities,
+                &mut sum_pos,
+                &mut sum_vel,
+                &mut valence,
+                mu,
+                false,
+            );
+        }
+        taubin_step(
+            &mut positions,
+            &mut velocities,
+            &mut sum_pos,
+            &mut sum_vel,
+            &mut valence,
+            0.24,
+            false,
+        );
+    }
+
+    let mut normals = vec![Vec3::ZERO; v_count];
+    for tri in indices.chunks_exact(3) {
+        let i0 = tri[0] as usize;
+        let i1 = tri[1] as usize;
+        let i2 = tri[2] as usize;
+        let e1 = positions[i1] - positions[i0];
+        let e2 = positions[i2] - positions[i0];
+        let fn_area = e1.cross(e2);
+        normals[i0] += fn_area;
+        normals[i1] += fn_area;
+        normals[i2] += fn_area;
+    }
+
+    let vertices: Vec<MeshVertex> = (0..v_count)
+        .into_par_iter()
+        .map(|i| {
+            let n = if normals[i].length_squared() > 1e-16 {
+                normals[i].normalize()
+            } else {
+                Vec3::Y
+            };
+            let speed = velocities[i].length();
+            let upward_splash = (velocities[i].y * 0.25).clamp(0.0, 0.4);
+            let foam = ((speed - 1.35) / 2.6 + upward_splash).clamp(0.0, 1.0);
+            MeshVertex {
+                position: positions[i].to_array(),
+                normal: n.to_array(),
+                speed,
+                foam,
+            }
+        })
+        .collect();
+
+    SurfaceMesh { vertices, indices }
+}
+
 impl SurfaceMesh {
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty() || self.vertices.is_empty()
@@ -921,6 +1343,162 @@ impl SurfaceMesh {
 
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
+    }
+
+    fn from_grid_cpu(grid: &SurfaceGridData, config: &SurfaceMeshConfig) -> Self {
+        let splat_r2 = grid.splat_radius * grid.splat_radius;
+        let inv_splat_r2 = 1.0 / splat_r2.max(1e-10);
+        let mut p_grid = SpatialHashGrid::new(grid.splat_radius, grid.fluid_positions.len());
+        p_grid.build(&grid.fluid_positions);
+
+        let brick_outputs: Vec<Vec<[RawEdgeVertex; 3]>> = grid
+            .active_brick_coords
+            .par_iter()
+            .map(|&[bx, by, bz]| {
+                let gx0 = bx * BRICK_DIM;
+                let gy0 = by * BRICK_DIM;
+                let gz0 = bz * BRICK_DIM;
+
+                let cells_x = BRICK_DIM.min(grid.nx.saturating_sub(gx0));
+                let cells_y = BRICK_DIM.min(grid.ny.saturating_sub(gy0));
+                let cells_z = BRICK_DIM.min(grid.nz.saturating_sub(gz0));
+
+                const STRIDE_Y: usize = BRICK_DIM + 1;
+                const STRIDE_Z: usize = STRIDE_Y * STRIDE_Y;
+                let mut field = [0.0f32; (BRICK_DIM + 1) * (BRICK_DIM + 1) * (BRICK_DIM + 1)];
+                let mut vels = [Vec3::ZERO; (BRICK_DIM + 1) * (BRICK_DIM + 1) * (BRICK_DIM + 1)];
+
+                let mut any_inside = false;
+                let mut any_outside = false;
+
+                for lz in 0..=cells_z {
+                    let wz = grid.grid_min.z + (gz0 + lz) as f32 * grid.voxel_size;
+                    for ly in 0..=cells_y {
+                        let wy = grid.grid_min.y + (gy0 + ly) as f32 * grid.voxel_size;
+                        for lx in 0..=cells_x {
+                            let wx = grid.grid_min.x + (gx0 + lx) as f32 * grid.voxel_size;
+                            let sample_pos = Vec3::new(wx, wy, wz);
+
+                            let mut sum_val = 0.0f32;
+                            let mut weighted_vel = Vec3::ZERO;
+
+                            p_grid.for_each_neighbor(sample_pos, |j| {
+                                let d2 = sample_pos.distance_squared(grid.fluid_positions[j]);
+                                if d2 < splat_r2 {
+                                    let t = 1.0 - d2 * inv_splat_r2;
+                                    let w = t * t * t;
+                                    sum_val += w;
+                                    weighted_vel += grid.fluid_velocities[j] * w;
+                                }
+                            });
+
+                            let phi = sum_val / (1.0 + sum_val * 0.35);
+                            let idx = lz * STRIDE_Z + ly * STRIDE_Y + lx;
+                            field[idx] = phi;
+                            if sum_val > 1e-6 {
+                                vels[idx] = weighted_vel / sum_val;
+                            }
+
+                            if phi >= grid.iso {
+                                any_inside = true;
+                            } else {
+                                any_outside = true;
+                            }
+                        }
+                    }
+                }
+
+                if !any_inside || !any_outside {
+                    return Vec::new();
+                }
+
+                extract_brick_mc_triangles(
+                    bx,
+                    by,
+                    bz,
+                    grid.nx,
+                    grid.ny,
+                    grid.nz,
+                    grid.grid_min,
+                    grid.voxel_size,
+                    grid.iso,
+                    |c| (field[c], vels[c]),
+                )
+            })
+            .collect();
+
+        finalize_surface_mesh(brick_outputs, config)
+    }
+
+    /// Reconstruct a smooth, watertight 3D liquid surface using GPU compute scalar field evaluation
+    /// combined with CPU watertight edge welding and Taubin smoothing (falling back to CPU if limits exceed).
+    pub fn from_particles_with_gpu(
+        particles: &[Particle],
+        particle_radius: f32,
+        smoothing_length: f32,
+        config: &SurfaceMeshConfig,
+        gpu_field: &mut crate::gpu::GpuSurfaceField,
+    ) -> Self {
+        let Some(grid) = prepare_surface_grid(particles, particle_radius, smoothing_length, config)
+        else {
+            return Self::default();
+        };
+
+        let ok = gpu_field.evaluate_crossing_bricks(
+            &grid.fluid_positions,
+            &grid.fluid_velocities,
+            grid.grid_min,
+            grid.grid_max,
+            grid.voxel_size,
+            grid.splat_radius,
+            grid.iso,
+            grid.nx,
+            grid.ny,
+            grid.nz,
+            &grid.active_brick_coords,
+        );
+        if !ok {
+            return Self::from_grid_cpu(&grid, config);
+        }
+
+        if gpu_field.crossing_brick_ids.is_empty() {
+            return Self::default();
+        }
+
+        let corners = &gpu_field.crossing_corners;
+        let active_coords = &grid.active_brick_coords;
+        let mut ordered_slots: Vec<(u32, usize)> = gpu_field
+            .crossing_brick_ids
+            .iter()
+            .enumerate()
+            .map(|(slot, &active_idx)| (active_idx, slot))
+            .collect();
+        ordered_slots.sort_unstable_by_key(|&(active_idx, _)| active_idx);
+
+        let brick_outputs: Vec<Vec<[RawEdgeVertex; 3]>> = ordered_slots
+            .par_iter()
+            .map(|&(active_idx, slot)| {
+                let [bx, by, bz] = active_coords[active_idx as usize];
+                let base = slot * 729;
+                extract_brick_mc_triangles(
+                    bx,
+                    by,
+                    bz,
+                    grid.nx,
+                    grid.ny,
+                    grid.nz,
+                    grid.grid_min,
+                    grid.voxel_size,
+                    grid.iso,
+                    |c| {
+                        let cv = corners[base + c];
+                        (cv[3], Vec3::new(cv[0], cv[1], cv[2]))
+                    },
+                )
+            })
+            .collect();
+
+        finalize_surface_mesh(brick_outputs, config)
     }
 
     /// Reconstruct a smooth, watertight 3D liquid surface from SPH fluid particles
@@ -931,428 +1509,11 @@ impl SurfaceMesh {
         smoothing_length: f32,
         config: &SurfaceMeshConfig,
     ) -> Self {
-        // Collect fluid particles
-        let fluid_positions: Vec<Vec3> = particles
-            .iter()
-            .filter(|p| {
-                p.particle_type == ParticleType::Fluid
-                    && p.position.is_finite()
-                    && p.velocity.is_finite()
-            })
-            .map(|p| p.position)
-            .collect();
-        if fluid_positions.is_empty() {
+        let Some(grid) = prepare_surface_grid(particles, particle_radius, smoothing_length, config)
+        else {
             return Self::default();
-        }
-        let fluid_velocities: Vec<Vec3> = particles
-            .iter()
-            .filter(|p| {
-                p.particle_type == ParticleType::Fluid
-                    && p.position.is_finite()
-                    && p.velocity.is_finite()
-            })
-            .map(|p| p.velocity)
-            .collect();
-
-        let kernel_scale = config.kernel_scale.clamp(0.6, 2.0);
-        let splat_radius = (particle_radius * 3.05)
-            .max(smoothing_length * 1.32)
-            * kernel_scale;
-        let splat_r2 = splat_radius * splat_radius;
-        let inv_splat_r2 = 1.0 / splat_r2.max(1e-10);
-
-        let min_voxel = config.min_voxel_size.max(0.00025);
-        let mut voxel_size = (particle_radius * config.voxel_scale.clamp(0.30, 1.8)).max(min_voxel);
-
-        // Tight bounding box around fluid particles
-        let mut min_p = Vec3::splat(f32::INFINITY);
-        let mut max_p = Vec3::splat(f32::NEG_INFINITY);
-        for &pos in &fluid_positions {
-            min_p = min_p.min(pos);
-            max_p = max_p.max(pos);
-        }
-
-        let pad = splat_radius + voxel_size * 2.0;
-        let grid_min = min_p - Vec3::splat(pad);
-        let grid_max = max_p + Vec3::splat(pad);
-        let extent = grid_max - grid_min;
-
-        // Cap maximum grid resolution along longest axis so memory and time stay bounded
-        let max_axis_extent = extent.x.max(extent.y).max(extent.z);
-        let max_cells_axis = config.max_grid_cells.max(32.0);
-        if max_axis_extent / voxel_size > max_cells_axis {
-            voxel_size = max_axis_extent / max_cells_axis;
-        }
-
-        let nx = ((extent.x / voxel_size).ceil() as usize).max(2);
-        let ny = ((extent.y / voxel_size).ceil() as usize).max(2);
-        let nz = ((extent.z / voxel_size).ceil() as usize).max(2);
-
-        let bricks_x = (nx + BRICK_DIM - 1) / BRICK_DIM;
-        let bricks_y = (ny + BRICK_DIM - 1) / BRICK_DIM;
-        let bricks_z = (nz + BRICK_DIM - 1) / BRICK_DIM;
-        let total_bricks = bricks_x * bricks_y * bricks_z;
-
-        // Mark narrow-band active bricks overlapped by at least one particle's splat AABB
-        let mut brick_active = vec![false; total_bricks];
-        let brick_world_size = voxel_size * BRICK_DIM as f32;
-        let inv_brick_size = 1.0 / brick_world_size;
-
-        for &pos in &fluid_positions {
-            let b_min = ((pos - Vec3::splat(splat_radius) - grid_min) * inv_brick_size)
-                .floor()
-                .as_ivec3();
-            let b_max = ((pos + Vec3::splat(splat_radius) - grid_min) * inv_brick_size)
-                .floor()
-                .as_ivec3();
-
-            let z0 = b_min.z.clamp(0, bricks_z as i32 - 1) as usize;
-            let z1 = b_max.z.clamp(0, bricks_z as i32 - 1) as usize;
-            let y0 = b_min.y.clamp(0, bricks_y as i32 - 1) as usize;
-            let y1 = b_max.y.clamp(0, bricks_y as i32 - 1) as usize;
-            let x0 = b_min.x.clamp(0, bricks_x as i32 - 1) as usize;
-            let x1 = b_max.x.clamp(0, bricks_x as i32 - 1) as usize;
-
-            for bz in z0..=z1 {
-                for by in y0..=y1 {
-                    let row = (bz * bricks_y + by) * bricks_x;
-                    for bx in x0..=x1 {
-                        brick_active[row + bx] = true;
-                    }
-                }
-            }
-        }
-
-        let active_brick_coords: Vec<[usize; 3]> = brick_active
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &active)| {
-                if !active {
-                    return None;
-                }
-                let bx = idx % bricks_x;
-                let rem = idx / bricks_x;
-                let by = rem % bricks_y;
-                let bz = rem / bricks_y;
-                Some([bx, by, bz])
-            })
-            .collect();
-
-        if active_brick_coords.is_empty() {
-            return Self::default();
-        }
-
-        // Build spatial hash on fluid positions with cell_size = splat_radius
-        let mut p_grid = SpatialHashGrid::new(splat_radius, fluid_positions.len());
-        p_grid.build(&fluid_positions);
-
-        let iso = config.iso_value.clamp(0.08, 0.92);
-
-        // Process each active 8x8x8 brick in parallel on all CPU cores
-        let brick_outputs: Vec<Vec<[RawEdgeVertex; 3]>> = active_brick_coords
-            .par_iter()
-            .map(|&[bx, by, bz]| {
-                let gx0 = bx * BRICK_DIM;
-                let gy0 = by * BRICK_DIM;
-                let gz0 = bz * BRICK_DIM;
-
-                let cells_x = BRICK_DIM.min(nx.saturating_sub(gx0));
-                let cells_y = BRICK_DIM.min(ny.saturating_sub(gy0));
-                let cells_z = BRICK_DIM.min(nz.saturating_sub(gz0));
-
-                // Evaluate 9x9x9 corner scalar values and velocity averages in L1 cache
-                const STRIDE_Y: usize = BRICK_DIM + 1; // 9
-                const STRIDE_Z: usize = STRIDE_Y * STRIDE_Y; // 81
-                let mut field = [0.0f32; (BRICK_DIM + 1) * (BRICK_DIM + 1) * (BRICK_DIM + 1)];
-                let mut vels = [Vec3::ZERO; (BRICK_DIM + 1) * (BRICK_DIM + 1) * (BRICK_DIM + 1)];
-
-                let mut any_inside = false;
-                let mut any_outside = false;
-
-                for lz in 0..=cells_z {
-                    let wz = grid_min.z + (gz0 + lz) as f32 * voxel_size;
-                    for ly in 0..=cells_y {
-                        let wy = grid_min.y + (gy0 + ly) as f32 * voxel_size;
-                        for lx in 0..=cells_x {
-                            let wx = grid_min.x + (gx0 + lx) as f32 * voxel_size;
-                            let sample_pos = Vec3::new(wx, wy, wz);
-
-                            let mut sum_val = 0.0f32;
-                            let mut weighted_vel = Vec3::ZERO;
-
-                            p_grid.for_each_neighbor(sample_pos, |j| {
-                                let d2 = sample_pos.distance_squared(fluid_positions[j]);
-                                if d2 < splat_r2 {
-                                    let t = 1.0 - d2 * inv_splat_r2;
-                                    let w = t * t * t; // Smooth C2 polynomial kernel
-                                    sum_val += w;
-                                    weighted_vel += fluid_velocities[j] * w;
-                                }
-                            });
-
-                            // Soft saturation prevents extreme density spikes in deep pools while keeping iso=0.42 exact
-                            let phi = sum_val / (1.0 + sum_val * 0.35);
-                            let idx = lz * STRIDE_Z + ly * STRIDE_Y + lx;
-                            field[idx] = phi;
-                            if sum_val > 1e-6 {
-                                vels[idx] = weighted_vel / sum_val;
-                            }
-
-                            if phi >= iso {
-                                any_inside = true;
-                            } else {
-                                any_outside = true;
-                            }
-                        }
-                    }
-                }
-
-                let mut tris = Vec::new();
-                if !any_inside || !any_outside {
-                    return tris;
-                }
-
-                // Extract Marching Cubes triangles within this brick
-                for lz in 0..cells_z {
-                    for ly in 0..cells_y {
-                        for lx in 0..cells_x {
-                            let c0 = lz * STRIDE_Z + ly * STRIDE_Y + lx;
-                            let c1 = c0 + 1;
-                            let c2 = c0 + STRIDE_Y + 1;
-                            let c3 = c0 + STRIDE_Y;
-                            let c4 = c0 + STRIDE_Z;
-                            let c5 = c4 + 1;
-                            let c6 = c4 + STRIDE_Y + 1;
-                            let c7 = c4 + STRIDE_Z - STRIDE_Z + STRIDE_Y; // c4 + STRIDE_Y
-
-                            let v = [
-                                field[c0], field[c1], field[c2], field[c3],
-                                field[c4], field[c5], field[c6], field[c7],
-                            ];
-
-                            let mut cube_index = 0usize;
-                            if v[0] >= iso { cube_index |= 1; }
-                            if v[1] >= iso { cube_index |= 2; }
-                            if v[2] >= iso { cube_index |= 4; }
-                            if v[3] >= iso { cube_index |= 8; }
-                            if v[4] >= iso { cube_index |= 16; }
-                            if v[5] >= iso { cube_index |= 32; }
-                            if v[6] >= iso { cube_index |= 64; }
-                            if v[7] >= iso { cube_index |= 128; }
-
-                            let edge_mask = MC_EDGE_TABLE[cube_index];
-                            if edge_mask == 0 {
-                                continue;
-                            }
-
-                            let gx = gx0 + lx;
-                            let gy = gy0 + ly;
-                            let gz = gz0 + lz;
-                            let p0 = grid_min + Vec3::new(gx as f32, gy as f32, gz as f32) * voxel_size;
-
-                            let corner_pos = [
-                                p0,
-                                p0 + Vec3::new(voxel_size, 0.0, 0.0),
-                                p0 + Vec3::new(voxel_size, voxel_size, 0.0),
-                                p0 + Vec3::new(0.0, voxel_size, 0.0),
-                                p0 + Vec3::new(0.0, 0.0, voxel_size),
-                                p0 + Vec3::new(voxel_size, 0.0, voxel_size),
-                                p0 + Vec3::new(voxel_size, voxel_size, voxel_size),
-                                p0 + Vec3::new(0.0, voxel_size, voxel_size),
-                            ];
-                            let corner_vel = [
-                                vels[c0], vels[c1], vels[c2], vels[c3],
-                                vels[c4], vels[c5], vels[c6], vels[c7],
-                            ];
-
-                            let mut edge_verts = [RawEdgeVertex {
-                                key: 0,
-                                pos: Vec3::ZERO,
-                                vel: Vec3::ZERO,
-                            }; 12];
-
-                            for e in 0..12 {
-                                if (edge_mask & (1 << e)) != 0 {
-                                    let (a, b) = MC_EDGE_CORNERS[e];
-                                    let va = v[a];
-                                    let vb = v[b];
-                                    let denom = vb - va;
-                                    let t = if denom.abs() > 1e-6 {
-                                        ((iso - va) / denom).clamp(0.0, 1.0)
-                                    } else {
-                                        0.5
-                                    };
-                                    let pos = corner_pos[a].lerp(corner_pos[b], t);
-                                    let vel = corner_vel[a].lerp(corner_vel[b], t);
-                                    let key = pack_grid_edge_key(gx, gy, gz, e);
-                                    edge_verts[e] = RawEdgeVertex { key, pos, vel };
-                                }
-                            }
-
-                            let row = &MC_TRI_TABLE[cube_index];
-                            let mut t_idx = 0;
-                            while t_idx < 15 && row[t_idx] != -1 {
-                                let e0 = row[t_idx] as usize;
-                                let e1 = row[t_idx + 1] as usize;
-                                let e2 = row[t_idx + 2] as usize;
-                                // Winding (e0, e2, e1) points outward along -grad(phi) in right-handed coordinates
-                                tris.push([edge_verts[e0], edge_verts[e2], edge_verts[e1]]);
-                                t_idx += 3;
-                            }
-                        }
-                    }
-                }
-
-                tris
-            })
-            .collect();
-
-        // Weld shared edge vertices into an indexed manifold mesh
-        let total_tris: usize = brick_outputs.iter().map(|v| v.len()).sum();
-        if total_tris == 0 {
-            return Self::default();
-        }
-
-        let mut key_to_idx: HashMap<u64, u32> = HashMap::with_capacity(total_tris);
-        let mut positions: Vec<Vec3> = Vec::with_capacity(total_tris / 2 + 16);
-        let mut velocities: Vec<Vec3> = Vec::with_capacity(total_tris / 2 + 16);
-        let mut indices: Vec<u32> = Vec::with_capacity(total_tris * 3);
-
-        for brick_tris in &brick_outputs {
-            for tri in brick_tris {
-                let mut tri_idx = [0u32; 3];
-                for k in 0..3 {
-                    let ev = tri[k];
-                    let v_id = *key_to_idx.entry(ev.key).or_insert_with(|| {
-                        let id = positions.len() as u32;
-                        positions.push(ev.pos);
-                        velocities.push(ev.vel);
-                        id
-                    });
-                    tri_idx[k] = v_id;
-                }
-                if tri_idx[0] != tri_idx[1] && tri_idx[1] != tri_idx[2] && tri_idx[2] != tri_idx[0] {
-                    indices.push(tri_idx[0]);
-                    indices.push(tri_idx[1]);
-                    indices.push(tri_idx[2]);
-                }
-            }
-        }
-
-        let v_count = positions.len();
-        if v_count == 0 || indices.is_empty() {
-            return Self::default();
-        }
-
-        // Volume-preserving Taubin (lambda / mu) mesh smoothing to erase particle blobbiness
-        let smooth_iters = config
-            .smoothing_passes
-            .min(config.max_smoothing_passes.max(1));
-        if smooth_iters > 0 {
-            let mut sum_pos = vec![Vec3::ZERO; v_count];
-            let mut sum_vel = vec![Vec3::ZERO; v_count];
-            let mut valence = vec![0u32; v_count];
-
-            let taubin_step = |positions: &mut [Vec3],
-                               velocities: &mut [Vec3],
-                               sum_pos: &mut [Vec3],
-                               sum_vel: &mut [Vec3],
-                               valence: &mut [u32],
-                               factor: f32,
-                               smooth_vel: bool| {
-                sum_pos.fill(Vec3::ZERO);
-                if smooth_vel {
-                    sum_vel.fill(Vec3::ZERO);
-                }
-                valence.fill(0);
-
-                for tri in indices.chunks_exact(3) {
-                    let i0 = tri[0] as usize;
-                    let i1 = tri[1] as usize;
-                    let i2 = tri[2] as usize;
-
-                    let p0 = positions[i0];
-                    let p1 = positions[i1];
-                    let p2 = positions[i2];
-
-                    sum_pos[i0] += p1 + p2;
-                    sum_pos[i1] += p2 + p0;
-                    sum_pos[i2] += p0 + p1;
-
-                    valence[i0] += 2;
-                    valence[i1] += 2;
-                    valence[i2] += 2;
-
-                    if smooth_vel {
-                        let v0 = velocities[i0];
-                        let v1 = velocities[i1];
-                        let v2 = velocities[i2];
-                        sum_vel[i0] += v1 + v2;
-                        sum_vel[i1] += v2 + v0;
-                        sum_vel[i2] += v0 + v1;
-                    }
-                }
-
-                for i in 0..positions.len() {
-                    let deg = valence[i];
-                    if deg > 0 {
-                        let inv_deg = 1.0 / deg as f32;
-                        let avg_p = sum_pos[i] * inv_deg;
-                        positions[i] += (avg_p - positions[i]) * factor;
-                        if smooth_vel {
-                            let avg_v = sum_vel[i] * inv_deg;
-                            velocities[i] = velocities[i].lerp(avg_v, 0.35);
-                        }
-                    }
-                }
-            };
-
-            let lambda = 0.50f32;
-            let mu = -0.522f32;
-            for _ in 0..smooth_iters {
-                taubin_step(&mut positions, &mut velocities, &mut sum_pos, &mut sum_vel, &mut valence, lambda, true);
-                taubin_step(&mut positions, &mut velocities, &mut sum_pos, &mut sum_vel, &mut valence, mu, false);
-            }
-            // Final micro-polish pass eliminates sub-voxel Marching Cubes faceting
-            taubin_step(&mut positions, &mut velocities, &mut sum_pos, &mut sum_vel, &mut valence, 0.24, false);
-        }
-
-        // Compute area-weighted smooth vertex normals + curvature crest foam cue
-        let mut normals = vec![Vec3::ZERO; v_count];
-        for tri in indices.chunks_exact(3) {
-            let i0 = tri[0] as usize;
-            let i1 = tri[1] as usize;
-            let i2 = tri[2] as usize;
-            let e1 = positions[i1] - positions[i0];
-            let e2 = positions[i2] - positions[i0];
-            let fn_area = e1.cross(e2);
-            normals[i0] += fn_area;
-            normals[i1] += fn_area;
-            normals[i2] += fn_area;
-        }
-
-        let vertices: Vec<MeshVertex> = (0..v_count)
-            .into_par_iter()
-            .map(|i| {
-                let n = if normals[i].length_squared() > 1e-16 {
-                    normals[i].normalize()
-                } else {
-                    Vec3::Y
-                };
-                let speed = velocities[i].length();
-                // Crest foam combines speed and upward/splash motion
-                let upward_splash = (velocities[i].y * 0.25).clamp(0.0, 0.4);
-                let foam = ((speed - 1.35) / 2.6 + upward_splash).clamp(0.0, 1.0);
-                MeshVertex {
-                    position: positions[i].to_array(),
-                    normal: n.to_array(),
-                    speed,
-                    foam,
-                }
-            })
-            .collect();
-
-        Self { vertices, indices }
+        };
+        Self::from_grid_cpu(&grid, config)
     }
 
     /// Export reconstructed surface mesh to Wavefront `.obj` file (with vertex positions and smooth normals).

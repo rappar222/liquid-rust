@@ -9,7 +9,7 @@ pub mod updater;
 
 pub use app::LiquidApp;
 pub use export::{Mp4Encoder, PlyExporter, PngExporter, SoftwareRenderer};
-pub use gpu::GpuSphSolver;
+pub use gpu::{GpuRenderer, GpuSphSolver, GpuSurfaceField};
 pub use math::{unproject_mouse_ray, Aabb, Ray};
 pub use render::{
     Camera, CliRenderQuality, ColorMap, ColorMapType, ColorMode, EnvironmentPreset,

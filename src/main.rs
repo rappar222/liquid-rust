@@ -2,7 +2,7 @@ use clap::Parser;
 use eframe::egui;
 use glam::Vec3;
 use liquid_rust::export::{Mp4Encoder, PlyExporter, PngExporter, SoftwareRenderer};
-use liquid_rust::gpu::GpuSphSolver;
+use liquid_rust::gpu::{create_headless_wgpu_device, GpuRenderer, GpuSphSolver, GpuSurfaceField};
 use liquid_rust::render::{
     Camera, CliRenderQuality, ColorMap, ColorMapType, ColorMode, EnvironmentPreset,
     FluidMaterialPreset, MeshTextureMode, RenderMode, SurfaceMesh, SurfaceMeshConfig,
@@ -1759,6 +1759,12 @@ fn run_headless(
         particle_count, solver.config.particle_radius, solver.config.spacing
     );
 
+    let has_mesh_col = solver
+        .colliders
+        .iter()
+        .any(|c| c.enabled && matches!(c.shape, ColliderShape::Mesh(_)));
+    let has_drains = !solver.drains.is_empty();
+
     let mut gpu_solver = if !args.cpu && total_frames > 0 {
         match GpuSphSolver::new(solver.bounds, &solver.config, &solver.particles) {
             Ok(g) => {
@@ -1779,6 +1785,121 @@ fn run_headless(
     } else {
         None
     };
+
+    let mut gpu_surface_field = if !args.cpu
+        && (render_mode == RenderMode::SurfaceMesh || args.export_obj.is_some())
+    {
+        if let Some(ref g) = gpu_solver {
+            GpuSurfaceField::new(Arc::clone(&g.device), Arc::clone(&g.queue)).ok()
+        } else {
+            create_headless_wgpu_device()
+                .ok()
+                .and_then(|(dev, q, _)| GpuSurfaceField::new(dev, q).ok())
+        }
+    } else {
+        None
+    };
+
+    enum CliRenderer {
+        Gpu(GpuRenderer),
+        Cpu(SoftwareRenderer),
+    }
+
+    impl CliRenderer {
+        fn rgb_buffer(&self) -> &[u8] {
+            match self {
+                CliRenderer::Gpu(r) => &r.rgb_buffer,
+                CliRenderer::Cpu(r) => &r.rgb_buffer,
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn render_particles(
+            &mut self,
+            gpu_solver: Option<&GpuSphSolver>,
+            particles: &[liquid_rust::sph::Particle],
+            radius: f32,
+            chamber: &Chamber,
+            bounds: liquid_rust::math::Aabb,
+            colliders: &[Collider],
+            camera: &Camera,
+            color_mode: ColorMode,
+            color_map: ColorMapType,
+            rest_density: f32,
+            is_2d: bool,
+        ) {
+            match self {
+                CliRenderer::Gpu(r) => {
+                    if let Some(gs) = gpu_solver {
+                        if let Some(buf) = gs.particle_buffer() {
+                            r.render_particles_from_gpu_buffer(
+                                buf,
+                                gs.particle_count,
+                                radius,
+                                chamber,
+                                bounds,
+                                colliders,
+                                camera,
+                                color_mode,
+                                color_map,
+                                rest_density,
+                                is_2d,
+                            );
+                            return;
+                        }
+                    }
+                    r.render_particles_studio(
+                        particles,
+                        radius,
+                        chamber,
+                        bounds,
+                        colliders,
+                        camera,
+                        color_mode,
+                        color_map,
+                        rest_density,
+                        is_2d,
+                    );
+                }
+                CliRenderer::Cpu(r) => {
+                    r.render_particles_studio(
+                        particles,
+                        radius,
+                        chamber,
+                        bounds,
+                        colliders,
+                        camera,
+                        color_mode,
+                        color_map,
+                        rest_density,
+                        is_2d,
+                    );
+                }
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn render_surface_mesh(
+            &mut self,
+            mesh: &SurfaceMesh,
+            cfg: &SurfaceMeshConfig,
+            camera: &Camera,
+            chamber: &Chamber,
+            bounds: liquid_rust::math::Aabb,
+            colliders: &[Collider],
+            anim_time: f32,
+            is_2d: bool,
+        ) {
+            match self {
+                CliRenderer::Gpu(r) => r.render_surface_mesh_frame(
+                    mesh, cfg, camera, chamber, bounds, colliders, anim_time, is_2d,
+                ),
+                CliRenderer::Cpu(r) => r.render_surface_mesh_frame(
+                    mesh, cfg, camera, chamber, bounds, colliders, anim_time, is_2d,
+                ),
+            }
+        }
+    }
 
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupted_clone = Arc::clone(&interrupted);
@@ -1814,31 +1935,77 @@ fn run_headless(
         None
     };
 
-    let mut software_renderer = if mp4_encoder.is_some() || args.export_png.is_some() {
-        let mut rend =
-            SoftwareRenderer::new_with_quality(video_width, video_height, cli_render_quality);
-        rend.enable_culling = use_culling;
-        rend.lit_spheres = lit_spheres;
-        rend.particle_foam = particle_foam;
-        rend.env_preset = mesh_cfg.env_preset;
-        rend.exposure = mesh_cfg.exposure;
-        rend.show_grid = mesh_cfg.show_grid;
-        rend.show_wireframe = mesh_cfg.show_wireframe;
-        rend.light_dir = mesh_cfg.light_dir;
-        rend.light_intensity = mesh_cfg.light_intensity;
-        rend.ambient_intensity = mesh_cfg.ambient_intensity;
+    let mut cli_renderer: Option<CliRenderer> =
+        if mp4_encoder.is_some() || args.export_png.is_some() {
+            let gpu_rend = if !args.cpu {
+                let res = if let Some(ref g) = gpu_solver {
+                    GpuRenderer::new_with_device(
+                        Arc::clone(&g.device),
+                        Arc::clone(&g.queue),
+                        g.device_name.clone(),
+                        video_width,
+                        video_height,
+                        cli_render_quality,
+                    )
+                } else {
+                    GpuRenderer::new_standalone(video_width, video_height, cli_render_quality)
+                };
+                match res {
+                    Ok(mut r) => {
+                        r.lit_spheres = lit_spheres;
+                        r.particle_foam = particle_foam;
+                        r.env_preset = mesh_cfg.env_preset;
+                        r.exposure = mesh_cfg.exposure;
+                        r.show_grid = mesh_cfg.show_grid;
+                        r.show_wireframe = mesh_cfg.show_wireframe;
+                        r.light_dir = mesh_cfg.light_dir;
+                        r.light_intensity = mesh_cfg.light_intensity;
+                        r.ambient_intensity = mesh_cfg.ambient_intensity;
+                        let (rw, rh) = r.internal_dimensions();
+                        println!(
+                            "GPU Rendering:    ACTIVE [{}] ({}x SSAA: {}x{})",
+                            r.device_name, r.ssaa_factor, rw, rh
+                        );
+                        Some(CliRenderer::Gpu(r))
+                    }
+                    Err(e) => {
+                        println!("GPU rendering unavailable ({}), falling back to CPU rasterizer", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
-        if rend.ssaa_factor != cli_render_quality.ssaa_factor() {
-            let (rw, rh) = rend.internal_dimensions();
-            println!(
-                "  (SSAA automatically capped to {}x [{}x{}] at {}x{} to bound RAM within 36M internal pixels)",
-                rend.ssaa_factor, rw, rh, video_width, video_height
-            );
-        }
-        Some(rend)
-    } else {
-        None
-    };
+            Some(gpu_rend.unwrap_or_else(|| {
+                let mut rend = SoftwareRenderer::new_with_quality(
+                    video_width,
+                    video_height,
+                    cli_render_quality,
+                );
+                rend.enable_culling = use_culling;
+                rend.lit_spheres = lit_spheres;
+                rend.particle_foam = particle_foam;
+                rend.env_preset = mesh_cfg.env_preset;
+                rend.exposure = mesh_cfg.exposure;
+                rend.show_grid = mesh_cfg.show_grid;
+                rend.show_wireframe = mesh_cfg.show_wireframe;
+                rend.light_dir = mesh_cfg.light_dir;
+                rend.light_intensity = mesh_cfg.light_intensity;
+                rend.ambient_intensity = mesh_cfg.ambient_intensity;
+
+                if rend.ssaa_factor != cli_render_quality.ssaa_factor() {
+                    let (rw, rh) = rend.internal_dimensions();
+                    println!(
+                        "  (SSAA automatically capped to {}x [{}x{}] at {}x{} to bound RAM within 36M internal pixels)",
+                        rend.ssaa_factor, rw, rh, video_width, video_height
+                    );
+                }
+                CliRenderer::Cpu(rend)
+            }))
+        } else {
+            None
+        };
 
     if let Some(ref dir) = args.export_ply {
         if let Err(e) = std::fs::create_dir_all(dir) {
@@ -1861,6 +2028,7 @@ fn run_headless(
     let mut last_progress_print = Instant::now();
     let mut completed_frames = 0;
     let mut anim_time = 0.0f32;
+    let mut cpu_particles_synced = true;
 
     for frame in 0..total_frames {
         if interrupted.load(Ordering::SeqCst) {
@@ -1871,11 +2039,24 @@ fn run_headless(
             break;
         }
 
+        let need_mesh = (render_mode == RenderMode::SurfaceMesh && mp4_encoder.is_some())
+            || args.export_obj.is_some();
+        let need_cpu_render =
+            mp4_encoder.is_some() && matches!(cli_renderer, Some(CliRenderer::Cpu(_)));
+        let need_cpu_particles =
+            has_mesh_col || has_drains || need_mesh || args.export_ply.is_some() || need_cpu_render;
+
         let t0 = Instant::now();
         if let Some(ref mut gpu) = gpu_solver {
             let prev_len = solver.particles.len();
             solver.emit_faucets(dt);
-            if solver.particles.len() != prev_len {
+            let new_len = solver.particles.len();
+            if new_len != prev_len {
+                if new_len > gpu.particle_capacity && !cpu_particles_synced {
+                    let newly_emitted = solver.particles.split_off(prev_len);
+                    gpu.read_particles(&mut solver.particles);
+                    solver.particles.extend(newly_emitted);
+                }
                 gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, true);
             }
             gpu.step(
@@ -1889,41 +2070,43 @@ fn run_headless(
                 dt,
                 is_2d,
             );
-            gpu.read_particles(&mut solver.particles);
 
-            let has_mesh_col = solver
-                .colliders
-                .iter()
-                .any(|c| c.enabled && matches!(c.shape, ColliderShape::Mesh(_)));
-            if has_mesh_col {
-                use rayon::prelude::*;
-                let radius = solver.config.particle_radius;
-                let colliders = &solver.colliders;
-                let hit = solver
-                    .particles
-                    .par_iter_mut()
-                    .map(|p| {
-                        let mut p_hit = false;
-                        for col in colliders {
-                            if let ColliderShape::Mesh(_) = &col.shape {
-                                p_hit |= col.resolve(&mut p.position, &mut p.velocity, radius);
+            if need_cpu_particles {
+                gpu.read_particles(&mut solver.particles);
+                cpu_particles_synced = true;
+
+                if has_mesh_col {
+                    use rayon::prelude::*;
+                    let radius = solver.config.particle_radius;
+                    let colliders = &solver.colliders;
+                    let hit = solver
+                        .particles
+                        .par_iter_mut()
+                        .map(|p| {
+                            let mut p_hit = false;
+                            for col in colliders {
+                                if let ColliderShape::Mesh(_) = &col.shape {
+                                    p_hit |= col.resolve(&mut p.position, &mut p.velocity, radius);
+                                }
                             }
-                        }
-                        if p_hit && is_2d {
-                            p.position.z = 0.0;
-                            p.velocity.z = 0.0;
-                        }
-                        p_hit
-                    })
-                    .reduce(|| false, |a, b| a || b);
-                if hit {
+                            if p_hit && is_2d {
+                                p.position.z = 0.0;
+                                p.velocity.z = 0.0;
+                            }
+                            p_hit
+                        })
+                        .reduce(|| false, |a, b| a || b);
+                    if hit {
+                        gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, false);
+                    }
+                }
+
+                let drained = solver.drain_particles();
+                if drained > 0 {
                     gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, false);
                 }
-            }
-
-            let drained = solver.drain_particles();
-            if drained > 0 {
-                gpu.sync_particles(solver.bounds, &solver.config, &solver.particles, false);
+            } else {
+                cpu_particles_synced = false;
             }
         } else {
             solver.step(dt);
@@ -1933,24 +2116,32 @@ fn run_headless(
 
         // Build surface mesh if needed for MP4 surface-mesh rendering or .OBJ export
         let t_r = Instant::now();
-        let need_mesh = (render_mode == RenderMode::SurfaceMesh && mp4_encoder.is_some())
-            || args.export_obj.is_some();
         let built_mesh = if need_mesh {
-            Some(SurfaceMesh::from_particles(
-                &solver.particles,
-                solver.config.particle_radius,
-                solver.config.smoothing_length,
-                &mesh_cfg,
-            ))
+            Some(if let Some(ref mut gf) = gpu_surface_field {
+                SurfaceMesh::from_particles_with_gpu(
+                    &solver.particles,
+                    solver.config.particle_radius,
+                    solver.config.smoothing_length,
+                    &mesh_cfg,
+                    gf,
+                )
+            } else {
+                SurfaceMesh::from_particles(
+                    &solver.particles,
+                    solver.config.particle_radius,
+                    solver.config.smoothing_length,
+                    &mesh_cfg,
+                )
+            })
         } else {
             None
         };
 
-        if let (Some(ref mut enc), Some(ref mut rend)) = (&mut mp4_encoder, &mut software_renderer)
-        {
+        if let (Some(ref mut enc), Some(ref mut rend)) = (&mut mp4_encoder, &mut cli_renderer) {
             match render_mode {
                 RenderMode::Particles => {
-                    rend.render_particles_studio(
+                    rend.render_particles(
+                        gpu_solver.as_ref(),
                         &solver.particles,
                         solver.config.particle_radius * particle_scale,
                         &solver.chamber,
@@ -1965,7 +2156,7 @@ fn run_headless(
                 }
                 RenderMode::SurfaceMesh => {
                     if let Some(ref mesh) = built_mesh {
-                        rend.render_surface_mesh_frame(
+                        rend.render_surface_mesh(
                             mesh,
                             &mesh_cfg,
                             &camera,
@@ -1978,7 +2169,7 @@ fn run_headless(
                     }
                 }
             }
-            if let Err(e) = enc.write_frame(&rend.rgb_buffer) {
+            if let Err(e) = enc.write_frame(rend.rgb_buffer()) {
                 eprintln!("Error writing video frame {}: {}", frame, e);
             }
         }
@@ -2056,11 +2247,19 @@ fn run_headless(
     }
 
     // Export studio PNG screenshot of the final simulated state if --export-png was requested
-    if let (Some(ref png_path), Some(ref mut rend)) = (&args.export_png, &mut software_renderer) {
+    if let (Some(ref png_path), Some(ref mut rend)) = (&args.export_png, &mut cli_renderer) {
+        if let Some(ref mut gpu) = gpu_solver {
+            if !cpu_particles_synced
+                && (render_mode == RenderMode::SurfaceMesh || matches!(rend, CliRenderer::Cpu(_)))
+            {
+                gpu.read_particles(&mut solver.particles);
+            }
+        }
         let t_png = Instant::now();
         match render_mode {
             RenderMode::Particles => {
-                rend.render_particles_studio(
+                rend.render_particles(
+                    gpu_solver.as_ref(),
                     &solver.particles,
                     solver.config.particle_radius * particle_scale,
                     &solver.chamber,
@@ -2074,13 +2273,23 @@ fn run_headless(
                 );
             }
             RenderMode::SurfaceMesh => {
-                let mesh = SurfaceMesh::from_particles(
-                    &solver.particles,
-                    solver.config.particle_radius,
-                    solver.config.smoothing_length,
-                    &mesh_cfg,
-                );
-                rend.render_surface_mesh_frame(
+                let mesh = if let Some(ref mut gf) = gpu_surface_field {
+                    SurfaceMesh::from_particles_with_gpu(
+                        &solver.particles,
+                        solver.config.particle_radius,
+                        solver.config.smoothing_length,
+                        &mesh_cfg,
+                        gf,
+                    )
+                } else {
+                    SurfaceMesh::from_particles(
+                        &solver.particles,
+                        solver.config.particle_radius,
+                        solver.config.smoothing_length,
+                        &mesh_cfg,
+                    )
+                };
+                rend.render_surface_mesh(
                     &mesh,
                     &mesh_cfg,
                     &camera,
@@ -2093,7 +2302,7 @@ fn run_headless(
             }
         }
         total_mesh_render_time += t_png.elapsed().as_secs_f64();
-        match PngExporter::save_rgb(png_path, video_width, video_height, &rend.rgb_buffer) {
+        match PngExporter::save_rgb(png_path, video_width, video_height, rend.rgb_buffer()) {
             Ok(_) => println!(
                 "Saved {}x{} studio PNG image to: {}",
                 video_width,
@@ -2120,6 +2329,10 @@ fn run_headless(
 
     let total_elapsed = start_total.elapsed().as_secs_f64();
     let effective_frames = completed_frames.max(1);
+    let final_particle_count = gpu_solver
+        .as_ref()
+        .map(|g| g.particle_count)
+        .unwrap_or_else(|| solver.particle_count());
     println!("--------------------------------------------------");
     println!("Render / Simulation complete!");
     println!("Total wall time:        {:.3}s", total_elapsed);
@@ -2139,7 +2352,7 @@ fn run_headless(
     if completed_frames > 0 {
         println!(
             "Throughput:             {:.0} particle-steps/sec",
-            (solver.particle_count() * completed_frames) as f64 / total_sim_time.max(1e-5)
+            (final_particle_count * completed_frames) as f64 / total_sim_time.max(1e-5)
         );
     }
 }

@@ -86,6 +86,69 @@ pub enum AnimationStartSource {
     CurrentState,
 }
 
+/// Visual representation used specifically for offline Studio renders (can differ from the live 3D editor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderAppearance {
+    MatchViewport,
+    SmoothLiquid,
+    ParticleSpheres,
+}
+
+/// One-click beginner-friendly studio render presets bringing full CLI rendering power to the GUI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuidedRenderPreset {
+    QuickPreview,
+    RecommendedHd,
+    Cinematic2K,
+    Ultra4K,
+    StudioPhoto,
+    Custom,
+}
+
+impl GuidedRenderPreset {
+    pub const ALL_PRESETS: &'static [GuidedRenderPreset] = &[
+        GuidedRenderPreset::QuickPreview,
+        GuidedRenderPreset::RecommendedHd,
+        GuidedRenderPreset::Cinematic2K,
+        GuidedRenderPreset::Ultra4K,
+        GuidedRenderPreset::StudioPhoto,
+    ];
+
+    pub fn title(&self) -> &'static str {
+        match self {
+            GuidedRenderPreset::QuickPreview => "Quick Draft",
+            GuidedRenderPreset::RecommendedHd => "Full HD Studio ★",
+            GuidedRenderPreset::Cinematic2K => "Cinema 2K",
+            GuidedRenderPreset::Ultra4K => "4K Ultra VFX",
+            GuidedRenderPreset::StudioPhoto => "High-Res Photo",
+            GuidedRenderPreset::Custom => "Custom Setup",
+        }
+    }
+
+    pub fn summary(&self) -> &'static str {
+        match self {
+            GuidedRenderPreset::QuickPreview => {
+                "Fast 720p • 30 FPS video (~18k particles) — great for checking camera & motion in seconds."
+            }
+            GuidedRenderPreset::RecommendedHd => {
+                "Recommended: 1080p • 60 FPS smooth liquid video (~50k particles) with soft shadows & reflections."
+            }
+            GuidedRenderPreset::Cinematic2K => {
+                "2K 1440p • 60 FPS high-detail movie (~120k particles) with 3x cinema anti-aliasing."
+            }
+            GuidedRenderPreset::Ultra4K => {
+                "4K UHD • 60 FPS ultra-dense VFX (~1M particles) — maximum quality, takes several minutes."
+            }
+            GuidedRenderPreset::StudioPhoto => {
+                "Crisp 2K 1440p still photograph (~120k particles) with 3x anti-aliasing & soft studio shadows."
+            }
+            GuidedRenderPreset::Custom => {
+                "Customized offline render settings configured below."
+            }
+        }
+    }
+}
+
 /// Crisp geometric vector icons painted directly via `egui::Painter` so every button, tab,
 /// and status badge renders cleanly across all Linux/macOS/Windows fonts without missing glyphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +190,8 @@ pub struct BgRenderState {
     pub completed_frames: usize,
     pub total_frames: usize,
     pub elapsed_secs: f32,
+    pub phase_label: String,
+    pub sim_particles_count: usize,
     pub backend_label: String,
     pub output_width: usize,
     pub output_height: usize,
@@ -419,10 +484,21 @@ pub struct LiquidApp {
     // Inspector & Studio Render / Export / CLI Generator
     pub active_tab: InspectorTab,
     pub central_view: CentralView,
+    pub guided_render_preset: GuidedRenderPreset,
     pub render_kind: StudioRenderKind,
+    pub render_appearance: RenderAppearance,
+    pub render_sim_quality: Option<SimulationQuality>,
+    pub render_still_simulate: bool,
+    pub render_still_time: f32,
+    pub render_also_export_obj: bool,
+    pub render_also_export_ply: bool,
     pub render_anim_start: AnimationStartSource,
     pub render_save_mp4: bool,
     pub render_auto_save_png: bool,
+    pub render_browse_pending: Arc<AtomicBool>,
+    pub render_mp4_browse_result: Arc<Mutex<Option<String>>>,
+    pub render_png_browse_result: Arc<Mutex<Option<String>>>,
+    pub render_save_result_png_slot: Arc<Mutex<Option<String>>>,
     render_texture: Option<egui::TextureHandle>,
     render_uploaded_key: (u64, Option<usize>),
     pub render_zoom: f32,
@@ -513,6 +589,8 @@ impl LiquidApp {
             preset,
             true,
         );
+        app.apply_guided_render_preset(GuidedRenderPreset::RecommendedHd);
+        app.render_auto_save_png = true;
         app.theme_applied = true;
         app.updater
             .spawn_check(Some(cc.egui_ctx.clone()), false);
@@ -592,10 +670,21 @@ impl LiquidApp {
             last_step_time_ms: 0.0,
             active_tab: InspectorTab::Scene,
             central_view: CentralView::LiveViewport,
-            render_kind: StudioRenderKind::StillFrame,
+            guided_render_preset: GuidedRenderPreset::Custom,
+            render_kind: StudioRenderKind::Animation,
+            render_appearance: RenderAppearance::MatchViewport,
+            render_sim_quality: None,
+            render_still_simulate: false,
+            render_still_time: 1.5,
+            render_also_export_obj: false,
+            render_also_export_ply: false,
             render_anim_start: AnimationStartSource::PresetStart,
             render_save_mp4: true,
             render_auto_save_png: false,
+            render_browse_pending: Arc::new(AtomicBool::new(false)),
+            render_mp4_browse_result: Arc::new(Mutex::new(None)),
+            render_png_browse_result: Arc::new(Mutex::new(None)),
+            render_save_result_png_slot: Arc::new(Mutex::new(None)),
             render_texture: None,
             render_uploaded_key: (0, None),
             render_zoom: 0.0,
@@ -634,10 +723,12 @@ impl LiquidApp {
             video_height: 720,
             bg_render: Arc::new(Mutex::new(BgRenderState {
                 is_running: false,
-                kind: StudioRenderKind::StillFrame,
+                kind: StudioRenderKind::Animation,
                 completed_frames: 0,
                 total_frames: 0,
                 elapsed_secs: 0.0,
+                phase_label: String::new(),
+                sim_particles_count: 0,
                 backend_label: String::new(),
                 output_width: 1280,
                 output_height: 720,
@@ -1221,8 +1312,198 @@ impl LiquidApp {
         }
     }
 
-    /// Save the currently displayed studio render result (full-res still or current animation frame) to PNG.
-    pub fn save_rendered_result_png(&mut self) {
+    pub fn effective_render_mode(&self) -> RenderMode {
+        match self.render_appearance {
+            RenderAppearance::MatchViewport => self.render_mode,
+            RenderAppearance::SmoothLiquid => RenderMode::SurfaceMesh,
+            RenderAppearance::ParticleSpheres => RenderMode::Particles,
+        }
+    }
+
+    pub fn apply_guided_render_preset(&mut self, preset: GuidedRenderPreset) {
+        self.guided_render_preset = preset;
+        match preset {
+            GuidedRenderPreset::QuickPreview => {
+                self.render_kind = StudioRenderKind::Animation;
+                self.render_appearance = RenderAppearance::SmoothLiquid;
+                self.render_sim_quality = Some(SimulationQuality::High);
+                self.gui_render_quality = CliRenderQuality::Standard;
+                self.video_width = 1280;
+                self.video_height = 720;
+                self.cli_fps = 30;
+                self.cli_duration = 4.0;
+            }
+            GuidedRenderPreset::RecommendedHd => {
+                self.render_kind = StudioRenderKind::Animation;
+                self.render_appearance = RenderAppearance::SmoothLiquid;
+                self.render_sim_quality = Some(SimulationQuality::Ultra);
+                self.gui_render_quality = CliRenderQuality::Studio;
+                self.video_width = 1920;
+                self.video_height = 1080;
+                self.cli_fps = 60;
+                self.cli_duration = 5.0;
+            }
+            GuidedRenderPreset::Cinematic2K => {
+                self.render_kind = StudioRenderKind::Animation;
+                self.render_appearance = RenderAppearance::SmoothLiquid;
+                self.render_sim_quality = Some(SimulationQuality::Cinematic);
+                self.gui_render_quality = CliRenderQuality::Cinema;
+                self.video_width = 2560;
+                self.video_height = 1440;
+                self.cli_fps = 60;
+                self.cli_duration = 5.0;
+            }
+            GuidedRenderPreset::Ultra4K => {
+                self.render_kind = StudioRenderKind::Animation;
+                self.render_appearance = RenderAppearance::SmoothLiquid;
+                self.render_sim_quality = Some(SimulationQuality::Extreme);
+                self.gui_render_quality = CliRenderQuality::Cinema;
+                self.video_width = 3840;
+                self.video_height = 2160;
+                self.cli_fps = 60;
+                self.cli_duration = 5.0;
+            }
+            GuidedRenderPreset::StudioPhoto => {
+                self.render_kind = StudioRenderKind::StillFrame;
+                self.render_appearance = RenderAppearance::SmoothLiquid;
+                self.render_sim_quality = Some(SimulationQuality::Cinematic);
+                self.gui_render_quality = CliRenderQuality::Cinema;
+                self.video_width = 2560;
+                self.video_height = 1440;
+                if self.sim_time < 0.05 && self.current_preset != ScenePreset::Empty {
+                    self.render_still_simulate = true;
+                    self.render_still_time = 1.6;
+                } else {
+                    self.render_still_simulate = false;
+                    self.render_still_time = self.sim_time;
+                }
+                self.render_auto_save_png = true;
+            }
+            GuidedRenderPreset::Custom => {}
+        }
+    }
+
+    fn format_particle_count(n: usize) -> String {
+        let s = n.to_string();
+        let mut out = String::with_capacity(s.len() + s.len() / 3);
+        for (i, ch) in s.chars().rev().enumerate() {
+            if i > 0 && i % 3 == 0 {
+                out.push(',');
+            }
+            out.push(ch);
+        }
+        out.chars().rev().collect()
+    }
+
+    fn open_in_file_manager(path_str: &str) {
+        let p = std::path::Path::new(path_str.trim());
+        let dir = if p.is_dir() {
+            p.to_path_buf()
+        } else if let Some(parent) = p.parent() {
+            if parent.as_os_str().is_empty() {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            } else {
+                parent.to_path_buf()
+            }
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        };
+
+        #[cfg(target_os = "linux")]
+        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open").arg(&dir).spawn();
+        #[cfg(target_os = "windows")]
+        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+    }
+
+    pub fn generate_render_tab_cli_command(&self) -> String {
+        let mut clone_self_mode = self.cli_mode;
+        let _ = &mut clone_self_mode;
+        // Build an exact CLI command string reflecting the Render tab's offline quality & appearance
+        let mut parts = vec!["liquid-rust".to_string()];
+        let eff_mode = self.effective_render_mode();
+        let eff_qual = self.render_sim_quality.unwrap_or(self.current_quality);
+
+        match self.render_kind {
+            StudioRenderKind::Animation => {
+                let out = if self.cli_mp4_output.trim().is_empty() {
+                    "simulation.mp4"
+                } else {
+                    self.cli_mp4_output.trim()
+                };
+                parts.push(format!("--export-mp4 {}", out));
+                parts.push(format!("--time {:.1}", self.cli_duration));
+                parts.push(format!("--fps {}", self.cli_fps));
+            }
+            StudioRenderKind::StillFrame => {
+                let out = if self.png_output_path.trim().is_empty() {
+                    "snapshot.png"
+                } else {
+                    self.png_output_path.trim()
+                };
+                parts.push(format!("--export-png {}", out));
+                let t = if self.render_still_simulate {
+                    self.render_still_time
+                } else {
+                    self.sim_time
+                };
+                if t > 0.001 {
+                    parts.push(format!("--time {:.2}", t));
+                    parts.push(format!("--fps {}", self.cli_fps));
+                } else {
+                    parts.push("--frames 0".to_string());
+                }
+            }
+        }
+
+        parts.push(format!(
+            "--video-width {} --video-height {}",
+            self.video_width, self.video_height
+        ));
+        if self.gui_render_quality != CliRenderQuality::Standard {
+            parts.push(format!("--render-quality {}", self.gui_render_quality.slug()));
+        }
+        if self.is_2d {
+            parts.push("--2d".to_string());
+        }
+        parts.push(format!("--preset {}", self.current_preset.slug()));
+        if eff_qual != SimulationQuality::Custom {
+            parts.push(format!("--quality {}", eff_qual.slug()));
+        }
+        if self.fluid_preset != FluidPhysicsPreset::Water
+            && self.fluid_preset != FluidPhysicsPreset::Custom
+        {
+            parts.push(format!("--fluid-preset {}", self.fluid_preset.slug()));
+        }
+        if eff_mode == RenderMode::SurfaceMesh {
+            parts.push("--surface-mesh".to_string());
+            if self.mesh_config.preset != FluidMaterialPreset::ClearWater {
+                parts.push(format!("--mesh-material {}", self.mesh_config.preset.slug()));
+            }
+        }
+        if self.mesh_config.env_preset != EnvironmentPreset::StudioDark {
+            parts.push(format!("--env-preset {}", self.mesh_config.env_preset.slug()));
+        }
+        if (self.sim_speed - 1.0).abs() > 1e-3 {
+            parts.push(format!("--sim-speed {:.2}", self.sim_speed));
+        }
+        if !self.is_2d && self.camera_orbit_speed_deg.abs() > 0.05 {
+            parts.push(format!("--camera-orbit {:.1}", self.camera_orbit_speed_deg));
+        }
+        if self.render_also_export_obj {
+            parts.push(format!("--export-obj {}", self.export_path.trim()));
+        }
+        if self.render_also_export_ply {
+            parts.push(format!("--export-ply {}", self.export_path.trim()));
+        }
+        if !self.use_gpu {
+            parts.push("--cpu".to_string());
+        }
+        parts.join(" ")
+    }
+
+    pub fn save_rendered_result_png_to_path(&mut self, path: &std::path::Path) {
         let frame_opt = {
             if let Ok(g) = self.bg_render.lock() {
                 if !g.anim_frames.is_empty() {
@@ -1245,13 +1526,15 @@ impl LiquidApp {
             return;
         };
 
-        let dir = std::path::Path::new(&self.export_path);
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            self.status_message = format!("PNG save error: {}", e);
-            return;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    self.status_message = format!("PNG save error: {}", e);
+                    return;
+                }
+            }
         }
-        let path = dir.join(format!("render_result_{:05}.png", self.exported_frames_count));
-        match PngExporter::save_rgb(&path, frame.width, frame.height, &frame.rgb) {
+        match PngExporter::save_rgb(path, frame.width, frame.height, &frame.rgb) {
             Ok(_) => {
                 let p_str = path.display().to_string();
                 self.exported_frames_count += 1;
@@ -1269,7 +1552,110 @@ impl LiquidApp {
         }
     }
 
-    /// Launch a non-blocking Studio Still Frame render of the current simulation state and display the end result.
+    /// Save the currently displayed studio render result (full-res still or current animation frame) to PNG.
+    pub fn save_rendered_result_png(&mut self) {
+        let dir = std::path::Path::new(&self.export_path);
+        let path = dir.join(format!("render_result_{:05}.png", self.exported_frames_count));
+        self.save_rendered_result_png_to_path(&path);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_offline_solver_frame(
+        render_solver: &mut SphSolver,
+        gpu_opt: &mut Option<GpuSphSolver>,
+        cpu_particles_synced: &mut bool,
+        need_cpu_particles: bool,
+        has_mesh_col: bool,
+        dt: f32,
+        is_2d: bool,
+    ) {
+        if let Some(ref mut gpu) = gpu_opt {
+            let prev_n = render_solver.particles.len();
+            render_solver.emit_faucets(dt);
+            let new_n = render_solver.particles.len();
+            if new_n != prev_n {
+                if new_n > gpu.particle_capacity && !*cpu_particles_synced {
+                    let newly_emitted = render_solver.particles.split_off(prev_n);
+                    gpu.read_particles(&mut render_solver.particles);
+                    render_solver.particles.extend(newly_emitted);
+                }
+                gpu.sync_particles(
+                    render_solver.bounds,
+                    &render_solver.config,
+                    &render_solver.particles,
+                    true,
+                );
+            }
+            gpu.step(
+                render_solver.bounds,
+                &render_solver.chamber,
+                &render_solver.config,
+                &render_solver.colliders,
+                None,
+                0.0,
+                0,
+                dt,
+                is_2d,
+            );
+
+            if need_cpu_particles {
+                gpu.read_particles(&mut render_solver.particles);
+                *cpu_particles_synced = true;
+
+                if has_mesh_col {
+                    let radius = render_solver.config.particle_radius;
+                    let colliders = &render_solver.colliders;
+                    let b_min = render_solver.bounds.min + Vec3::splat(radius);
+                    let b_max = render_solver.bounds.max - Vec3::splat(radius);
+                    let hit = render_solver
+                        .particles
+                        .par_iter_mut()
+                        .map(|p| {
+                            let mut p_hit = false;
+                            for col in colliders {
+                                if let ColliderShape::Mesh(_) = &col.shape {
+                                    p_hit |= col.resolve(&mut p.position, &mut p.velocity, radius);
+                                }
+                            }
+                            if p_hit {
+                                p.position = p.position.clamp(b_min.min(b_max), b_max.max(b_min));
+                                if is_2d {
+                                    p.position.z = 0.0;
+                                    p.velocity.z = 0.0;
+                                }
+                            }
+                            p_hit
+                        })
+                        .reduce(|| false, |a, b| a || b);
+                    if hit {
+                        gpu.sync_particles(
+                            render_solver.bounds,
+                            &render_solver.config,
+                            &render_solver.particles,
+                            false,
+                        );
+                    }
+                }
+
+                let drained = render_solver.drain_particles();
+                if drained > 0 {
+                    gpu.sync_particles(
+                        render_solver.bounds,
+                        &render_solver.config,
+                        &render_solver.particles,
+                        false,
+                    );
+                }
+            } else {
+                *cpu_particles_synced = false;
+            }
+        } else {
+            render_solver.step(dt);
+        }
+    }
+
+    /// Launch a non-blocking Studio Still Frame render (either instant from the live editor state,
+    /// or simulated offline at CLI particle density up to the chosen capture timestamp) and display the end result.
     pub fn start_gui_still_render(&mut self, ctx: Option<egui::Context>, save_to_disk: bool) {
         if let Ok(guard) = self.bg_render.lock() {
             if guard.is_running {
@@ -1280,47 +1666,96 @@ impl LiquidApp {
         let width = self.video_width.max(320);
         let height = self.video_height.max(240);
         let rq = self.gui_render_quality;
-        let render_mode = self.render_mode;
+        let render_mode = self.effective_render_mode();
         let mut mesh_cfg = self.mesh_config.clone();
         rq.apply_to_mesh_config(&mut mesh_cfg, false, false);
 
-        let particles = self.solver.particles.clone();
-        let particle_radius = self.solver.config.particle_radius;
-        let smoothing_length = self.solver.config.smoothing_length;
-        let rest_density = self.solver.config.rest_density;
+        let override_q = self
+            .render_sim_quality
+            .filter(|&q| q != self.current_quality && q != SimulationQuality::Custom);
+        let need_fresh_sim = self.render_still_simulate || override_q.is_some();
+        let target_t = if self.render_still_simulate {
+            self.render_still_time.max(0.0)
+        } else {
+            self.sim_time.max(0.0)
+        };
+        let fps = self.cli_fps.max(1);
+        let sim_steps = if need_fresh_sim && target_t > 1e-4 {
+            (target_t * fps as f32).round().max(1.0) as usize
+        } else {
+            0
+        };
+        let dt = (1.0 / fps as f32) * self.sim_speed;
+
+        let mut desired_cfg = self.solver.config.clone();
+        if let Some(q) = self.render_sim_quality {
+            q.apply(&mut desired_cfg, self.is_2d);
+            desired_cfg.substeps = desired_cfg.substeps.max(self.solver.config.substeps);
+            desired_cfg.solver_iterations = desired_cfg
+                .solver_iterations
+                .max(self.solver.config.solver_iterations);
+        }
+
+        let live_particles_opt = if need_fresh_sim {
+            None
+        } else {
+            Some(self.solver.particles.clone())
+        };
+        let current_preset = self.current_preset;
         let display_size_factor = self.display_size_factor;
-        let camera = self.camera.clone();
+        let mut camera = self.camera.clone();
+        let orbit_rad_per_sec = if self.is_2d {
+            0.0
+        } else {
+            self.camera_orbit_speed_deg.to_radians()
+        };
+        let wall_frame_dt = 1.0 / fps as f32;
         let chamber = self.solver.chamber.clone();
         let bounds = self.solver.bounds;
         let colliders = self.solver.colliders.clone();
+        let faucets = self.solver.faucets.clone();
+        let drains = self.solver.drains.clone();
         let color_mode = self.color_mode;
         let color_map = self.color_map;
-        let sim_time = self.sim_time;
+        let initial_sim_time = if need_fresh_sim { 0.0 } else { self.sim_time };
         let is_2d = self.is_2d;
         let use_gpu = self.use_gpu;
         let enable_culling = self.enable_culling;
         let lit_spheres = self.lit_spheres;
         let particle_foam = self.particle_foam;
 
-        let save_target = if save_to_disk {
-            let dir = std::path::PathBuf::from(&self.export_path);
-            let idx = self.exported_frames_count;
-            self.exported_frames_count += 1;
-            Some((dir, format!("render_frame_{:05}.png", idx)))
+        let save_target: Option<std::path::PathBuf> = if save_to_disk {
+            let trimmed = self.png_output_path.trim();
+            if !trimmed.is_empty() && trimmed != "snapshot.png" {
+                Some(std::path::PathBuf::from(trimmed))
+            } else {
+                let dir = std::path::PathBuf::from(&self.export_path);
+                let idx = self.exported_frames_count;
+                self.exported_frames_count += 1;
+                Some(dir.join(format!("render_photo_{:05}.png", idx)))
+            }
         } else {
             None
         };
 
+        self.is_playing = false;
         self.anim_playing = false;
         self.bg_render_cancel.store(false, Ordering::SeqCst);
+        let cancel_flag = Arc::clone(&self.bg_render_cancel);
         let state_arc = Arc::clone(&self.bg_render);
 
         if let Ok(mut g) = state_arc.lock() {
             g.is_running = true;
             g.kind = StudioRenderKind::StillFrame;
             g.completed_frames = 0;
-            g.total_frames = 1;
+            g.total_frames = sim_steps + 1;
             g.elapsed_secs = 0.0;
+            g.phase_label = if need_fresh_sim {
+                "Spawning fluid particles...".to_string()
+            } else {
+                "Rendering high-resolution photo...".to_string()
+            };
+            g.sim_particles_count = live_particles_opt.as_ref().map_or(0, |v| v.len());
             g.output_width = width;
             g.output_height = height;
             g.quality = rq;
@@ -1329,7 +1764,7 @@ impl LiquidApp {
             g.just_finished_anim = false;
         }
         self.status_message = format!(
-            "Rendering {}x{} Studio frame ({})...",
+            "Rendering {}x{} Studio photo ({})...",
             width,
             height,
             rq.name()
@@ -1337,34 +1772,128 @@ impl LiquidApp {
 
         std::thread::spawn(move || {
             let t_start = Instant::now();
+            let mut render_solver = SphSolver::new(bounds, desired_cfg.clone());
+            render_solver.set_2d(is_2d);
+            render_solver.set_chamber(chamber);
+            if let Some(live_pts) = live_particles_opt {
+                render_solver.particles = live_pts;
+            } else {
+                SceneGenerator::setup_scene(&mut render_solver, current_preset);
+            }
+            render_solver.config = desired_cfg;
+            render_solver.colliders = colliders;
+            render_solver.faucets = faucets;
+            render_solver.drains = drains;
+
+            let p_count = render_solver.particles.len();
+            if let Ok(mut g) = state_arc.lock() {
+                g.sim_particles_count = p_count;
+            }
+
+            let mut gpu_opt = if use_gpu && sim_steps > 0 {
+                GpuSphSolver::new(
+                    render_solver.bounds,
+                    &render_solver.config,
+                    &render_solver.particles,
+                )
+                .ok()
+            } else {
+                None
+            };
+
+            let mut anim_t = initial_sim_time;
+            if sim_steps > 0 {
+                let has_mesh_col = render_solver
+                    .colliders
+                    .iter()
+                    .any(|c| c.enabled && matches!(c.shape, ColliderShape::Mesh(_)));
+                let has_drains = !render_solver.drains.is_empty();
+                let mut cpu_particles_synced = true;
+
+                for step in 0..sim_steps {
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let is_last = step + 1 == sim_steps;
+                    let need_cpu = has_mesh_col
+                        || has_drains
+                        || (is_last && render_mode == RenderMode::SurfaceMesh);
+                    Self::step_offline_solver_frame(
+                        &mut render_solver,
+                        &mut gpu_opt,
+                        &mut cpu_particles_synced,
+                        need_cpu,
+                        has_mesh_col,
+                        dt,
+                        is_2d,
+                    );
+                    anim_t += dt;
+                    camera.azimuth += orbit_rad_per_sec * wall_frame_dt;
+
+                    if let Ok(mut g) = state_arc.lock() {
+                        g.completed_frames = step + 1;
+                        g.elapsed_secs = t_start.elapsed().as_secs_f32();
+                        g.sim_particles_count = gpu_opt
+                            .as_ref()
+                            .map_or(render_solver.particles.len(), |gs| gs.particle_count);
+                        g.phase_label = format!(
+                            "Simulating fluid step {} / {} ({:.2}s)",
+                            step + 1,
+                            sim_steps,
+                            anim_t
+                        );
+                    }
+                    if let Some(ref c) = ctx {
+                        c.request_repaint();
+                    }
+                }
+                if let Some(ref gpu) = gpu_opt {
+                    if render_mode == RenderMode::SurfaceMesh || !gpu.supports_vertex_storage() {
+                        gpu.read_particles(&mut render_solver.particles);
+                    }
+                }
+            }
+
+            if let Ok(mut g) = state_arc.lock() {
+                g.phase_label = format!("Painting {}×{} studio image...", width, height);
+            }
+            if let Some(ref c) = ctx {
+                c.request_repaint();
+            }
+
             let mut off = GuiOfflineRenderer::new(
                 width,
                 height,
                 rq,
                 use_gpu,
-                None,
+                gpu_opt.as_ref(),
                 enable_culling,
                 lit_spheres,
                 particle_foam,
                 &mesh_cfg,
             );
+            if matches!(off, GuiOfflineRenderer::Cpu(_)) {
+                if let Some(ref gpu) = gpu_opt {
+                    gpu.read_particles(&mut render_solver.particles);
+                }
+            }
             let backend_lbl = off.backend_label();
             let rgb_slice = off.render_frame(
                 render_mode,
-                &particles,
-                None,
-                particle_radius,
-                smoothing_length,
+                &render_solver.particles,
+                gpu_opt.as_ref(),
+                render_solver.config.particle_radius,
+                render_solver.config.smoothing_length,
                 display_size_factor,
-                rest_density,
+                render_solver.config.rest_density,
                 &mesh_cfg,
                 &camera,
-                &chamber,
-                bounds,
-                &colliders,
+                &render_solver.chamber,
+                render_solver.bounds,
+                &render_solver.colliders,
                 color_mode,
                 color_map,
-                sim_time,
+                anim_t,
                 is_2d,
             );
             let rgb_vec = rgb_slice.to_vec();
@@ -1372,11 +1901,15 @@ impl LiquidApp {
 
             let mut saved_path_str = None;
             let mut err_str = None;
-            if let Some((dir, fname)) = save_target {
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    err_str = Some(format!("PNG save error: {}", e));
-                } else {
-                    let full_p = dir.join(fname);
+            if let Some(full_p) = save_target {
+                if let Some(parent) = full_p.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            err_str = Some(format!("PNG save error: {}", e));
+                        }
+                    }
+                }
+                if err_str.is_none() {
                     match PngExporter::save_rgb(&full_p, width, height, &rgb_vec) {
                         Ok(_) => saved_path_str = Some(full_p.display().to_string()),
                         Err(e) => err_str = Some(format!("PNG save error: {}", e)),
@@ -1384,12 +1917,18 @@ impl LiquidApp {
                 }
             }
 
+            let final_pts = gpu_opt
+                .as_ref()
+                .map_or(render_solver.particles.len(), |gs| gs.particle_count);
+
             if let Ok(mut g) = state_arc.lock() {
                 g.is_running = false;
                 g.kind = StudioRenderKind::StillFrame;
-                g.completed_frames = 1;
-                g.total_frames = 1;
+                g.completed_frames = sim_steps + 1;
+                g.total_frames = sim_steps + 1;
                 g.elapsed_secs = elapsed;
+                g.phase_label = "Render complete".to_string();
+                g.sim_particles_count = final_pts;
                 g.backend_label = backend_lbl.clone();
                 g.output_width = width;
                 g.output_height = height;
@@ -1406,20 +1945,13 @@ impl LiquidApp {
                     e
                 } else if let Some(ref p) = saved_path_str {
                     format!(
-                        "Rendered {}x{} frame in {:.0} ms [{}] -> {}",
-                        width,
-                        height,
-                        elapsed * 1000.0,
-                        backend_lbl,
-                        p
+                        "Rendered {}x{} photo in {:.2}s [{}] -> {}",
+                        width, height, elapsed, backend_lbl, p
                     )
                 } else {
                     format!(
-                        "Rendered {}x{} studio frame in {:.0} ms [{}]",
-                        width,
-                        height,
-                        elapsed * 1000.0,
-                        backend_lbl
+                        "Rendered {}x{} studio photo in {:.2}s [{}]",
+                        width, height, elapsed, backend_lbl
                     )
                 });
             }
@@ -1490,8 +2022,8 @@ impl LiquidApp {
         self.start_gui_mp4_render_with_ctx(None);
     }
 
-    /// Launch a non-blocking studio animation render, streaming rendered frames into the GUI Render Result player
-    /// and optionally encoding an H.264 MP4 video file.
+    /// Launch a non-blocking CLI-grade studio animation render, streaming rendered frames into the GUI Render Result player
+    /// and optionally encoding an H.264 MP4 video + OBJ/PLY sequences.
     pub fn start_gui_mp4_render_with_ctx(&mut self, ctx: Option<egui::Context>) {
         if let Ok(guard) = self.bg_render.lock() {
             if guard.is_running {
@@ -1527,27 +2059,35 @@ impl LiquidApp {
             (pw, ph)
         };
 
-        // Snapshot either a fresh t=0 preset scene or the current live fluid state
-        let active_cfg = self.solver.config.clone();
-        let mut render_solver = SphSolver::new(self.solver.bounds, active_cfg.clone());
-        render_solver.set_2d(self.is_2d);
-        render_solver.set_chamber(self.solver.chamber.clone());
-        let initial_anim_t = match self.render_anim_start {
-            AnimationStartSource::PresetStart => {
-                SceneGenerator::setup_scene(&mut render_solver, self.current_preset);
-                0.0
-            }
-            AnimationStartSource::CurrentState => {
-                render_solver.particles = self.solver.particles.clone();
-                self.sim_time
-            }
-        };
-        render_solver.config = active_cfg;
-        render_solver.colliders = self.solver.colliders.clone();
-        render_solver.faucets = self.solver.faucets.clone();
-        render_solver.drains = self.solver.drains.clone();
+        let override_q = self
+            .render_sim_quality
+            .filter(|&q| q != self.current_quality && q != SimulationQuality::Custom);
+        let mut desired_cfg = self.solver.config.clone();
+        if let Some(q) = self.render_sim_quality {
+            q.apply(&mut desired_cfg, self.is_2d);
+            desired_cfg.substeps = desired_cfg.substeps.max(self.solver.config.substeps);
+            desired_cfg.solver_iterations = desired_cfg
+                .solver_iterations
+                .max(self.solver.config.solver_iterations);
+        }
 
-        let render_mode = self.render_mode;
+        let use_live_state =
+            override_q.is_none() && self.render_anim_start == AnimationStartSource::CurrentState;
+        let live_particles_opt = if use_live_state {
+            Some(self.solver.particles.clone())
+        } else {
+            None
+        };
+        let initial_anim_t = if use_live_state { self.sim_time } else { 0.0 };
+
+        let current_preset = self.current_preset;
+        let bounds = self.solver.bounds;
+        let chamber = self.solver.chamber.clone();
+        let colliders = self.solver.colliders.clone();
+        let faucets = self.solver.faucets.clone();
+        let drains = self.solver.drains.clone();
+
+        let render_mode = self.effective_render_mode();
         let rq = self.gui_render_quality;
         let mut mesh_cfg = self.mesh_config.clone();
         rq.apply_to_mesh_config(&mut mesh_cfg, false, false);
@@ -1566,6 +2106,9 @@ impl LiquidApp {
         let particle_foam = self.particle_foam;
         let is_2d = self.is_2d;
         let use_gpu = self.use_gpu;
+        let also_obj = self.render_also_export_obj;
+        let also_ply = self.render_also_export_ply;
+        let seq_dir = std::path::PathBuf::from(self.export_path.trim());
 
         self.bg_render_cancel.store(false, Ordering::SeqCst);
         let cancel_flag = Arc::clone(&self.bg_render_cancel);
@@ -1577,6 +2120,8 @@ impl LiquidApp {
             guard.completed_frames = 0;
             guard.total_frames = total_frames;
             guard.elapsed_secs = 0.0;
+            guard.phase_label = "Initializing fluid particles & GPU buffers...".to_string();
+            guard.sim_particles_count = live_particles_opt.as_ref().map_or(0, |v| v.len());
             guard.output_width = width;
             guard.output_height = height;
             guard.quality = rq;
@@ -1591,18 +2136,47 @@ impl LiquidApp {
         }
         self.status_message = if save_mp4 {
             format!(
-                "Rendering {}x{} animation ({} frames) -> {}...",
+                "Rendering {}x{} video ({} frames) -> {}...",
                 width, height, total_frames, out_path
             )
         } else {
             format!(
-                "Rendering {}x{} studio animation ({} frames)...",
+                "Rendering {}x{} studio video ({} frames)...",
                 width, height, total_frames
             )
         };
 
         std::thread::spawn(move || {
             let t_start = Instant::now();
+
+            let mut render_solver = SphSolver::new(bounds, desired_cfg.clone());
+            render_solver.set_2d(is_2d);
+            render_solver.set_chamber(chamber);
+            if let Some(live_pts) = live_particles_opt {
+                render_solver.particles = live_pts;
+            } else {
+                SceneGenerator::setup_scene(&mut render_solver, current_preset);
+            }
+            render_solver.config = desired_cfg;
+            render_solver.colliders = colliders;
+            render_solver.faucets = faucets;
+            render_solver.drains = drains;
+
+            if let Ok(mut g) = state_arc.lock() {
+                g.sim_particles_count = render_solver.particles.len();
+            }
+
+            if also_obj || also_ply {
+                let _ = std::fs::create_dir_all(&seq_dir);
+            }
+            if save_mp4 {
+                if let Some(parent) = std::path::Path::new(&out_path).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+            }
+
             let mut mp4_warn: Option<String> = None;
             let mut encoder = if save_mp4 {
                 match Mp4Encoder::new_with_encoding(
@@ -1655,110 +2229,32 @@ impl LiquidApp {
                 .iter()
                 .any(|c| c.enabled && matches!(c.shape, ColliderShape::Mesh(_)));
             let has_drains = !render_solver.drains.is_empty();
-            let need_mesh = render_mode == RenderMode::SurfaceMesh;
+            let need_mesh = render_mode == RenderMode::SurfaceMesh || also_obj;
             let need_cpu_render = matches!(off, GuiOfflineRenderer::Cpu(_))
                 || gpu_opt
                     .as_ref()
                     .map_or(true, |gs| !gs.supports_vertex_storage());
-            let need_cpu_particles = has_mesh_col || has_drains || need_mesh || need_cpu_render;
+            let need_cpu_particles =
+                has_mesh_col || has_drains || need_mesh || need_cpu_render || also_ply;
 
             let mut anim_t = initial_anim_t;
             let mut done = 0usize;
             let mut cpu_particles_synced = true;
 
-            for _frame in 0..total_frames {
+            for frame_idx in 0..total_frames {
                 if cancel_flag.load(Ordering::SeqCst) {
                     break;
                 }
 
-                if let Some(ref mut gpu) = gpu_opt {
-                    let prev_n = render_solver.particles.len();
-                    render_solver.emit_faucets(dt);
-                    let new_n = render_solver.particles.len();
-                    if new_n != prev_n {
-                        if new_n > gpu.particle_capacity && !cpu_particles_synced {
-                            let newly_emitted = render_solver.particles.split_off(prev_n);
-                            gpu.read_particles(&mut render_solver.particles);
-                            render_solver.particles.extend(newly_emitted);
-                        }
-                        gpu.sync_particles(
-                            render_solver.bounds,
-                            &render_solver.config,
-                            &render_solver.particles,
-                            true,
-                        );
-                    }
-                    gpu.step(
-                        render_solver.bounds,
-                        &render_solver.chamber,
-                        &render_solver.config,
-                        &render_solver.colliders,
-                        None,
-                        0.0,
-                        0,
-                        dt,
-                        is_2d,
-                    );
-
-                    if need_cpu_particles {
-                        gpu.read_particles(&mut render_solver.particles);
-                        cpu_particles_synced = true;
-
-                        if has_mesh_col {
-                            let radius = render_solver.config.particle_radius;
-                            let colliders = &render_solver.colliders;
-                            let b_min = render_solver.bounds.min + Vec3::splat(radius);
-                            let b_max = render_solver.bounds.max - Vec3::splat(radius);
-                            let hit = render_solver
-                                .particles
-                                .par_iter_mut()
-                                .map(|p| {
-                                    let mut p_hit = false;
-                                    for col in colliders {
-                                        if let ColliderShape::Mesh(_) = &col.shape {
-                                            p_hit |= col.resolve(
-                                                &mut p.position,
-                                                &mut p.velocity,
-                                                radius,
-                                            );
-                                        }
-                                    }
-                                    if p_hit {
-                                        p.position =
-                                            p.position.clamp(b_min.min(b_max), b_max.max(b_min));
-                                        if is_2d {
-                                            p.position.z = 0.0;
-                                            p.velocity.z = 0.0;
-                                        }
-                                    }
-                                    p_hit
-                                })
-                                .reduce(|| false, |a, b| a || b);
-                            if hit {
-                                gpu.sync_particles(
-                                    render_solver.bounds,
-                                    &render_solver.config,
-                                    &render_solver.particles,
-                                    false,
-                                );
-                            }
-                        }
-
-                        let drained = render_solver.drain_particles();
-                        if drained > 0 {
-                            gpu.sync_particles(
-                                render_solver.bounds,
-                                &render_solver.config,
-                                &render_solver.particles,
-                                false,
-                            );
-                        }
-                    } else {
-                        cpu_particles_synced = false;
-                    }
-                } else {
-                    render_solver.step(dt);
-                }
+                Self::step_offline_solver_frame(
+                    &mut render_solver,
+                    &mut gpu_opt,
+                    &mut cpu_particles_synced,
+                    need_cpu_particles,
+                    has_mesh_col,
+                    dt,
+                    is_2d,
+                );
                 anim_t += dt;
 
                 let rgb_slice = off.render_frame(
@@ -1782,6 +2278,40 @@ impl LiquidApp {
 
                 camera.azimuth += orbit_rad_per_sec * wall_frame_dt;
 
+                if also_obj {
+                    let obj_mesh = SurfaceMesh::from_particles(
+                        &render_solver.particles,
+                        render_solver.config.particle_radius,
+                        render_solver.config.smoothing_length,
+                        &mesh_cfg,
+                    );
+                    let _ =
+                        obj_mesh.save_obj(seq_dir.join(format!("fluid_surface_{:05}.obj", frame_idx)));
+                }
+                if also_ply {
+                    let rest_rho = render_solver.config.rest_density;
+                    let bnds = render_solver.bounds;
+                    let colors: Vec<[u8; 3]> = render_solver
+                        .particles
+                        .iter()
+                        .map(|p| {
+                            ColorMap::particle_color(
+                                p,
+                                color_mode,
+                                color_map,
+                                rest_rho,
+                                &bnds,
+                                particle_foam,
+                            )
+                        })
+                        .collect();
+                    let _ = PlyExporter::save_binary(
+                        seq_dir.join(format!("fluid_{:05}.ply", frame_idx)),
+                        &render_solver.particles,
+                        &colors,
+                    );
+                }
+
                 let preview = Self::make_preview_frame(rgb_slice, width, height, prev_w, prev_h);
 
                 if let Some(ref mut enc) = encoder {
@@ -1792,10 +2322,15 @@ impl LiquidApp {
                 }
 
                 done += 1;
+                let cur_pts = gpu_opt
+                    .as_ref()
+                    .map_or(render_solver.particles.len(), |gs| gs.particle_count);
                 if let Ok(mut g) = state_arc.lock() {
                     g.anim_frames.push(preview);
                     g.completed_frames = done;
                     g.elapsed_secs = t_start.elapsed().as_secs_f32();
+                    g.sim_particles_count = cur_pts;
+                    g.phase_label = format!("Rendering frame {} of {}", done, total_frames);
                     g.frame_revision = g.frame_revision.wrapping_add(1);
                 }
                 if let Some(ref c) = ctx {
@@ -1821,6 +2356,7 @@ impl LiquidApp {
                 g.is_running = false;
                 g.completed_frames = done;
                 g.elapsed_secs = elapsed;
+                g.phase_label = "Render complete".to_string();
                 g.saved_path = saved_mp4.clone();
                 if done > 0 {
                     g.full_res_frame = Some(PreviewFrameRgb {
@@ -4539,6 +5075,110 @@ impl LiquidApp {
         });
     }
 
+    fn format_eta(done: usize, total: usize, elapsed: f32) -> Option<String> {
+        if done == 0 || total <= done || elapsed < 0.25 {
+            return None;
+        }
+        let rem = (elapsed / done as f32) * (total - done) as f32;
+        if !rem.is_finite() || rem < 0.4 {
+            return Some("almost done".to_string());
+        }
+        let secs = rem.ceil() as u64;
+        if secs >= 60 {
+            Some(format!("~{}m {:02}s left", secs / 60, secs % 60))
+        } else {
+            Some(format!("~{}s left", secs))
+        }
+    }
+
+    fn friendly_sim_quality_label(
+        q: Option<SimulationQuality>,
+        is_2d: bool,
+        editor_q: SimulationQuality,
+    ) -> String {
+        match q {
+            None => {
+                let ed = match editor_q {
+                    SimulationQuality::Draft => "Fast Draft",
+                    SimulationQuality::Medium => "Balanced",
+                    SimulationQuality::High => "Smooth",
+                    SimulationQuality::Ultra => "High Detail",
+                    SimulationQuality::Cinematic => "Cinematic",
+                    SimulationQuality::Extreme => "Ultra VFX",
+                    SimulationQuality::Studio => "Studio",
+                    SimulationQuality::Film => "Film",
+                    SimulationQuality::Master => "Master",
+                    SimulationQuality::Custom => "Custom",
+                };
+                format!("Same as 3D Editor ({})", ed)
+            }
+            Some(SimulationQuality::Draft) => {
+                if is_2d {
+                    "Fast Draft (~300 particles)".to_string()
+                } else {
+                    "Fast Draft (~2.5k particles)".to_string()
+                }
+            }
+            Some(SimulationQuality::Medium) => {
+                if is_2d {
+                    "Balanced (~500 particles)".to_string()
+                } else {
+                    "Balanced (~5.5k particles)".to_string()
+                }
+            }
+            Some(SimulationQuality::High) => {
+                if is_2d {
+                    "Smooth (~1.5k particles)".to_string()
+                } else {
+                    "Smooth (~18k particles)".to_string()
+                }
+            }
+            Some(SimulationQuality::Ultra) => {
+                if is_2d {
+                    "High Detail (~4k — Recommended)".to_string()
+                } else {
+                    "High Detail (~50k — Recommended)".to_string()
+                }
+            }
+            Some(SimulationQuality::Cinematic) => {
+                if is_2d {
+                    "Cinematic (~10k particles)".to_string()
+                } else {
+                    "Cinematic (~120k particles)".to_string()
+                }
+            }
+            Some(SimulationQuality::Extreme) => {
+                if is_2d {
+                    "Ultra VFX (~30k particles)".to_string()
+                } else {
+                    "Ultra VFX (~1 Million particles)".to_string()
+                }
+            }
+            Some(SimulationQuality::Studio) => {
+                if is_2d {
+                    "Studio Offline (~48k particles)".to_string()
+                } else {
+                    "Studio Offline (~2.5 Million particles)".to_string()
+                }
+            }
+            Some(SimulationQuality::Film) => {
+                if is_2d {
+                    "Film Offline (~95k particles)".to_string()
+                } else {
+                    "Film Offline (~4.9 Million particles)".to_string()
+                }
+            }
+            Some(SimulationQuality::Master) => {
+                if is_2d {
+                    "Master Offline (~160k particles)".to_string()
+                } else {
+                    "Master Offline (~8.2 Million particles)".to_string()
+                }
+            }
+            Some(SimulationQuality::Custom) => "Custom Setup".to_string(),
+        }
+    }
+
     fn draw_render_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let (
             is_running,
@@ -4546,6 +5186,8 @@ impl LiquidApp {
             done,
             total,
             elapsed,
+            phase_lbl,
+            sim_pts,
             has_still,
             anim_len,
             backend_lbl,
@@ -4561,6 +5203,8 @@ impl LiquidApp {
                     g.completed_frames,
                     g.total_frames,
                     g.elapsed_secs,
+                    g.phase_label.clone(),
+                    g.sim_particles_count,
                     g.full_res_frame.is_some(),
                     g.anim_frames.len(),
                     g.backend_label.clone(),
@@ -4576,6 +5220,8 @@ impl LiquidApp {
                     0,
                     0,
                     0.0,
+                    String::new(),
+                    0,
                     false,
                     0,
                     String::new(),
@@ -4588,73 +5234,271 @@ impl LiquidApp {
         };
         let has_result = has_still || anim_len > 0;
 
-        // 1. Studio Render Mode, Resolution & Optics Quality
-        Self::section_card(ui, "Studio Render Setup", |ui| {
+        // 1. Beginner-Friendly One-Click Render Presets
+        Self::section_card(ui, "1. Quick Render Presets", |ui| {
+            let half_w = (ui.available_width() - 6.0) * 0.5;
+            ui.horizontal(|ui| {
+                for &p in &[
+                    GuidedRenderPreset::QuickPreview,
+                    GuidedRenderPreset::RecommendedHd,
+                ] {
+                    let ic = if p == GuidedRenderPreset::QuickPreview {
+                        UiIcon::Bolt
+                    } else {
+                        UiIcon::Film
+                    };
+                    if Self::icon_button(
+                        ui,
+                        ic,
+                        p.title(),
+                        self.guided_render_preset == p,
+                        Some(egui::vec2(half_w, 27.0)),
+                    )
+                    .on_hover_text(p.summary())
+                    .clicked()
+                    {
+                        self.apply_guided_render_preset(p);
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                for &p in &[
+                    GuidedRenderPreset::Cinematic2K,
+                    GuidedRenderPreset::Ultra4K,
+                ] {
+                    if Self::icon_button(
+                        ui,
+                        UiIcon::Film,
+                        p.title(),
+                        self.guided_render_preset == p,
+                        Some(egui::vec2(half_w, 27.0)),
+                    )
+                    .on_hover_text(p.summary())
+                    .clicked()
+                    {
+                        self.apply_guided_render_preset(p);
+                    }
+                }
+            });
+            if Self::icon_button(
+                ui,
+                UiIcon::Camera,
+                GuidedRenderPreset::StudioPhoto.title(),
+                self.guided_render_preset == GuidedRenderPreset::StudioPhoto,
+                Some(egui::vec2(ui.available_width(), 26.0)),
+            )
+            .on_hover_text(GuidedRenderPreset::StudioPhoto.summary())
+            .clicked()
+            {
+                self.apply_guided_render_preset(GuidedRenderPreset::StudioPhoto);
+            }
+
+            ui.add_space(2.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(148, 194, 236),
+                self.guided_render_preset.summary(),
+            );
+        });
+
+        ui.add_space(6.0);
+
+        // 2. Plain-English Quality, Look & File Settings
+        Self::section_card(ui, "2. Customize Look & Quality", |ui| {
+            // Output Type: Video vs Still Photo
             ui.horizontal(|ui| {
                 let half_w = (ui.available_width() - 6.0) * 0.5;
                 if Self::icon_button(
                     ui,
-                    UiIcon::Camera,
-                    "Still Image",
-                    self.render_kind == StudioRenderKind::StillFrame,
-                    Some(egui::vec2(half_w, 27.0)),
-                )
-                .on_hover_text("Render a high-resolution supersampled studio still frame")
-                .clicked()
-                {
-                    self.render_kind = StudioRenderKind::StillFrame;
-                }
-                if Self::icon_button(
-                    ui,
                     UiIcon::Film,
-                    "Video Animation",
+                    "Video (.mp4)",
                     self.render_kind == StudioRenderKind::Animation,
                     Some(egui::vec2(half_w, 27.0)),
                 )
-                .on_hover_text("Simulate & render a multi-frame animation with in-GUI playback and MP4 export")
+                .on_hover_text("Simulate and render a smooth video animation you can watch & save")
                 .clicked()
                 {
                     self.render_kind = StudioRenderKind::Animation;
+                    self.guided_render_preset = GuidedRenderPreset::Custom;
+                }
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Camera,
+                    "Still Photo (.png)",
+                    self.render_kind == StudioRenderKind::StillFrame,
+                    Some(egui::vec2(half_w, 27.0)),
+                )
+                .on_hover_text("Render a high-resolution studio photograph")
+                .clicked()
+                {
+                    self.render_kind = StudioRenderKind::StillFrame;
+                    self.guided_render_preset = GuidedRenderPreset::Custom;
                 }
             });
 
-            ui.add_space(2.0);
+            ui.add_space(3.0);
 
+            // Liquid Appearance (decoupled from Live 3D Editor so viewport stays fast!)
+            ui.label("Liquid Style in Render:");
             ui.horizontal(|ui| {
-                ui.label("Geometry:");
-                if Self::icon_button(
-                    ui,
-                    UiIcon::Spheres,
-                    "Spheres",
-                    self.render_mode == RenderMode::Particles,
-                    None,
-                )
-                .clicked()
-                {
-                    self.render_mode = RenderMode::Particles;
-                }
+                let third_w = (ui.available_width() - 12.0) / 3.0;
                 if Self::icon_button(
                     ui,
                     UiIcon::Mesh,
-                    "Surface Mesh",
-                    self.render_mode == RenderMode::SurfaceMesh,
-                    None,
+                    "Smooth Liquid",
+                    self.render_appearance == RenderAppearance::SmoothLiquid,
+                    Some(egui::vec2(third_w + 8.0, 25.0)),
                 )
+                .on_hover_text("Render realistic glossy 3D liquid surface (keeps your live editor fast)")
                 .clicked()
                 {
-                    self.render_mode = RenderMode::SurfaceMesh;
-                    self.mesh_dirty = true;
+                    self.render_appearance = RenderAppearance::SmoothLiquid;
+                    self.guided_render_preset = GuidedRenderPreset::Custom;
+                }
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Spheres,
+                    "Droplets",
+                    self.render_appearance == RenderAppearance::ParticleSpheres,
+                    Some(egui::vec2(third_w - 4.0, 25.0)),
+                )
+                .on_hover_text("Render individual glossy fluid spheres")
+                .clicked()
+                {
+                    self.render_appearance = RenderAppearance::ParticleSpheres;
+                    self.guided_render_preset = GuidedRenderPreset::Custom;
+                }
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Cube3D,
+                    "Same as View",
+                    self.render_appearance == RenderAppearance::MatchViewport,
+                    Some(egui::vec2(third_w - 4.0, 25.0)),
+                )
+                .on_hover_text("Use whichever mode (Spheres or Mesh) is active in the top bar")
+                .clicked()
+                {
+                    self.render_appearance = RenderAppearance::MatchViewport;
+                    self.guided_render_preset = GuidedRenderPreset::Custom;
                 }
             });
 
+            // Quick Material & Sky Lighting selectors right in place
+            egui::Grid::new("render_tab_look_grid")
+                .num_columns(2)
+                .spacing([8.0, 5.0])
+                .show(ui, |ui| {
+                    if self.effective_render_mode() == RenderMode::SurfaceMesh {
+                        ui.label("Material:");
+                        let mut mat = self.mesh_config.preset;
+                        egui::ComboBox::from_id_salt("render_tab_mat_combo")
+                            .selected_text(mat.name())
+                            .width(215.0)
+                            .show_ui(ui, |ui| {
+                                for &p in FluidMaterialPreset::ALL {
+                                    if ui.selectable_value(&mut mat, p, p.name()).clicked() {
+                                        p.apply(&mut self.mesh_config);
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                    } else {
+                        ui.label("Color Theme:");
+                        egui::ComboBox::from_id_salt("render_tab_cmap_combo")
+                            .selected_text(self.color_map.name())
+                            .width(215.0)
+                            .show_ui(ui, |ui| {
+                                for &cm in ColorMapType::ALL {
+                                    ui.selectable_value(&mut self.color_map, cm, cm.name());
+                                }
+                            });
+                        ui.end_row();
+                    }
+
+                    ui.label("Sky Lighting:");
+                    egui::ComboBox::from_id_salt("render_tab_env_combo")
+                        .selected_text(self.mesh_config.env_preset.name())
+                        .width(215.0)
+                        .show_ui(ui, |ui| {
+                            for &ep in EnvironmentPreset::ALL {
+                                ui.selectable_value(
+                                    &mut self.mesh_config.env_preset,
+                                    ep,
+                                    ep.name(),
+                                );
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Fluid Detail:");
+                    let cur_q_lbl = Self::friendly_sim_quality_label(
+                        self.render_sim_quality,
+                        self.is_2d,
+                        self.current_quality,
+                    );
+                    egui::ComboBox::from_id_salt("render_tab_sim_qual")
+                        .selected_text(cur_q_lbl)
+                        .width(215.0)
+                        .show_ui(ui, |ui| {
+                            let same_lbl = Self::friendly_sim_quality_label(
+                                None,
+                                self.is_2d,
+                                self.current_quality,
+                            );
+                            if ui
+                                .selectable_value(&mut self.render_sim_quality, None, same_lbl)
+                                .clicked()
+                            {
+                                self.guided_render_preset = GuidedRenderPreset::Custom;
+                            }
+                            ui.separator();
+                            for &q in SimulationQuality::ALL
+                                .iter()
+                                .chain(SimulationQuality::CLI_ONLY.iter())
+                            {
+                                let lbl = Self::friendly_sim_quality_label(
+                                    Some(q),
+                                    self.is_2d,
+                                    self.current_quality,
+                                );
+                                if ui
+                                    .selectable_value(&mut self.render_sim_quality, Some(q), lbl)
+                                    .clicked()
+                                {
+                                    self.guided_render_preset = GuidedRenderPreset::Custom;
+                                }
+                            }
+                        });
+                    ui.end_row();
+                });
+
+            if !self.is_2d
+                && matches!(
+                    self.render_sim_quality,
+                    Some(
+                        SimulationQuality::Extreme
+                            | SimulationQuality::Studio
+                            | SimulationQuality::Film
+                            | SimulationQuality::Master
+                    )
+                )
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 196, 92),
+                    "Note: 1M+ particle VFX tiers run offline in the background without freezing the editor, but require high RAM/VRAM and take longer.",
+                );
+            }
+
+            ui.separator();
+
+            // Picture Size
             ui.horizontal_wrapped(|ui| {
-                ui.label("Resolution:");
+                ui.label("Picture Size:");
                 for &(w, h, lbl) in &[
                     (1280usize, 720usize, "720p"),
-                    (1920usize, 1080usize, "1080p"),
-                    (2560usize, 1440usize, "1440p"),
+                    (1920usize, 1080usize, "1080p HD"),
+                    (2560usize, 1440usize, "2K"),
                     (3840usize, 2160usize, "4K"),
-                    (1080usize, 1920usize, "9:16"),
+                    (1080usize, 1920usize, "9:16 Phone"),
                 ] {
                     if ui
                         .selectable_label(self.video_width == w && self.video_height == h, lbl)
@@ -4662,298 +5506,435 @@ impl LiquidApp {
                     {
                         self.video_width = w;
                         self.video_height = h;
+                        self.guided_render_preset = GuidedRenderPreset::Custom;
                     }
                 }
             });
 
-            ui.horizontal(|ui| {
-                ui.label("Custom Size:");
-                let mut w_i = self.video_width as u32;
-                let mut h_i = self.video_height as u32;
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut w_i)
-                            .range(320..=7680)
-                            .speed(4)
-                            .suffix(" px"),
-                    )
-                    .changed()
-                {
-                    self.video_width = ((w_i as usize + 1) & !1).clamp(320, 7680);
-                }
-                ui.label("×");
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut h_i)
-                            .range(240..=4320)
-                            .speed(4)
-                            .suffix(" px"),
-                    )
-                    .changed()
-                {
-                    self.video_height = ((h_i as usize + 1) & !1).clamp(240, 4320);
-                }
-            });
-
+            // Image Sharpness & Shadows (friendly names for CliRenderQuality)
             ui.horizontal_wrapped(|ui| {
-                ui.label("Optics Tier:");
-                for &rq in CliRenderQuality::ALL {
-                    let short = match rq {
-                        CliRenderQuality::Standard => "Standard",
-                        CliRenderQuality::Studio => "Studio 2x",
-                        CliRenderQuality::Cinema => "Cinema 3x",
-                        CliRenderQuality::Master => "Master 4x",
-                    };
+                ui.label("Sharpness:");
+                for &(rq, lbl, tip) in &[
+                    (
+                        CliRenderQuality::Standard,
+                        "Fast (1x)",
+                        "Fastest render speed with standard shadows",
+                    ),
+                    (
+                        CliRenderQuality::Studio,
+                        "Smooth (2x)",
+                        "Recommended: 2x anti-aliasing & soft studio shadows",
+                    ),
+                    (
+                        CliRenderQuality::Cinema,
+                        "Crisp (3x)",
+                        "Cinema-grade 3x anti-aliasing & ultra-sharp edges",
+                    ),
+                    (
+                        CliRenderQuality::Master,
+                        "Max (4x)",
+                        "Maximum 4x supersampling (slowest, finest detail)",
+                    ),
+                ] {
                     if ui
-                        .selectable_label(self.gui_render_quality == rq, short)
-                        .on_hover_text(rq.name())
+                        .selectable_label(self.gui_render_quality == rq, lbl)
+                        .on_hover_text(tip)
                         .clicked()
                     {
                         self.gui_render_quality = rq;
+                        self.guided_render_preset = GuidedRenderPreset::Custom;
                     }
                 }
             });
-            ui.weak(format!(
-                "{}x SSAA • {}px soft shadow map • H.264 CRF {}",
-                self.gui_render_quality.ssaa_factor(),
-                self.gui_render_quality.shadow_res(),
-                self.gui_render_quality.ffmpeg_crf(),
-            ));
 
-            ui.checkbox(
-                &mut self.use_gpu,
-                "Hardware Vulkan GPU Rendering & Compute",
-            )
-            .on_hover_text(
-                "Uses Vulkan wgpu offscreen SSAA rasterizer + GPU Marching Cubes (falls back to multi-core CPU when unchecked)",
-            );
-        });
+            ui.separator();
 
-        ui.add_space(6.0);
-
-        // 2. Still Image OR Video Animation Render Trigger Card
-        match self.render_kind {
-            StudioRenderKind::StillFrame => {
-                Self::section_card(ui, "Still Frame Render", |ui| {
-                    ui.checkbox(
-                        &mut self.render_auto_save_png,
-                        "Auto-save rendered PNG to exports/ folder",
-                    );
-
-                    ui.add_space(4.0);
-
-                    if is_running {
-                        let txt = if bg_kind == StudioRenderKind::StillFrame {
-                            format!(
-                                "Rendering {}×{} Studio Frame...",
-                                self.video_width, self.video_height
-                            )
-                        } else {
-                            format!("Rendering Animation Frame {}/{}...", done, total)
-                        };
-                        let frac = if total > 1 {
-                            done as f32 / total as f32
-                        } else {
-                            0.5
-                        };
-                        ui.add(egui::ProgressBar::new(frac).animate(true).text(txt));
-                        if bg_kind == StudioRenderKind::Animation
-                            && ui.button("Stop & Finalize").clicked()
-                        {
-                            self.bg_render_cancel.store(true, Ordering::SeqCst);
-                        }
-                        ctx.request_repaint();
-                    } else if Self::icon_button(
-                        ui,
-                        UiIcon::Camera,
-                        "Render Current Frame (F12)",
-                        true,
-                        Some(egui::vec2(ui.available_width(), 32.0)),
-                    )
-                    .on_hover_text(
-                        "Render the current simulation frame at full Studio quality and display the end result",
-                    )
-                    .clicked()
+            // Mode-specific simple controls (Video Timeline vs Still Photo Capture)
+            match self.render_kind {
+                StudioRenderKind::Animation => {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.cli_duration, 1.0..=30.0)
+                                .text("Video Length")
+                                .suffix(" sec")
+                                .fixed_decimals(1),
+                        )
+                        .changed()
                     {
-                        self.central_view = CentralView::RenderResult;
-                        self.start_gui_still_render(
-                            Some(ctx.clone()),
-                            self.render_auto_save_png,
-                        );
+                        self.guided_render_preset = GuidedRenderPreset::Custom;
                     }
-
-                    if has_result && !is_running {
-                        ui.add_space(3.0);
-                        ui.horizontal(|ui| {
-                            let half_w = (ui.available_width() - 6.0) * 0.5;
-                            if Self::icon_button(
-                                ui,
-                                UiIcon::Save,
-                                "Save Result PNG",
-                                false,
-                                Some(egui::vec2(half_w, 26.0)),
-                            )
-                            .clicked()
-                            {
-                                self.save_rendered_result_png();
-                            }
-                            let toggle_lbl = if self.central_view == CentralView::RenderResult {
-                                "Live 3D View"
-                            } else {
-                                "Show Result"
-                            };
-                            if Self::icon_button(
-                                ui,
-                                UiIcon::Image,
-                                toggle_lbl,
-                                self.central_view == CentralView::RenderResult,
-                                Some(egui::vec2(half_w, 26.0)),
-                            )
-                            .clicked()
-                            {
-                                self.central_view = match self.central_view {
-                                    CentralView::RenderResult => CentralView::LiveViewport,
-                                    CentralView::LiveViewport => CentralView::RenderResult,
-                                };
-                            }
-                        });
-                    }
-                });
-            }
-            StudioRenderKind::Animation => {
-                Self::section_card(ui, "Video Animation Render", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Start From:");
-                        if ui
-                            .selectable_label(
-                                self.render_anim_start == AnimationStartSource::PresetStart,
-                                "Preset Start (t=0)",
-                            )
-                            .on_hover_text("Start cleanly from t = 0s of the active scene preset")
-                            .clicked()
-                        {
-                            self.render_anim_start = AnimationStartSource::PresetStart;
-                        }
-                        if ui
-                            .selectable_label(
-                                self.render_anim_start == AnimationStartSource::CurrentState,
-                                "Current State",
-                            )
-                            .on_hover_text("Continue simulating forward from the current live particles")
-                            .clicked()
-                        {
-                            self.render_anim_start = AnimationStartSource::CurrentState;
-                        }
-                    });
-
-                    ui.add(
-                        egui::Slider::new(&mut self.cli_duration, 0.5..=30.0)
-                            .text("Duration (s)")
-                            .fixed_decimals(1),
-                    );
 
                     let planned_frames =
                         (self.cli_duration * self.cli_fps.max(1) as f32).round().max(1.0) as usize;
-                    ui.horizontal(|ui| {
-                        ui.label("FPS:");
-                        for &f in &[24u32, 30, 60, 120] {
-                            if ui
-                                .selectable_label(self.cli_fps == f, format!("{}", f))
-                                .clicked()
-                            {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Smoothness:");
+                        for &(f, lbl) in &[
+                            (24u32, "24 FPS"),
+                            (30u32, "30 FPS"),
+                            (60u32, "60 FPS"),
+                        ] {
+                            if ui.selectable_label(self.cli_fps == f, lbl).clicked() {
                                 self.cli_fps = f;
+                                self.guided_render_preset = GuidedRenderPreset::Custom;
                             }
                         }
                         ui.weak(format!("({} frames)", planned_frames));
                     });
 
-                    ui.checkbox(&mut self.render_save_mp4, "Save H.264 MP4 video file");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Motion:");
+                        for &(spd, lbl) in &[
+                            (1.0f32, "Normal"),
+                            (0.5f32, "Slow-Mo"),
+                            (0.25f32, "Super Slow"),
+                        ] {
+                            if ui
+                                .selectable_label((self.sim_speed - spd).abs() < 0.03, lbl)
+                                .clicked()
+                            {
+                                self.sim_speed = spd;
+                            }
+                        }
+                    });
+
+                    if !self.is_2d {
+                        let mut spin = self.camera_orbit_speed_deg.abs() > 0.5;
+                        if ui
+                            .checkbox(&mut spin, "360° Showcase Camera Spin")
+                            .on_hover_text(
+                                "Gently orbits the camera around the tank while the video renders",
+                            )
+                            .changed()
+                        {
+                            self.camera_orbit_speed_deg = if spin { 18.0 } else { 0.0 };
+                        }
+                    }
+
+                    ui.checkbox(&mut self.render_save_mp4, "Save video file (.mp4) to disk");
                     if self.render_save_mp4 {
                         ui.horizontal(|ui| {
-                            ui.label("Output MP4:");
-                            ui.text_edit_singleline(&mut self.cli_mp4_output);
+                            let btn_w = 78.0;
+                            let txt_w = (ui.available_width() - btn_w - 6.0).max(80.0);
+                            ui.add_sized(
+                                [txt_w, 22.0],
+                                egui::TextEdit::singleline(&mut self.cli_mp4_output),
+                            );
+                            if Self::icon_button(
+                                ui,
+                                UiIcon::Folder,
+                                "Browse",
+                                false,
+                                Some(egui::vec2(btn_w, 22.0)),
+                            )
+                            .on_hover_text("Choose where to save your .mp4 video")
+                            .clicked()
+                            {
+                                self.spawn_render_file_dialog(ctx.clone(), 0);
+                            }
+                        });
+                    }
+                }
+                StudioRenderKind::StillFrame => {
+                    ui.horizontal(|ui| {
+                        ui.label("Moment:");
+                        if ui
+                            .selectable_label(!self.render_still_simulate, "Current View")
+                            .on_hover_text("Capture the current moment shown in the 3D editor")
+                            .clicked()
+                        {
+                            self.render_still_simulate = false;
+                        }
+                        if ui
+                            .selectable_label(self.render_still_simulate, "Simulate to Time...")
+                            .on_hover_text(
+                                "Simulate from the start (t = 0s) up to an exact timestamp before taking the photo",
+                            )
+                            .clicked()
+                        {
+                            self.render_still_simulate = true;
+                            if self.render_still_time < 0.05 {
+                                self.render_still_time =
+                                    if self.sim_time > 0.05 { self.sim_time } else { 1.6 };
+                            }
+                        }
+                    });
+
+                    if self.render_still_simulate {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Slider::new(&mut self.render_still_time, 0.0..=15.0)
+                                    .text("Time")
+                                    .suffix(" sec")
+                                    .fixed_decimals(2),
+                            );
+                            if ui
+                                .small_button("Use Editor")
+                                .on_hover_text("Copy current simulation timestamp from the live editor")
+                                .clicked()
+                            {
+                                self.render_still_time = self.sim_time;
+                            }
                         });
                     }
 
-                    ui.add_space(4.0);
-
-                    if is_running {
-                        let frac = if total > 0 {
-                            done as f32 / total as f32
-                        } else {
-                            0.0
-                        };
-                        let rate = if elapsed > 0.05 && done > 0 {
-                            done as f32 / elapsed
-                        } else {
-                            0.0
-                        };
-                        ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!(
-                            "Frame {}/{} ({:.1}s • {:.1} fps)",
-                            done, total, elapsed, rate
-                        )));
-                        if ui.button("Stop & Finalize Animation").clicked() {
-                            self.bg_render_cancel.store(true, Ordering::SeqCst);
-                        }
-                        ctx.request_repaint();
-                    } else if Self::icon_button(
-                        ui,
-                        UiIcon::Film,
-                        "Render Animation & Show Result",
-                        true,
-                        Some(egui::vec2(ui.available_width(), 32.0)),
-                    )
-                    .clicked()
-                    {
-                        self.central_view = CentralView::RenderResult;
-                        self.start_gui_mp4_render_with_ctx(Some(ctx.clone()));
+                    ui.checkbox(
+                        &mut self.render_auto_save_png,
+                        "Auto-save photo (.png) to disk",
+                    );
+                    if self.render_auto_save_png {
+                        ui.horizontal(|ui| {
+                            let btn_w = 78.0;
+                            let txt_w = (ui.available_width() - btn_w - 6.0).max(80.0);
+                            ui.add_sized(
+                                [txt_w, 22.0],
+                                egui::TextEdit::singleline(&mut self.png_output_path),
+                            );
+                            if Self::icon_button(
+                                ui,
+                                UiIcon::Folder,
+                                "Browse",
+                                false,
+                                Some(egui::vec2(btn_w, 22.0)),
+                            )
+                            .on_hover_text("Choose where to save your .png photo")
+                            .clicked()
+                            {
+                                self.spawn_render_file_dialog(ctx.clone(), 1);
+                            }
+                        });
                     }
-                });
+                }
             }
-        }
+        });
 
-        // 3. End-Result Telemetry & Saved File Card
-        if has_result || is_running {
-            ui.add_space(6.0);
-            Self::section_card(ui, "Rendered End Result", |ui| {
+        ui.add_space(6.0);
+
+        // 3. Primary Start Button, Plain-English Progress + ETA & End Result Actions
+        Self::section_card(ui, "3. Start Render & View Result", |ui| {
+            let look_name = match self.effective_render_mode() {
+                RenderMode::SurfaceMesh => "Smooth Liquid",
+                RenderMode::Particles => "Droplets",
+            };
+
+            if is_running {
+                let frac = if total > 0 {
+                    (done as f32 / total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.25
+                };
+                let pct = (frac * 100.0).round() as u32;
+                let bar_txt = if let Some(eta) = Self::format_eta(done, total, elapsed) {
+                    format!("{}% • {}", pct, eta)
+                } else if total > 1 {
+                    format!("{}% ({}/{})", pct, done, total)
+                } else {
+                    "Working...".to_string()
+                };
+
+                if !phase_lbl.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(154, 214, 255), &phase_lbl);
+                }
+                ui.add(egui::ProgressBar::new(frac).animate(true).text(bar_txt));
+
+                if sim_pts > 0 || !backend_lbl.is_empty() {
+                    let pts_str = if sim_pts > 0 {
+                        format!("{} particles", Self::format_particle_count(sim_pts))
+                    } else {
+                        String::new()
+                    };
+                    let info = match (!pts_str.is_empty(), !backend_lbl.is_empty()) {
+                        (true, true) => format!("{} • {}", pts_str, backend_lbl),
+                        (true, false) => pts_str,
+                        (false, true) => backend_lbl.clone(),
+                        (false, false) => String::new(),
+                    };
+                    ui.weak(info);
+                }
+
+                let stop_lbl = if bg_kind == StudioRenderKind::Animation {
+                    "Stop Early & Keep Rendered Video"
+                } else {
+                    "Cancel Photo Render"
+                };
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Pause,
+                    stop_lbl,
+                    false,
+                    Some(egui::vec2(ui.available_width(), 27.0)),
+                )
+                .clicked()
+                {
+                    self.bg_render_cancel.store(true, Ordering::SeqCst);
+                }
+                ctx.request_repaint();
+            } else {
+                let summary_line = match self.render_kind {
+                    StudioRenderKind::Animation => {
+                        let frames = (self.cli_duration * self.cli_fps.max(1) as f32)
+                            .round()
+                            .max(1.0) as usize;
+                        format!(
+                            "Ready: {}×{} video • {:.1}s @ {} FPS ({} frames) • {}",
+                            self.video_width,
+                            self.video_height,
+                            self.cli_duration,
+                            self.cli_fps,
+                            frames,
+                            look_name
+                        )
+                    }
+                    StudioRenderKind::StillFrame => {
+                        format!(
+                            "Ready: {}×{} photo • {} • {}",
+                            self.video_width,
+                            self.video_height,
+                            look_name,
+                            self.gui_render_quality.name()
+                        )
+                    }
+                };
+                ui.weak(summary_line);
+                ui.add_space(2.0);
+
+                match self.render_kind {
+                    StudioRenderKind::Animation => {
+                        if Self::icon_button(
+                            ui,
+                            UiIcon::Film,
+                            "Start Video Render",
+                            true,
+                            Some(egui::vec2(ui.available_width(), 35.0)),
+                        )
+                        .on_hover_text(
+                            "Run full offline fluid simulation & studio rendering and play the finished video right here",
+                        )
+                        .clicked()
+                        {
+                            self.central_view = CentralView::RenderResult;
+                            self.start_gui_mp4_render_with_ctx(Some(ctx.clone()));
+                        }
+                    }
+                    StudioRenderKind::StillFrame => {
+                        if Self::icon_button(
+                            ui,
+                            UiIcon::Camera,
+                            "Render High-Res Photo (F12)",
+                            true,
+                            Some(egui::vec2(ui.available_width(), 35.0)),
+                        )
+                        .on_hover_text(
+                            "Render a high-resolution studio photograph and display the finished image",
+                        )
+                        .clicked()
+                        {
+                            self.central_view = CentralView::RenderResult;
+                            self.start_gui_still_render(
+                                Some(ctx.clone()),
+                                self.render_auto_save_png,
+                            );
+                        }
+                    }
+                }
+            }
+
+            if has_result && !is_running {
+                ui.separator();
                 egui::Grid::new("render_result_summary_grid")
                     .num_columns(2)
-                    .spacing([12.0, 4.0])
+                    .spacing([10.0, 3.0])
                     .show(ui, |ui| {
-                        ui.weak("Output:");
-                        ui.monospace(format!("{}×{} ({})", out_w, out_h, qual.name()));
+                        ui.weak("Result:");
+                        if anim_len > 0 || bg_kind == StudioRenderKind::Animation {
+                            ui.monospace(format!(
+                                "{}×{} • {} frames ({:.1}s)",
+                                out_w,
+                                out_h,
+                                done.max(anim_len),
+                                elapsed
+                            ));
+                        } else {
+                            ui.monospace(format!(
+                                "{}×{} photo ({:.2}s)",
+                                out_w, out_h, elapsed
+                            ));
+                        }
                         ui.end_row();
 
+                        if sim_pts > 0 {
+                            ui.weak("Fluid:");
+                            ui.monospace(format!(
+                                "{} particles ({})",
+                                Self::format_particle_count(sim_pts),
+                                qual.slug()
+                            ));
+                            ui.end_row();
+                        }
+
                         if !backend_lbl.is_empty() {
-                            ui.weak("Backend:");
+                            ui.weak("Engine:");
                             ui.colored_label(
                                 egui::Color32::from_rgb(114, 198, 255),
                                 &backend_lbl,
                             );
                             ui.end_row();
                         }
-
-                        ui.weak("Result:");
-                        if anim_len > 0 || bg_kind == StudioRenderKind::Animation {
-                            let rate = if elapsed > 0.01 && done > 0 {
-                                done as f32 / elapsed
-                            } else {
-                                0.0
-                            };
-                            ui.monospace(format!(
-                                "{} frames • {:.2}s ({:.1} fps)",
-                                done.max(anim_len),
-                                elapsed,
-                                rate
-                            ));
-                        } else {
-                            ui.monospace(format!("Still frame • {:.0} ms", elapsed * 1000.0));
-                        }
-                        ui.end_row();
                     });
 
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    let half_w = (ui.available_width() - 6.0) * 0.5;
+                    if Self::icon_button(
+                        ui,
+                        UiIcon::Save,
+                        "Save Image As...",
+                        false,
+                        Some(egui::vec2(half_w, 26.0)),
+                    )
+                    .on_hover_text("Choose where to save the displayed frame as a lossless PNG image")
+                    .clicked()
+                    {
+                        self.spawn_render_file_dialog(ctx.clone(), 2);
+                    }
+
+                    let folder_target = saved_path
+                        .clone()
+                        .unwrap_or_else(|| self.export_path.clone());
+                    if Self::icon_button(
+                        ui,
+                        UiIcon::Folder,
+                        "Open Folder",
+                        false,
+                        Some(egui::vec2(half_w, 26.0)),
+                    )
+                    .on_hover_text("Open the output folder in your computer's file manager")
+                    .clicked()
+                    {
+                        Self::open_in_file_manager(&folder_target);
+                    }
+                });
+
+                let (view_ic, view_lbl) = if self.central_view == CentralView::RenderResult {
+                    (UiIcon::Cube3D, "Back to Live 3D Editor")
+                } else {
+                    (UiIcon::Image, "Show Rendered Result")
+                };
+                if Self::icon_button(
+                    ui,
+                    view_ic,
+                    view_lbl,
+                    self.central_view == CentralView::RenderResult,
+                    Some(egui::vec2(ui.available_width(), 26.0)),
+                )
+                .clicked()
+                {
+                    self.central_view = match self.central_view {
+                        CentralView::RenderResult => CentralView::LiveViewport,
+                        CentralView::LiveViewport => CentralView::RenderResult,
+                    };
+                }
+
                 if let Some(ref p) = saved_path {
-                    ui.add_space(3.0);
                     ui.horizontal(|ui| {
                         ui.weak("Saved:");
                         ui.monospace(
@@ -4961,20 +5942,133 @@ impl LiquidApp {
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(120, 224, 158)),
                         );
-                        if Self::icon_button(ui, UiIcon::Copy, "", false, Some(egui::vec2(22.0, 20.0)))
-                            .on_hover_text("Copy file path to clipboard")
-                            .clicked()
+                        if Self::icon_button(
+                            ui,
+                            UiIcon::Copy,
+                            "",
+                            false,
+                            Some(egui::vec2(22.0, 20.0)),
+                        )
+                        .on_hover_text("Copy file path to clipboard")
+                        .clicked()
                         {
                             ctx.copy_text(p.clone());
                             self.status_message = format!("Copied path '{}'", p);
                         }
                     });
                 }
+            }
+        });
 
-                ui.add_space(2.0);
-                ui.weak("Tip: Scroll to zoom & drag to pan in Render Result view; double-click to fit.");
+        ui.add_space(6.0);
+
+        // 4. Collapsed Power-User & CLI Drawer (keeps UI clean for beginners!)
+        egui::CollapsingHeader::new("Advanced & CLI Options")
+            .default_open(false)
+            .show(ui, |ui| {
+                Self::section_card(ui, "Custom Size, 3D Mesh Export & CLI", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Exact Pixels:");
+                        let mut w_i = self.video_width as u32;
+                        let mut h_i = self.video_height as u32;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut w_i)
+                                    .range(320..=7680)
+                                    .speed(4)
+                                    .suffix(" px"),
+                            )
+                            .changed()
+                        {
+                            self.video_width = ((w_i as usize + 1) & !1).clamp(320, 7680);
+                            self.guided_render_preset = GuidedRenderPreset::Custom;
+                        }
+                        ui.label("×");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut h_i)
+                                    .range(240..=4320)
+                                    .speed(4)
+                                    .suffix(" px"),
+                            )
+                            .changed()
+                        {
+                            self.video_height = ((h_i as usize + 1) & !1).clamp(240, 4320);
+                            self.guided_render_preset = GuidedRenderPreset::Custom;
+                        }
+                    });
+
+                    if self.render_kind == StudioRenderKind::Animation {
+                        ui.horizontal(|ui| {
+                            ui.label("Start Video:");
+                            if ui
+                                .selectable_label(
+                                    self.render_anim_start == AnimationStartSource::PresetStart,
+                                    "Scene Start (t=0)",
+                                )
+                                .clicked()
+                            {
+                                self.render_anim_start = AnimationStartSource::PresetStart;
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.render_anim_start == AnimationStartSource::CurrentState,
+                                    "Current Fluid",
+                                )
+                                .on_hover_text(
+                                    "Continues from live particles when Fluid Detail is 'Same as 3D Editor'",
+                                )
+                                .clicked()
+                            {
+                                self.render_anim_start = AnimationStartSource::CurrentState;
+                            }
+                        });
+
+                        if !self.is_2d {
+                            ui.add(
+                                egui::Slider::new(&mut self.camera_orbit_speed_deg, -60.0..=60.0)
+                                    .text("Orbit Speed")
+                                    .suffix(" °/s"),
+                            );
+                        }
+
+                        ui.checkbox(
+                            &mut self.render_also_export_obj,
+                            "Also export 3D Surface Mesh sequence (.obj)",
+                        )
+                        .on_hover_text("Writes fluid_surface_00000.obj ... into the Export folder for Blender / Houdini");
+                        ui.checkbox(
+                            &mut self.render_also_export_ply,
+                            "Also export Particle Cloud sequence (.ply)",
+                        );
+                    }
+
+                    ui.checkbox(
+                        &mut self.use_gpu,
+                        "Hardware Vulkan GPU Acceleration",
+                    )
+                    .on_hover_text(
+                        "Uses Vulkan GPU simulation, GPU Marching Cubes & offscreen SSAA rasterizer (uncheck for multi-core CPU)",
+                    );
+
+                    ui.separator();
+                    ui.weak("Equivalent Terminal (CLI) Command:");
+                    let mut cli_cmd = self.generate_render_tab_cli_command();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut cli_cmd)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if Self::icon_button(ui, UiIcon::Copy, "Copy CLI Command", false, None)
+                        .clicked()
+                    {
+                        ctx.copy_text(cli_cmd);
+                        self.status_message =
+                            "Copied equivalent CLI render command to clipboard!".to_string();
+                    }
+                });
             });
-        }
     }
 
     fn draw_render_cli_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -5108,6 +6202,39 @@ impl eframe::App for LiquidApp {
             self.theme_applied = true;
         }
 
+        // Poll native OS file dialogs for Render output paths & "Save Image As..."
+        if let Ok(mut g) = self.render_mp4_browse_result.lock() {
+            if let Some(mut chosen) = g.take() {
+                if std::path::Path::new(&chosen).extension().is_none() {
+                    chosen.push_str(".mp4");
+                }
+                self.cli_mp4_output = chosen;
+                self.render_save_mp4 = true;
+            }
+        }
+        if let Ok(mut g) = self.render_png_browse_result.lock() {
+            if let Some(mut chosen) = g.take() {
+                if std::path::Path::new(&chosen).extension().is_none() {
+                    chosen.push_str(".png");
+                }
+                self.png_output_path = chosen;
+                self.render_auto_save_png = true;
+            }
+        }
+        let save_as_png_now = {
+            if let Ok(mut g) = self.render_save_result_png_slot.lock() {
+                g.take()
+            } else {
+                None
+            }
+        };
+        if let Some(mut chosen) = save_as_png_now {
+            if std::path::Path::new(&chosen).extension().is_none() {
+                chosen.push_str(".png");
+            }
+            self.save_rendered_result_png_to_path(std::path::Path::new(&chosen));
+        }
+
         // Sync background studio render progress, messages, and animation auto-play state
         let (
             bg_is_running,
@@ -5115,6 +6242,8 @@ impl eframe::App for LiquidApp {
             bg_done,
             bg_total,
             bg_elapsed,
+            bg_phase,
+            bg_sim_pts,
             bg_has_still,
             bg_anim_len,
             bg_fps,
@@ -5122,6 +6251,7 @@ impl eframe::App for LiquidApp {
             bg_out_h,
             bg_qual,
             bg_backend,
+            bg_saved_path,
         ) = {
             let mut finished_msg = None;
             let mut start_playback = false;
@@ -5131,6 +6261,8 @@ impl eframe::App for LiquidApp {
                 0usize,
                 0usize,
                 0.0f32,
+                String::new(),
+                0usize,
                 false,
                 0usize,
                 60u32,
@@ -5138,6 +6270,7 @@ impl eframe::App for LiquidApp {
                 self.video_height,
                 self.gui_render_quality,
                 String::new(),
+                None,
             );
             if let Ok(mut g) = self.bg_render.lock() {
                 finished_msg = g.finished_message.take();
@@ -5151,6 +6284,8 @@ impl eframe::App for LiquidApp {
                     g.completed_frames,
                     g.total_frames,
                     g.elapsed_secs,
+                    g.phase_label.clone(),
+                    g.sim_particles_count,
                     g.full_res_frame.is_some(),
                     g.anim_frames.len(),
                     g.fps.max(1),
@@ -5158,12 +6293,13 @@ impl eframe::App for LiquidApp {
                     g.output_height,
                     g.quality,
                     g.backend_label.clone(),
+                    g.saved_path.clone(),
                 );
             }
             if let Some(msg) = finished_msg {
                 self.status_message = msg;
             }
-            if start_playback && snap.6 > 1 {
+            if start_playback && snap.8 > 1 {
                 self.central_view = CentralView::RenderResult;
                 self.anim_play_idx = 0;
                 self.anim_accum_secs = 0.0;
@@ -5713,9 +6849,8 @@ impl eframe::App for LiquidApp {
                             self.active_tab = tab;
                             match tab {
                                 InspectorTab::Render => {
-                                    self.central_view = CentralView::RenderResult;
-                                    if !bg_has_still && bg_anim_len == 0 && !bg_is_running {
-                                        self.start_gui_still_render(Some(ctx.clone()), false);
+                                    if bg_is_running || bg_has_still || bg_anim_len > 0 {
+                                        self.central_view = CentralView::RenderResult;
                                     }
                                 }
                                 InspectorTab::Scene
@@ -5759,18 +6894,18 @@ impl eframe::App for LiquidApp {
                     if Self::icon_button(
                         ui,
                         live_icon,
-                        "Live 3D Viewport",
+                        "Live 3D Editor",
                         self.central_view == CentralView::LiveViewport,
                         None,
                     )
-                    .on_hover_text("Interactive real-time simulation viewport")
+                    .on_hover_text("Interactive real-time 3D fluid editor")
                     .clicked()
                     {
                         self.central_view = CentralView::LiveViewport;
                     }
 
                     let res_lbl = if bg_anim_len > 1 {
-                        format!("Render Result ({}f)", bg_anim_len)
+                        format!("Render Result ({} frames)", bg_anim_len)
                     } else {
                         "Render Result".to_string()
                     };
@@ -5781,46 +6916,56 @@ impl eframe::App for LiquidApp {
                         self.central_view == CentralView::RenderResult,
                         None,
                     )
-                    .on_hover_text("Inspect studio rendered image or play rendered video animation (F12)")
+                    .on_hover_text("Inspect rendered photo or watch rendered video animation (F12)")
                     .clicked()
                     {
                         self.central_view = CentralView::RenderResult;
-                        if !bg_has_still && bg_anim_len == 0 && !bg_is_running {
-                            self.start_gui_still_render(Some(ctx.clone()), false);
-                        }
                     }
 
                     if bg_is_running {
                         ui.separator();
                         ui.spinner();
-                        let prog_str = if bg_kind == StudioRenderKind::Animation && bg_total > 0 {
-                            format!(
-                                "Rendering {}/{} ({:.1}s)",
-                                bg_done, bg_total, bg_elapsed
-                            )
+                        let eta_suffix = Self::format_eta(bg_done, bg_total, bg_elapsed)
+                            .map(|s| format!(" • {}", s))
+                            .unwrap_or_default();
+                        let prog_str = if bg_total > 1 {
+                            format!("Rendering {}/{}{}", bg_done, bg_total, eta_suffix)
+                        } else if !bg_phase.is_empty() {
+                            bg_phase.clone()
                         } else {
-                            "Rendering Studio Frame...".to_string()
+                            "Rendering...".to_string()
                         };
                         ui.colored_label(egui::Color32::from_rgb(108, 204, 255), prog_str);
                     }
 
                     if self.central_view == CentralView::RenderResult {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(ref p) = bg_saved_path {
+                                if Self::icon_button(ui, UiIcon::Folder, "Folder", false, None)
+                                    .on_hover_text("Open saved file folder in your file manager")
+                                    .clicked()
+                                {
+                                    Self::open_in_file_manager(p);
+                                }
+                            }
+
                             if (bg_has_still || bg_anim_len > 0)
-                                && Self::icon_button(ui, UiIcon::Save, "Save PNG", false, None)
-                                    .on_hover_text("Save displayed studio render result as lossless PNG")
+                                && Self::icon_button(ui, UiIcon::Save, "Save As...", false, None)
+                                    .on_hover_text("Save displayed image anywhere on your computer (.png)")
                                     .clicked()
                             {
-                                self.save_rendered_result_png();
+                                self.spawn_render_file_dialog(ctx.clone(), 2);
                             }
 
                             if !bg_is_running {
                                 let (rr_ic, rr_lbl) = match self.render_kind {
-                                    StudioRenderKind::StillFrame => (UiIcon::Camera, "Re-Render"),
+                                    StudioRenderKind::StillFrame => {
+                                        (UiIcon::Camera, "Render Photo")
+                                    }
                                     StudioRenderKind::Animation => (UiIcon::Film, "Render Video"),
                                 };
                                 if Self::icon_button(ui, rr_ic, rr_lbl, false, None)
-                                    .on_hover_text("Trigger a fresh Studio render with current camera & scene")
+                                    .on_hover_text("Start render using your Render tab settings")
                                     .clicked()
                                 {
                                     match self.render_kind {
@@ -5858,9 +7003,20 @@ impl eframe::App for LiquidApp {
                             }
 
                             if bg_has_still || bg_anim_len > 0 {
+                                let pts_suffix = if bg_sim_pts > 0 {
+                                    format!(" • {} pts", Self::format_particle_count(bg_sim_pts))
+                                } else {
+                                    String::new()
+                                };
                                 Self::draw_telemetry_pill(
                                     ui,
-                                    format!("{}×{} • {}", bg_out_w, bg_out_h, bg_qual.slug()),
+                                    format!(
+                                        "{}×{} • {}{}",
+                                        bg_out_w,
+                                        bg_out_h,
+                                        bg_qual.slug(),
+                                        pts_suffix
+                                    ),
                                     egui::Color32::from_rgb(154, 214, 255),
                                 );
                                 if !bg_backend.is_empty() {
@@ -6122,23 +7278,47 @@ impl eframe::App for LiquidApp {
                         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                             ui.centered_and_justified(|ui| {
                                 ui.vertical_centered(|ui| {
-                                    ui.add_space(rect.height() * 0.38);
+                                    ui.add_space(rect.height() * 0.34);
                                     ui.label(
-                                        egui::RichText::new("No Studio Render Generated Yet")
-                                            .size(16.0)
+                                        egui::RichText::new("Ready to Render Your Fluid Scene")
+                                            .size(17.0)
                                             .strong()
-                                            .color(egui::Color32::from_rgb(190, 208, 235)),
+                                            .color(egui::Color32::from_rgb(208, 224, 248)),
                                     );
-                                    ui.add_space(6.0);
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Pick a preset in the Render tab on the left, or start right away below:",
+                                        )
+                                        .size(12.5)
+                                        .color(egui::Color32::from_rgb(142, 168, 202)),
+                                    );
+                                    ui.add_space(10.0);
                                     if Self::icon_button(
                                         ui,
-                                        UiIcon::Camera,
-                                        "Render Current Frame Now (F12)",
-                                        true,
-                                        Some(egui::vec2(240.0, 32.0)),
+                                        UiIcon::Film,
+                                        "Start Video Render (.mp4)",
+                                        self.render_kind == StudioRenderKind::Animation,
+                                        Some(egui::vec2(248.0, 34.0)),
                                     )
                                     .clicked()
                                     {
+                                        self.active_tab = InspectorTab::Render;
+                                        self.render_kind = StudioRenderKind::Animation;
+                                        self.start_gui_mp4_render_with_ctx(Some(ctx.clone()));
+                                    }
+                                    ui.add_space(5.0);
+                                    if Self::icon_button(
+                                        ui,
+                                        UiIcon::Camera,
+                                        "Render High-Res Photo (F12)",
+                                        self.render_kind == StudioRenderKind::StillFrame,
+                                        Some(egui::vec2(248.0, 32.0)),
+                                    )
+                                    .clicked()
+                                    {
+                                        self.active_tab = InspectorTab::Render;
+                                        self.render_kind = StudioRenderKind::StillFrame;
                                         self.start_gui_still_render(
                                             Some(ctx.clone()),
                                             self.render_auto_save_png,
@@ -6150,22 +7330,25 @@ impl eframe::App for LiquidApp {
                     }
 
                     if bg_is_running {
-                        let banner_txt = if bg_kind == StudioRenderKind::Animation && bg_total > 0 {
+                        let eta_part = Self::format_eta(bg_done, bg_total, bg_elapsed)
+                            .map(|s| format!(" • {}", s))
+                            .unwrap_or_default();
+                        let banner_txt = if !bg_phase.is_empty() {
+                            format!("{}{}", bg_phase, eta_part)
+                        } else if bg_kind == StudioRenderKind::Animation && bg_total > 0 {
                             format!(
-                                "Rendering Studio Animation — Frame {} / {} ({:.1}s)",
-                                bg_done, bg_total, bg_elapsed
+                                "Rendering Video — Frame {} / {}{}",
+                                bg_done, bg_total, eta_part
                             )
                         } else {
                             format!(
-                                "Rendering {}×{} Studio Frame ({})...",
-                                self.video_width,
-                                self.video_height,
-                                self.gui_render_quality.name()
+                                "Rendering {}×{} Studio Photo...",
+                                self.video_width, self.video_height
                             )
                         };
                         let banner_rect = egui::Rect::from_center_size(
                             egui::pos2(rect.center().x, rect.top() + 26.0),
-                            egui::vec2(380.0_f32.min(rect.width() - 24.0), 30.0),
+                            egui::vec2(460.0_f32.min(rect.width() - 24.0), 30.0),
                         );
                         let p = ui.painter().with_clip_rect(rect);
                         p.rect(
@@ -6603,6 +7786,71 @@ impl LiquidApp {
                 self.status_message = format!("OBJ error: {}", e);
             }
         }
+    }
+
+    /// Spawn a non-blocking native OS Save File dialog for Render outputs:
+    /// `kind == 0`: choose `.mp4` video output path
+    /// `kind == 1`: choose `.png` auto-save photo path
+    /// `kind == 2`: immediate "Save Rendered Image As..." `.png`
+    fn spawn_render_file_dialog(&self, ctx: egui::Context, kind: u8) {
+        if self.render_browse_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pending = Arc::clone(&self.render_browse_pending);
+        let slot = match kind {
+            0 => Arc::clone(&self.render_mp4_browse_result),
+            1 => Arc::clone(&self.render_png_browse_result),
+            _ => Arc::clone(&self.render_save_result_png_slot),
+        };
+        let hint = match kind {
+            0 => self.cli_mp4_output.trim().to_string(),
+            1 => self.png_output_path.trim().to_string(),
+            _ => format!("render_result_{:05}.png", self.exported_frames_count),
+        };
+
+        std::thread::spawn(move || {
+            let mut dialog = if kind == 0 {
+                rfd::FileDialog::new()
+                    .set_title("Save Rendered Video As (.mp4)")
+                    .add_filter("MP4 Video (*.mp4)", &["mp4", "MP4"])
+            } else {
+                rfd::FileDialog::new()
+                    .set_title("Save Rendered Image As (.png)")
+                    .add_filter("PNG Image (*.png)", &["png", "PNG"])
+            };
+
+            let hint_path = std::path::Path::new(&hint);
+            if let Some(parent) = hint_path.parent() {
+                if !parent.as_os_str().is_empty() && parent.is_dir() {
+                    dialog = dialog.set_directory(parent);
+                } else if let Ok(cwd) = std::env::current_dir() {
+                    dialog = dialog.set_directory(cwd);
+                }
+            } else if let Ok(cwd) = std::env::current_dir() {
+                dialog = dialog.set_directory(cwd);
+            }
+
+            let default_name = if kind == 0 {
+                "simulation.mp4"
+            } else {
+                "render_photo.png"
+            };
+            let fname = hint_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(default_name);
+            dialog = dialog.set_file_name(fname);
+
+            if let Some(chosen) = dialog.save_file() {
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(chosen.to_string_lossy().into_owned());
+                }
+            }
+
+            pending.store(false, Ordering::SeqCst);
+            ctx.request_repaint();
+        });
     }
 
     fn spawn_scene_file_dialog(&self, ctx: egui::Context, save: bool) {

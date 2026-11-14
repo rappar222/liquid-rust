@@ -1374,28 +1374,28 @@ impl SoftwareRenderer {
                                     * (cfg.ambient_intensity * (0.42 + 0.58 * hemi)
                                         + ndotl * cfg.light_intensity * 0.58);
 
-                                let refracted_col = if cfg.metallic > 0.85 {
-                                    body_scatter * 0.12
+                                let metallic = cfg.metallic.clamp(0.0, 1.0);
+                                let filtered_bg = bg_lin * transmittance;
+                                // Clear/translucent liquids (< 0.88 opacity) transmit crisp refracted floor/obstacles,
+                                // while turbid liquids (e.g. Milk >= 0.90) scatter throughout their volume.
+                                let turbidity = if cfg.opacity >= 0.88 {
+                                    cfg.opacity.clamp(0.0, 1.0)
                                 } else {
-                                    let filtered_bg = bg_lin * transmittance;
-                                    // Clear/translucent liquids (< 0.88 opacity) transmit crisp refracted floor/obstacles,
-                                    // while turbid liquids (e.g. Milk >= 0.90) scatter throughout their volume.
-                                    let turbidity = if cfg.opacity >= 0.88 {
-                                        cfg.opacity.clamp(0.0, 1.0)
-                                    } else {
-                                        (cfg.opacity * cfg.opacity * 0.34).clamp(0.02, 0.45)
-                                    };
-                                    let volume_inscatter =
-                                        body_scatter * (Vec3::ONE - transmittance) * 0.55;
-                                    (filtered_bg + volume_inscatter).lerp(body_scatter, turbidity)
+                                    (cfg.opacity * cfg.opacity * 0.34).clamp(0.02, 0.45)
                                 };
+                                let volume_inscatter =
+                                    body_scatter * (Vec3::ONE - transmittance) * 0.55;
+                                let dielectric_refr =
+                                    (filtered_bg + volume_inscatter).lerp(body_scatter, turbidity);
+                                let refracted_col = dielectric_refr * (1.0 - metallic);
 
-                                // Studio Environment Reflection (blurred by roughness)
+                                // 360-degree Studio Environment Reflection (blurred by roughness)
                                 let refl_dir = (-v_dir) - n * (2.0 * (-v_dir).dot(n));
                                 let env_col = sample_studio_sky(
                                     refl_dir,
                                     light_dir,
                                     rough,
+                                    metallic,
                                     cfg.env_preset,
                                 ) * cfg.env_reflection;
 
@@ -1414,7 +1414,7 @@ impl SoftwareRenderer {
                                     * cfg.light_intensity
                                     * cfg.specular_intensity;
 
-                                // Subsurface Wave-Crest Scattering (backlit thin sheets glow)
+                                // Subsurface Wave-Crest Scattering (backlit thin sheets glow, dielectrics only)
                                 let back_light = (-light_dir + n * 0.45)
                                     .normalize_or_zero()
                                     .dot(v_dir)
@@ -1426,14 +1426,22 @@ impl SoftwareRenderer {
                                     * thin_factor
                                     * cfg.subsurface_scattering
                                     * cfg.light_intensity
-                                    * 0.85;
+                                    * 0.85
+                                    * (1.0 - metallic);
+
+                                let metal_cavity_bounce =
+                                    shallow_tex * (0.005 + 0.010 * hemi) * cfg.ambient_intensity * metallic;
 
                                 // Combine Dielectric / Metallic Reflection + Transmission + SSS + Caustic
                                 let mut final_lin = refracted_col * (Vec3::ONE - fresnel)
                                     + env_col * fresnel
+                                    + metal_cavity_bounce
                                     + sun_spec
                                     + sss_col
-                                    + shallow_tex * tex.emissive_caustic * cfg.light_intensity;
+                                    + shallow_tex
+                                        * tex.emissive_caustic
+                                        * cfg.light_intensity
+                                        * (1.0 - metallic * 0.65);
 
                                 // Aerated Whitewater Crest Foam
                                 let foam_amount = ((hit.foam * 0.85 + tex.foam_boost)
@@ -1728,34 +1736,122 @@ fn tonemap_to_srgb(col: Vec3) -> [u8; 3] {
 }
 
 #[inline]
+fn smoothstep_f32(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
 fn sample_studio_sky(
     refl_dir: Vec3,
     light_dir: Vec3,
     roughness: f32,
+    metallic: f32,
     env_preset: EnvironmentPreset,
 ) -> Vec3 {
     let r = refl_dir.normalize_or_zero();
     let up = r.y.clamp(-1.0, 1.0);
+    let sharp = (1.0 - roughness).clamp(0.05, 1.0);
 
     // Horizon-to-zenith studio sky + floor bounce from EnvironmentPreset
-    let (horizon, zenith, ground) = env_preset.sky_reflection_linear();
+    let (mut horizon, mut zenith, mut ground) = env_preset.sky_reflection_linear();
 
-    let mut sky = if up >= 0.0 {
-        horizon.lerp(zenith, up.powf(0.65))
+    // Neutralize excessive environmental saturation for silver liquid metals
+    let env_desat = metallic * 0.72;
+    let luma_w = Vec3::new(0.2126, 0.7152, 0.0722);
+    horizon = horizon.lerp(Vec3::splat(horizon.dot(luma_w)), env_desat);
+    zenith = zenith.lerp(Vec3::splat(zenith.dot(luma_w)), env_desat);
+    ground = ground.lerp(Vec3::splat(ground.dot(luma_w)), env_desat);
+
+    // Smooth C1 transition across horizon (avoids hard contour bands on bevels)
+    let upper_raw = horizon.lerp(zenith, up.max(0.0).powf(0.58));
+    // Luminous silver sky dome overhead for conductors so top waves gleam cleanly
+    let metal_sky_dome = Vec3::new(0.26, 0.28, 0.31)
+        .lerp(Vec3::new(0.14, 0.16, 0.19), up.max(0.0).powf(0.70));
+    let upper_sky = upper_raw.lerp(upper_raw.max(metal_sky_dome), metallic);
+
+    // Lower hemisphere reflects a silky-smooth studio cyclorama sweep floor
+    let floor_dark = (horizon * 0.35).lerp(
+        ground * (1.0 * (1.0 - metallic) + 0.55 * metallic),
+        1.0 - smoothstep_f32(-0.22, 0.04, up),
+    );
+    let up_mix = smoothstep_f32(-0.08, 0.12, up);
+    let mut sky = floor_dark.lerp(upper_sky, up_mix);
+
+    // Smooth studio horizon rim line + dark studio negative-fill band above horizon
+    let horizon_width = 0.15 * (1.0 - metallic) + 0.065 * metallic;
+    let horizon_band = (-(up / horizon_width).powi(2)).exp();
+    let neg_fill = 1.0 - (0.30 + 0.40 * metallic) * (-((up - 0.25) / 0.16).powi(2)).exp();
+    let cove_col = Vec3::new(0.20, 0.22, 0.25).lerp(Vec3::new(0.58, 0.61, 0.66), metallic);
+    sky = sky * neg_fill + cove_col * horizon_band * (0.28 + 0.45 * metallic);
+
+    // Broad, smooth directional studio floor bounce on the lower hemisphere
+    if up < 0.0 {
+        let r_horiz = Vec3::new(r.x, 0.0, r.z);
+        let r_xz = if r_horiz.length_squared() > 1e-8 {
+            r_horiz.normalize()
+        } else {
+            Vec3::X
+        };
+        let l_horiz = Vec3::new(light_dir.x, 0.0, light_dir.z);
+        let l_xz = if l_horiz.length_squared() > 1e-8 {
+            l_horiz.normalize()
+        } else {
+            Vec3::Z
+        };
+        let key_bounce = 0.5 + 0.5 * r_xz.dot(l_xz);
+        let floor_sheen =
+            (0.025 + (0.095 - 0.025) * key_bounce) * (-((up + 0.32) / 0.38).powi(2)).exp();
+        let rim_floor = 0.055 * (1.0 + up).clamp(0.0, 1.0).powi(3) * (0.5 + 0.5 * r_xz.z);
+        sky += Vec3::new(0.88, 0.92, 0.98) * (floor_sheen + rim_floor) * (0.20 + 0.75 * metallic);
+    }
+
+    // Overhead studio rectangular softbox panel
+    let sb_dir = Vec3::new(-0.22, 0.84, 0.34).normalize();
+    let sb_u = Vec3::new(0.0, 0.0, 1.0).cross(sb_dir).normalize();
+    let sb_v = sb_dir.cross(sb_u).normalize();
+    let su = r.dot(sb_u).abs();
+    let sv = r.dot(sb_v).abs();
+    let sf = r.dot(sb_dir).max(0.0);
+    let feather = 0.05 + (1.0 - sharp) * 0.30;
+    let softbox_rect = (1.0 - smoothstep_f32(0.36, 0.36 + feather, su))
+        * (1.0 - smoothstep_f32(0.24, 0.24 + feather, sv))
+        * smoothstep_f32(0.2, 0.55, sf);
+    let softbox_col = Vec3::new(0.85, 0.91, 1.0).lerp(Vec3::new(1.15, 1.18, 1.22), metallic);
+    sky += softbox_col * softbox_rect * (0.85 + 0.55 * metallic);
+
+    // Narrow studio kicker/rim strips at side-back grazing angles for beveled corner highlights
+    let strip_y = (-((up - 0.14) / 0.26).powi(2)).exp();
+    let r_horiz = Vec3::new(r.x, 0.0, r.z);
+    let r_horiz_dir = if r_horiz.length_squared() > 1e-8 {
+        r_horiz.normalize()
     } else {
-        horizon.lerp(ground, (-up).powf(0.45))
+        Vec3::X
     };
+    let strip_pow = (4.0 * (1.0 - metallic) + 16.0 * metallic)
+        + sharp * (10.0 * (1.0 - metallic) + 42.0 * metallic);
+    let strip_l = r_horiz_dir
+        .dot(Vec3::new(-0.96, 0.0, -0.28).normalize())
+        .clamp(0.0, 1.0)
+        .powf(strip_pow);
+    let strip_r = r_horiz_dir
+        .dot(Vec3::new(0.95, 0.0, -0.31).normalize())
+        .clamp(0.0, 1.0)
+        .powf(strip_pow);
+    let strip_front = r_horiz_dir
+        .dot(Vec3::new(-0.25, 0.0, 0.97).normalize())
+        .clamp(0.0, 1.0)
+        .powf(strip_pow * 1.4);
+    let strip_col = Vec3::new(0.55, 0.68, 0.85).lerp(Vec3::new(0.95, 0.98, 1.02), metallic);
+    sky += strip_col
+        * strip_y
+        * (strip_l + 0.80 * strip_r + 0.55 * strip_front)
+        * (0.35 + 0.70 * metallic);
 
-    // Overhead studio softbox panel reflection (gives liquid that realistic glossy studio look)
-    let softbox_dir = Vec3::new(-0.25, 0.92, 0.30).normalize();
-    let soft_dot = r.dot(softbox_dir).max(0.0);
-    let sharpness = (1.0 - roughness).clamp(0.05, 1.0);
-    let softbox = soft_dot.powf(4.0 + sharpness * 18.0) * (0.45 + 0.55 * sharpness);
-    sky += Vec3::new(0.65, 0.78, 0.95) * softbox;
-
-    // Warm sun bloom in sky
+    // Warm sun / studio key bloom in sky
     let sun_dot = r.dot(light_dir).max(0.0);
-    sky += Vec3::new(1.0, 0.95, 0.86) * sun_dot.powf(8.0 + sharpness * 32.0) * 0.45;
+    let sun_col = Vec3::new(1.0, 0.95, 0.86).lerp(Vec3::new(1.42, 1.42, 1.42), metallic);
+    sky += sun_col * sun_dot.powf(12.0 + sharp * 64.0) * (0.55 + 0.70 * metallic);
 
     sky
 }

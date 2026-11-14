@@ -359,12 +359,12 @@ impl FluidPhysicsPreset {
                 }
             }
             FluidPhysicsPreset::Mercury => {
-                config.viscosity = 0.08;
-                config.surface_tension = 0.250;
-                config.vorticity = 0.035;
-                config.tensile_k = 0.0040;
+                config.viscosity = 0.055;
+                config.surface_tension = 0.135;
+                config.vorticity = 0.025;
+                config.tensile_k = 0.0016;
                 config.air_drag = 0.08;
-                config.restitution = 0.08;
+                config.restitution = 0.03;
                 config.boundary_friction = 0.99;
                 if config.gravity.length_squared() < 1e-4 {
                     config.gravity = Vec3::new(0.0, -9.81, 0.0);

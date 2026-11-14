@@ -213,11 +213,15 @@ fn test_color_maps() {
         ColorMapType::Viridis,
         ColorMapType::Fire,
         ColorMapType::Plasma,
+        ColorMapType::Ice,
+        ColorMapType::Chrome,
     ] {
         let c0 = ColorMap::sample(cmap, 0.0);
         let c2 = ColorMap::sample(cmap, 1.0);
         assert_ne!(c0, c2);
     }
+    assert_eq!(ColorMapType::from_slug("chrome"), Some(ColorMapType::Chrome));
+    assert_eq!(ColorMapType::from_slug("mercury"), Some(ColorMapType::Chrome));
 }
 
 #[test]

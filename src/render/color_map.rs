@@ -11,6 +11,7 @@ pub enum ColorMapType {
     Plasma,
     Inferno,
     Ice,
+    Chrome,
 }
 
 impl ColorMapType {
@@ -22,6 +23,7 @@ impl ColorMapType {
         ColorMapType::Plasma,
         ColorMapType::Inferno,
         ColorMapType::Ice,
+        ColorMapType::Chrome,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -33,6 +35,7 @@ impl ColorMapType {
             ColorMapType::Plasma => "Plasma (Magenta -> Gold)",
             ColorMapType::Inferno => "Inferno (Magma)",
             ColorMapType::Ice => "Arctic Ice (Glacier)",
+            ColorMapType::Chrome => "Liquid Chrome (Quicksilver)",
         }
     }
 
@@ -45,6 +48,7 @@ impl ColorMapType {
             ColorMapType::Plasma => "plasma",
             ColorMapType::Inferno => "inferno",
             ColorMapType::Ice => "ice",
+            ColorMapType::Chrome => "chrome",
         }
     }
 
@@ -57,6 +61,7 @@ impl ColorMapType {
             "plasma" => Some(ColorMapType::Plasma),
             "inferno" | "magma" | "lava" => Some(ColorMapType::Inferno),
             "ice" | "arctic" | "glacier" => Some(ColorMapType::Ice),
+            "chrome" | "mercury" | "silver" | "quicksilver" => Some(ColorMapType::Chrome),
             _ => None,
         }
     }
@@ -141,6 +146,7 @@ impl ColorMap {
             ColorMapType::Plasma => Self::sample_plasma(t),
             ColorMapType::Inferno => Self::sample_inferno(t),
             ColorMapType::Ice => Self::sample_ice(t),
+            ColorMapType::Chrome => Self::sample_chrome(t),
         };
         [
             (rgb.x * 255.0).clamp(0.0, 255.0) as u8,
@@ -285,6 +291,19 @@ impl ColorMap {
         } else {
             let s = (t - 0.72) / 0.28;
             Vec3::new(0.56, 0.88, 0.96).lerp(Vec3::new(0.98, 0.995, 1.0), s)
+        }
+    }
+
+    fn sample_chrome(t: f32) -> Vec3 {
+        if t < 0.35 {
+            let s = t / 0.35;
+            Vec3::new(0.24, 0.26, 0.30).lerp(Vec3::new(0.52, 0.55, 0.60), s)
+        } else if t < 0.75 {
+            let s = (t - 0.35) / 0.40;
+            Vec3::new(0.52, 0.55, 0.60).lerp(Vec3::new(0.82, 0.85, 0.89), s)
+        } else {
+            let s = (t - 0.75) / 0.25;
+            Vec3::new(0.82, 0.85, 0.89).lerp(Vec3::new(0.98, 0.99, 1.0), s)
         }
     }
 }

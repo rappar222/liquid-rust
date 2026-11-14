@@ -212,18 +212,21 @@ impl FluidMaterialPreset {
                 cfg.foam_intensity = 0.05;
             }
             FluidMaterialPreset::LiquidChrome => {
-                cfg.shallow_color = [0.86, 0.89, 0.94];
-                cfg.deep_color = [0.55, 0.60, 0.68];
+                cfg.shallow_color = [0.92, 0.93, 0.95];
+                cfg.deep_color = [0.34, 0.37, 0.42];
                 cfg.opacity = 1.00;
                 cfg.absorption = 6.0;
-                cfg.ior = 2.40;
-                cfg.roughness = 0.035;
-                cfg.specular_intensity = 2.10;
+                cfg.ior = 2.50;
+                cfg.roughness = 0.025;
+                cfg.specular_intensity = 2.35;
                 cfg.refraction_strength = 0.0;
                 cfg.subsurface_scattering = 0.0;
-                cfg.env_reflection = 1.65;
-                cfg.metallic = 0.95;
+                cfg.env_reflection = 1.35;
+                cfg.metallic = 0.99;
                 cfg.foam_intensity = 0.0;
+                if cfg.texture_mode == MeshTextureMode::Ripples {
+                    cfg.texture_mode = MeshTextureMode::None;
+                }
             }
             FluidMaterialPreset::Custom => {}
         }

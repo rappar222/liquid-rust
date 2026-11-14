@@ -253,18 +253,82 @@ float grid_line(vec2 uv) {
     return 1.0 - clamp(d / 0.045, 0.0, 1.0);
 }
 
-vec3 sample_studio_sky(vec3 dir) {
-    float y = clamp(dir.y, -1.0, 1.0);
-    vec3 zenith = u_sky_zenith;
+vec3 sample_studio_sky(vec3 dir, float rough, float metallic) {
+    vec3 r = normalize(dir);
+    float y = clamp(r.y, -1.0, 1.0);
+    float sharp = clamp(1.0 - rough, 0.05, 1.0);
+
     vec3 horizon = u_sky_horizon;
+    vec3 zenith = u_sky_zenith;
     vec3 ground = u_sky_ground;
-    if (y >= 0.0) {
-        vec3 sky = mix(horizon, zenith, pow(y, 0.55));
-        float sun_spot = pow(max(dot(dir, u_light_dir), 0.0), 96.0);
-        return sky + vec3(1.4, 1.35, 1.25) * sun_spot;
-    } else {
-        return mix(horizon * 0.45, ground, pow(-y, 0.45));
+
+    // Neutralize excessive environmental saturation for silver liquid metals
+    // so mercury reflects crisp metallic silver/graphite with subtle ambient tinting.
+    float env_desat = metallic * 0.72;
+    vec3 luma_w = vec3(0.2126, 0.7152, 0.0722);
+    horizon = mix(horizon, vec3(dot(horizon, luma_w)), env_desat);
+    zenith = mix(zenith, vec3(dot(zenith, luma_w)), env_desat);
+    ground = mix(ground, vec3(dot(ground, luma_w)), env_desat);
+
+    // Smooth C1 transition across y=0 (eliminates artificial contour steps on bevels)
+    vec3 upper_raw = mix(horizon, zenith, pow(max(y, 0.0), 0.58));
+    // Give liquid metals a luminous studio cyclorama sky dome overhead so wave tops
+    // gleam as true silver/quicksilver rather than crushing to black in dark themes.
+    vec3 metal_sky_dome = mix(vec3(0.26, 0.28, 0.31), vec3(0.14, 0.16, 0.19), pow(max(y, 0.0), 0.70));
+    vec3 upper_sky = mix(upper_raw, max(upper_raw, metal_sky_dome), metallic);
+
+    // Lower hemisphere reflects a silky-smooth studio cyclorama sweep floor (no high-frequency
+    // binary edges, preventing moire contours on curved bevels and flat container walls)
+    vec3 floor_dark = mix(horizon * 0.35, ground * mix(1.0, 0.55, metallic), 1.0 - smoothstep(-0.22, 0.04, y));
+    float up_mix = smoothstep(-0.08, 0.12, y);
+    vec3 sky = mix(floor_dark, upper_sky, up_mix);
+
+    // Smooth studio horizon rim line + dark studio negative-fill band above horizon for chrome S-curve contrast
+    float horizon_width = mix(0.15, 0.065, metallic);
+    float horizon_band = exp(-pow(y / horizon_width, 2.0));
+    float neg_fill = 1.0 - (0.30 + 0.40 * metallic) * exp(-pow((y - 0.25) / 0.16, 2.0));
+    sky = sky * neg_fill
+        + mix(vec3(0.20, 0.22, 0.25), vec3(0.58, 0.61, 0.66), metallic) * horizon_band * (0.28 + 0.45 * metallic);
+
+    // Broad, smooth directional studio floor bounce on the lower hemisphere so vertical walls
+    // show natural studio depth and tonal gradation across left/right wall angles
+    if (y < 0.0) {
+        vec3 r_xz = normalize(vec3(r.x, 0.0, r.z) + vec3(1e-5, 0.0, 0.0));
+        float key_bounce = 0.5 + 0.5 * dot(r_xz, normalize(vec3(u_light_dir.x, 0.0, u_light_dir.z) + vec3(1e-5, 0.0, 0.0)));
+        float floor_sheen = mix(0.025, 0.095, key_bounce) * exp(-pow((y + 0.32) / 0.38, 2.0));
+        float rim_floor = 0.055 * pow(clamp(1.0 + y, 0.0, 1.0), 3.0) * (0.5 + 0.5 * r_xz.z);
+        sky += vec3(0.88, 0.92, 0.98) * (floor_sheen + rim_floor) * (0.20 + 0.75 * metallic);
     }
+
+    // Overhead studio softbox panel + secondary diffused fill panel for crisp silver highlights
+    vec3 sb_dir = normalize(vec3(-0.22, 0.84, 0.34));
+    vec3 sb_u = normalize(cross(vec3(0.0, 0.0, 1.0), sb_dir));
+    vec3 sb_v = normalize(cross(sb_dir, sb_u));
+    float su = abs(dot(r, sb_u));
+    float sv = abs(dot(r, sb_v));
+    float sf = max(dot(r, sb_dir), 0.0);
+    float feather = 0.05 + (1.0 - sharp) * 0.30;
+    float softbox_rect = (1.0 - smoothstep(0.36, 0.36 + feather, su))
+                       * (1.0 - smoothstep(0.24, 0.24 + feather, sv))
+                       * smoothstep(0.2, 0.55, sf);
+    vec3 softbox_col = mix(vec3(0.85, 0.91, 1.0), vec3(1.15, 1.18, 1.22), metallic);
+    sky += softbox_col * softbox_rect * (0.85 + 0.55 * metallic);
+
+    // Narrow studio kicker/rim strips positioned at side-back grazing angles
+    // so curved bevels & droplets catch bright silver edges without washing out flat front walls
+    float strip_y = exp(-pow((y - 0.14) / 0.26, 2.0));
+    float strip_pow = mix(4.0, 16.0, metallic) + sharp * mix(10.0, 42.0, metallic);
+    vec3 r_horiz = normalize(vec3(r.x, 0.0, r.z) + vec3(1e-5, 0.0, 0.0));
+    float strip_l = pow(clamp(dot(r_horiz, normalize(vec3(-0.96, 0.0, -0.28))), 0.0, 1.0), strip_pow);
+    float strip_r = pow(clamp(dot(r_horiz, normalize(vec3(0.95, 0.0, -0.31))), 0.0, 1.0), strip_pow);
+    float strip_front = pow(clamp(dot(r_horiz, normalize(vec3(-0.25, 0.0, 0.97))), 0.0, 1.0), strip_pow * 1.4);
+    sky += mix(vec3(0.55, 0.68, 0.85), vec3(0.95, 0.98, 1.02), metallic) * strip_y * (strip_l + 0.80 * strip_r + 0.55 * strip_front) * (0.35 + 0.70 * metallic);
+
+    // Crisp sun/key light bloom in sky
+    float sun_dot = max(dot(r, u_light_dir), 0.0);
+    float sun_spot = pow(sun_dot, 12.0 + sharp * 72.0);
+    vec3 sun_col = mix(vec3(1.25, 1.18, 1.05), vec3(1.45, 1.44, 1.42), metallic);
+    return sky + sun_col * sun_spot;
 }
 
 void main() {
@@ -338,57 +402,79 @@ void main() {
     vec3 H = normalize(L + V);
     float ndoth = max(dot(N, H), 0.0);
 
+    vec3 shallow_lin = pow(max(u_shallow_color, vec3(0.0)), vec3(2.2));
+    vec3 deep_lin = pow(max(u_deep_color, vec3(0.0)), vec3(2.2));
+
     float ior = max(u_light_params.x, 1.0);
     float f0_dielectric = pow((ior - 1.0) / (ior + 1.0), 2.0);
     float metallic = clamp(u_mat_params.w, 0.0, 1.0);
-    vec3 f0 = mix(vec3(f0_dielectric), u_shallow_color, metallic);
+    vec3 f0 = mix(vec3(f0_dielectric), shallow_lin * albedo_mod, metallic);
     vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - ndotv, 5.0);
 
     // Beer-Lambert optical thickness approximation from grazing angle & height
     float optical_depth = clamp((1.0 - ndotv * 0.65) * u_mat_params.y * 0.55, 0.0, 1.0);
-    vec3 body_color = mix(u_shallow_color, u_deep_color, optical_depth) * albedo_mod;
+    vec3 body_color = mix(shallow_lin, deep_lin, optical_depth) * albedo_mod;
 
     if (u_backface_pass != 0) {
+        if (metallic >= 0.85 || u_mat_params.x >= 0.99) {
+            discard;
+        }
         // Subtle interior volume tint pass
         float back_alpha = clamp(u_mat_params.x * 0.42, 0.05, 0.65);
-        FragColor = vec4(u_deep_color * (u_env_params.w + 0.35 * ndotl), back_alpha);
+        vec3 back_col = deep_lin * (u_env_params.w + 0.35 * ndotl);
+        back_col = pow(clamp(back_col, 0.0, 1.0), vec3(1.0 / 2.2));
+        FragColor = vec4(back_col, back_alpha);
         return;
     }
 
-    // GGX Microfacet Specular
+    // Smith GGX Microfacet Specular
     float rough = clamp(u_light_params.y, 0.02, 1.0);
     float alpha = rough * rough;
     float alpha2 = alpha * alpha;
     float denom = (ndoth * ndoth * (alpha2 - 1.0) + 1.0);
-    float d_ggx = alpha2 / max(3.14159265 * denom * denom, 1e-5);
-    vec3 spec = d_ggx * fresnel * u_light_params.z * u_env_params.z * (0.25 + 0.75 * ndotl);
+    float d_ggx = alpha2 / max(3.14159265 * denom * denom, 1e-6);
+    float k_ggx = (rough + 1.0) * (rough + 1.0) * 0.125;
+    float g_v = ndotv / (ndotv * (1.0 - k_ggx) + k_ggx);
+    float g_l = ndotl / (ndotl * (1.0 - k_ggx) + k_ggx);
+    vec3 spec_brdf = (d_ggx * g_v * g_l * fresnel) / max(4.0 * ndotv * ndotl, 0.05);
+    vec3 spec = spec_brdf * ndotl * u_light_params.z * u_env_params.z;
 
-    // Studio sky reflection
+    // 360-degree Studio HDRI reflection
     vec3 R = reflect(-V, N);
-    vec3 env_col = sample_studio_sky(R) * u_env_params.x;
+    vec3 env_col = sample_studio_sky(R, rough, metallic) * u_env_params.x;
 
-    // Subsurface back-scattered wave crest glow
+    // Subsurface back-scattered wave crest glow (dielectrics only)
     float back_light = pow(clamp(dot(V, -L + N * 0.55), 0.0, 1.0), 3.0);
-    vec3 sss = u_shallow_color * back_light * u_light_params.w * u_env_params.z * (1.0 - metallic);
+    vec3 sss = shallow_lin * back_light * u_light_params.w * u_env_params.z * (1.0 - metallic);
 
-    // Diffuse + Ambient
+    // Diffuse + Ambient (zeroed for pure conductors; faint multi-scatter cavity fill keeps chrome lush)
     float amb = u_env_params.w;
     float diff = ndotl * u_env_params.z;
-    vec3 fluid_lit = body_color * (amb + diff * (1.0 - metallic * 0.8)) + sss + u_shallow_color * caustic_glow;
+    float hemi = 0.5 + 0.5 * N.y;
+    vec3 fluid_lit = body_color * (amb + diff) * (1.0 - metallic);
+    vec3 metal_cavity_bounce = f0 * (0.005 + 0.010 * hemi) * amb * metallic;
 
-    // Blend transmission body with Fresnel reflection + GGX sun highlight
-    vec3 color = mix(fluid_lit, env_col, clamp(fresnel * (0.65 + 0.35 * metallic), 0.0, 0.96)) + spec;
+    // Blend transmission body with physical Fresnel reflection + GGX sun highlight
+    vec3 color = fluid_lit * (vec3(1.0) - fresnel)
+        + env_col * fresnel
+        + metal_cavity_bounce
+        + spec
+        + sss
+        + shallow_lin * caustic_glow * (1.0 - metallic * 0.65);
 
     // Aerated whitewater foam on energetic crests
     float foam = clamp(v_foam * u_mat_params.z + foam_extra, 0.0, 1.0);
-    vec3 foam_col = vec3(0.94, 0.97, 1.0) * (amb + diff * 0.85 + 0.25);
+    vec3 foam_col = vec3(0.88, 0.93, 1.0) * (amb + diff * 0.85 + 0.25);
     color = mix(color, foam_col, foam);
 
-    // Exposure + Filmic tone compression for bright glints
+    // Exposure + ACES Filmic Tone Mapping + Linear-to-sRGB output encoding
     color *= max(u_exposure, 0.05);
-    color = color / (vec3(1.0) + color * 0.18);
+    color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);
+    color = pow(color, vec3(1.0 / 2.2));
 
-    float out_alpha = clamp(mix(u_mat_params.x, 1.0, max(max(fresnel.r, foam), metallic)), 0.12, 1.0);
+    float out_alpha = metallic >= 0.85
+        ? 1.0
+        : clamp(mix(u_mat_params.x, 1.0, max(fresnel.r, foam)), 0.12, 1.0);
     FragColor = vec4(color, out_alpha);
 }
 "#;
@@ -840,9 +926,9 @@ void main() {
                     Vec3::new(0.42, 0.82, 0.38).normalize()
                 };
                 let (sky_hor_l, sky_zen_l, sky_gnd_l) = mesh_cfg.env_preset.sky_reflection_linear();
-                let sky_hor = sky_hor_l.clamp(Vec3::ZERO, Vec3::ONE).powf(1.0 / 2.2);
-                let sky_zen = sky_zen_l.clamp(Vec3::ZERO, Vec3::ONE).powf(1.0 / 2.2);
-                let sky_gnd = sky_gnd_l.clamp(Vec3::ZERO, Vec3::ONE).powf(1.0 / 2.2);
+                let sky_hor = sky_hor_l.max(Vec3::ZERO);
+                let sky_zen = sky_zen_l.max(Vec3::ZERO);
+                let sky_gnd = sky_gnd_l.max(Vec3::ZERO);
 
                 gl.uniform_matrix_4_f32_slice(u_vp.as_ref(), false, &view_proj.to_cols_array());
                 gl.uniform_3_f32(u_eye.as_ref(), eye_pos.x, eye_pos.y, eye_pos.z);

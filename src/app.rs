@@ -442,7 +442,7 @@ impl LiquidApp {
         self.color_map = match self.fluid_preset {
             FluidPhysicsPreset::Lava => ColorMapType::Inferno,
             FluidPhysicsPreset::Honey | FluidPhysicsPreset::Oil => ColorMapType::Fire,
-            FluidPhysicsPreset::Mercury => ColorMapType::Ice,
+            FluidPhysicsPreset::Mercury => ColorMapType::Chrome,
             FluidPhysicsPreset::Glycerin => ColorMapType::Viridis,
             _ => ColorMapType::Ocean,
         };

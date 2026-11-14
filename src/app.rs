@@ -1576,19 +1576,17 @@ impl LiquidApp {
                                     .color(egui::Color32::from_rgb(138, 152, 172)),
                             );
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if Self::trash_icon_button(ui, "Remove obstacle") {
-                                to_remove_col = Some(idx);
-                            }
-                            if tri_badge.is_some()
-                                && ui
-                                    .small_button("↺")
-                                    .on_hover_text("Reset position, scale & rotation")
-                                    .clicked()
-                            {
-                                reset_mesh_transform = true;
-                            }
-                        });
+                        if tri_badge.is_some()
+                            && ui
+                                .small_button("↺")
+                                .on_hover_text("Reset position, scale & rotation")
+                                .clicked()
+                        {
+                            reset_mesh_transform = true;
+                        }
+                        if Self::trash_icon_button(ui, "Remove obstacle") {
+                            to_remove_col = Some(idx);
+                        }
                     });
 
                     if collider.enabled {
@@ -1925,11 +1923,9 @@ impl LiquidApp {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut faucet.enabled, "");
                         ui.strong(&faucet.name);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if Self::trash_icon_button(ui, "Remove faucet / tap") {
-                                to_remove = Some(idx);
-                            }
-                        });
+                        if Self::trash_icon_button(ui, "Remove faucet / tap") {
+                            to_remove = Some(idx);
+                        }
                     });
                     if faucet.enabled {
                         ui.horizontal(|ui| {
@@ -2031,11 +2027,9 @@ impl LiquidApp {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut drain.enabled, "");
                         ui.strong(&drain.name);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if Self::trash_icon_button(ui, "Remove drain") {
-                                to_remove = Some(idx);
-                            }
-                        });
+                        if Self::trash_icon_button(ui, "Remove drain") {
+                            to_remove = Some(idx);
+                        }
                     });
                     if drain.enabled {
                         ui.add(egui::Slider::new(&mut drain.radius, 0.04..=0.5).text("Radius"));

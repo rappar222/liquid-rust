@@ -17,6 +17,10 @@ pub enum SimulationQuality {
     Ultra,
     Cinematic,
     Extreme,
+    // Offline CLI-only simulation presets (kept out of interactive GUI dropdown)
+    Studio,
+    Film,
+    Master,
     Custom,
 }
 
@@ -29,6 +33,19 @@ impl SimulationQuality {
         SimulationQuality::Cinematic,
         SimulationQuality::Extreme,
     ];
+
+    pub const CLI_ONLY: &'static [SimulationQuality] = &[
+        SimulationQuality::Studio,
+        SimulationQuality::Film,
+        SimulationQuality::Master,
+    ];
+
+    pub fn is_cli_only(&self) -> bool {
+        matches!(
+            self,
+            SimulationQuality::Studio | SimulationQuality::Film | SimulationQuality::Master
+        )
+    }
 
     pub fn name(&self) -> &'static str {
         self.name_for(false)
@@ -78,6 +95,27 @@ impl SimulationQuality {
                     "Extreme (1,000,000+ particles, GPU Max)"
                 }
             }
+            SimulationQuality::Studio => {
+                if is_2d {
+                    "Studio [CLI] (~48k particles)"
+                } else {
+                    "Studio [CLI] (~2.5M particles)"
+                }
+            }
+            SimulationQuality::Film => {
+                if is_2d {
+                    "Film [CLI] (~95k particles)"
+                } else {
+                    "Film [CLI] (~4.9M particles)"
+                }
+            }
+            SimulationQuality::Master => {
+                if is_2d {
+                    "Master [CLI] (~160k particles)"
+                } else {
+                    "Master [CLI] (~8.2M particles)"
+                }
+            }
             SimulationQuality::Custom => "Custom",
         }
     }
@@ -90,6 +128,9 @@ impl SimulationQuality {
             SimulationQuality::Ultra => "ultra",
             SimulationQuality::Cinematic => "cinematic",
             SimulationQuality::Extreme => "extreme",
+            SimulationQuality::Studio => "studio",
+            SimulationQuality::Film => "film",
+            SimulationQuality::Master => "master",
             SimulationQuality::Custom => "custom",
         }
     }
@@ -137,6 +178,27 @@ impl SimulationQuality {
                 config.smoothing_length = 0.014;
                 config.substeps = 4;
                 config.solver_iterations = 4;
+            }
+            SimulationQuality::Studio => {
+                config.particle_radius = 0.0033;
+                config.spacing = 0.0055;
+                config.smoothing_length = 0.0110;
+                config.substeps = 5;
+                config.solver_iterations = 5;
+            }
+            SimulationQuality::Film => {
+                config.particle_radius = 0.0026;
+                config.spacing = 0.0044;
+                config.smoothing_length = 0.0088;
+                config.substeps = 6;
+                config.solver_iterations = 6;
+            }
+            SimulationQuality::Master => {
+                config.particle_radius = 0.0022;
+                config.spacing = 0.0037;
+                config.smoothing_length = 0.0074;
+                config.substeps = 8;
+                config.solver_iterations = 6;
             }
             SimulationQuality::Custom => {}
         }
@@ -259,6 +321,7 @@ pub struct SphSolver {
     lambdas: Vec<f32>,
     delta_positions: Vec<Vec3>,
     densities: Vec<f32>,
+    wall_weights: Vec<f32>,
     xsph_velocities: Vec<Vec3>,
     vorticities: Vec<Vec3>,
 
@@ -290,6 +353,7 @@ impl SphSolver {
             lambdas: Vec::new(),
             delta_positions: Vec::new(),
             densities: Vec::new(),
+            wall_weights: Vec::new(),
             xsph_velocities: Vec::new(),
             vorticities: Vec::new(),
             mouse_ray: None,
@@ -392,17 +456,18 @@ impl SphSolver {
             return;
         }
 
-        let substeps = self.config.substeps.max(1);
+        let fps_substep_mult = ((dt * 60.0 - 1e-4).ceil() as usize).clamp(1, 8);
+        let substeps = self.config.substeps.max(1) * fps_substep_mult;
         let sub_dt = dt / substeps as f32;
 
         for _ in 0..substeps {
-            self.pbf_substep(sub_dt);
+            self.pbf_substep(sub_dt, dt);
         }
 
         self.drain_particles();
     }
 
-    fn pbf_substep(&mut self, dt: f32) {
+    fn pbf_substep(&mut self, dt: f32, frame_dt: f32) {
         let n = self.particles.len();
         let use_parallel = n >= PAR_THRESHOLD;
 
@@ -413,6 +478,7 @@ impl SphSolver {
             self.lambdas.resize(n, 0.0);
             self.delta_positions.resize(n, Vec3::ZERO);
             self.densities.resize(n, self.config.rest_density);
+            self.wall_weights.resize(n, 1.0);
             self.xsph_velocities.resize(n, Vec3::ZERO);
             self.vorticities.resize(n, Vec3::ZERO);
         }
@@ -519,12 +585,19 @@ impl SphSolver {
         let surface_tension = self.config.surface_tension;
         let w_q = kernels.poly6((0.15 * h).powi(2)).max(1e-12);
         let inv_rho0 = 1.0 / rho0;
-        let dt_ref = 1.0 / 60.0;
-        let dt_ratio = (dt_ref / dt.max(1e-5)).max(1.0);
-        let cfm_scale = dt_ratio * dt_ratio;
-        let dt_factor = (dt / dt_ref).clamp(0.0001, 1.0);
-        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
-        let max_displacement = (radius * 0.45).max(h * 0.25) * dt_factor;
+        let frame_dt_ref = 1.0 / 90.0;
+        let slow_ratio = (frame_dt_ref / frame_dt.max(1e-5)).max(1.0);
+        let cfm_scale = slow_ratio * slow_ratio;
+        let slow_factor = (frame_dt / frame_dt_ref).clamp(0.0001, 1.0);
+        let relaxation_epsilon = 1000.0 * (0.075 / h).powi(2) * cfm_scale;
+        let max_displacement = (radius * 0.40)
+            .max(h * 0.18)
+            .min(2.8 * dt.max(1e-5))
+            * slow_factor;
+        let iter_scale = 3.0 / (self.config.solver_iterations.max(1) as f32);
+        let force_dt_scale = ((dt / (1.0 / 60.0)).powi(2)).clamp(1e-6, 1.0) * iter_scale;
+        let eff_tensile_k = tensile_k * force_dt_scale;
+        let eff_surface_tension = surface_tension * force_dt_scale;
         let spacing = self.config.spacing;
         let colliders = &self.colliders;
 
@@ -532,79 +605,88 @@ impl SphSolver {
         for _ in 0..self.config.solver_iterations {
             let pred_pos = &self.predicted_positions;
 
-            // 4a. Computation of density and constraint lambda_i
-            let compute_lambda = |(i, (lambda_out, density_out)): (usize, (&mut f32, &mut f32))| {
-                let pos_i = pred_pos[i];
-                let mut density = kernels.poly6(0.0);
-                let mut grad_ci = Vec3::ZERO;
-                let mut sum_grad_sq = 0.0f32;
+            // 4a. Computation of density, wall-neutrality weight, and constraint lambda_i
+            let compute_lambda =
+                |(i, ((lambda_out, density_out), wall_w_out)): (
+                    usize,
+                    ((&mut f32, &mut f32), &mut f32),
+                )| {
+                    let pos_i = pred_pos[i];
+                    let mut density = kernels.poly6(0.0);
+                    let mut grad_ci = Vec3::ZERO;
+                    let mut sum_grad_sq = 0.0f32;
 
-                grid.for_each_neighbor_mode(pos_i, is_2d, |j| {
-                    if i != j {
-                        let pos_j = pred_pos[j];
-                        let r_vec = pos_i - pos_j;
-                        let r2 = r_vec.length_squared();
+                    grid.for_each_neighbor_mode(pos_i, is_2d, |j| {
+                        if i != j {
+                            let pos_j = pred_pos[j];
+                            let r_vec = pos_i - pos_j;
+                            let r2 = r_vec.length_squared();
 
-                        if r2 < h2 && r2 > 1e-12 {
-                            let r = r2.sqrt();
-                            density += kernels.poly6(r2);
+                            if r2 < h2 && r2 > 1e-12 {
+                                let r = r2.sqrt();
+                                density += kernels.poly6(r2);
 
-                            let grad_w = kernels.spiky_gradient(r_vec, r);
-                            let grad_j = grad_w * inv_rho0;
-                            grad_ci += grad_j;
-                            sum_grad_sq += grad_j.length_squared();
+                                let grad_w = kernels.spiky_gradient(r_vec, r);
+                                let grad_j = grad_w * inv_rho0;
+                                grad_ci += grad_j;
+                                sum_grad_sq += grad_j.length_squared();
+                            }
                         }
+                    });
+
+                    let (mut psi_b, mut grad_psi_b) =
+                        chamber.boundary_contribution(pos_i, radius, spacing, h, &bounds, is_2d);
+                    for collider in colliders {
+                        collider.fold_boundary_contribution(
+                            pos_i,
+                            radius,
+                            spacing,
+                            h,
+                            is_2d,
+                            &mut psi_b,
+                            &mut grad_psi_b,
+                        );
                     }
-                });
+                    if is_2d {
+                        grad_psi_b.z = 0.0;
+                    }
 
-                let (mut psi_b, mut grad_psi_b) =
-                    chamber.boundary_contribution(pos_i, radius, spacing, h, &bounds, is_2d);
-                for collider in colliders {
-                    collider.fold_boundary_contribution(
-                        pos_i,
-                        radius,
-                        spacing,
-                        h,
-                        is_2d,
-                        &mut psi_b,
-                        &mut grad_psi_b,
-                    );
-                }
-                if is_2d {
-                    grad_psi_b.z = 0.0;
-                }
+                    density += rho0 * psi_b;
+                    grad_ci += grad_psi_b;
+                    sum_grad_sq += grad_psi_b.length_squared() + grad_ci.length_squared();
+                    *density_out = density;
+                    *wall_w_out = chamber.wall_cohesion_weight(pos_i, radius, h, &bounds, is_2d);
 
-                density += rho0 * psi_b;
-                grad_ci += grad_psi_b;
-                sum_grad_sq += grad_psi_b.length_squared() + grad_ci.length_squared();
-                *density_out = density;
-
-                let c_i = (density * inv_rho0 - 1.0).max(0.0);
-                *lambda_out = -c_i / (sum_grad_sq + relaxation_epsilon);
-            };
+                    let c_i = (density * inv_rho0 - 1.0).max(0.0);
+                    *lambda_out = -c_i / (sum_grad_sq + relaxation_epsilon);
+                };
 
             if use_parallel {
                 self.lambdas
                     .par_iter_mut()
                     .zip(self.densities.par_iter_mut())
+                    .zip(self.wall_weights.par_iter_mut())
                     .enumerate()
                     .for_each(compute_lambda);
             } else {
                 self.lambdas
                     .iter_mut()
                     .zip(self.densities.iter_mut())
+                    .zip(self.wall_weights.iter_mut())
                     .enumerate()
                     .for_each(compute_lambda);
             }
 
             let lambdas = &self.lambdas;
             let densities = &self.densities;
+            let wall_weights = &self.wall_weights;
 
-            // 4b. Computation of position displacement delta_p_i + Akinci free-surface cohesion
+            // 4b. Computation of position displacement delta_p_i + symmetric Akinci cohesion
             let compute_delta = |(i, delta_out): (usize, &mut Vec3)| {
                 let pos_i = pred_pos[i];
                 let lambda_i = lambdas[i];
                 let rho_i = densities[i];
+                let wall_w_i = wall_weights[i];
                 let mut delta = Vec3::ZERO;
 
                 let (mut psi_b, mut grad_psi_b) =
@@ -623,7 +705,6 @@ impl SphSolver {
                 if is_2d {
                     grad_psi_b.z = 0.0;
                 }
-                let wall_cohesion_scale = (1.0 - psi_b * 3.5).clamp(0.08, 1.0);
 
                 grid.for_each_neighbor_mode(pos_i, is_2d, |j| {
                     if i != j {
@@ -640,7 +721,7 @@ impl SphSolver {
                             let s_corr = if lambda_sum < -1e-6 {
                                 let w_r = kernels.poly6(r2);
                                 let ratio = (w_r / w_q).min(1.5);
-                                (-tensile_k * ratio.powi(4) * (h * h)) / cfm_scale
+                                -eff_tensile_k * ratio.powi(4) * (h * h)
                             } else {
                                 0.0
                             };
@@ -648,20 +729,21 @@ impl SphSolver {
                             let grad_w = kernels.spiky_gradient(r_vec, r);
                             delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
 
-                            // Scale-invariant Akinci bell-spline cohesion weighted toward free surface
-                            if surface_tension > 0.0 {
+                            // Symmetric free-surface cohesion (neutral 90° contact angle on walls)
+                            let pair_wall_scale = wall_w_i.min(wall_weights[j]);
+                            if eff_surface_tension > 0.0 && pair_wall_scale > 1e-4 {
                                 let q = r * inv_h;
                                 let one_minus_q = 1.0 - q;
-                                let c_q = 64.0 * (q * q * q) * (one_minus_q * one_minus_q * one_minus_q);
+                                let c_q =
+                                    64.0 * (q * q * q) * (one_minus_q * one_minus_q * one_minus_q);
                                 let surf_weight =
                                     (2.0 - (rho_i + densities[j]) * inv_rho0).clamp(0.15, 1.40);
-                                let cohesion = (c_q
+                                let cohesion = c_q
                                     * surf_weight
-                                    * surface_tension
-                                    * wall_cohesion_scale
+                                    * eff_surface_tension
+                                    * pair_wall_scale
                                     * 0.016
-                                    * h)
-                                    / cfm_scale;
+                                    * h;
                                 delta -= (r_vec / r) * cohesion;
                             }
                         }
@@ -787,7 +869,12 @@ impl SphSolver {
         }
 
         // 6. Fused Normalized XSPH Viscosity + Velocity Curl (Vorticity) Pass
-        let visc_c = self.config.viscosity.clamp(0.0, 0.95);
+        let visc_base = self.config.viscosity.clamp(0.0, 0.95);
+        let visc_c = if visc_base > 0.0 {
+            1.0 - (1.0 - visc_base).powf((dt * 120.0).clamp(0.001, 2.0))
+        } else {
+            0.0
+        };
         let vort_eps = self.config.vorticity.max(0.0);
 
         if visc_c > 0.0 || vort_eps > 1e-5 {
@@ -799,7 +886,7 @@ impl SphSolver {
                     let vel_i = particles_slice[i].velocity;
 
                     let mut sum_w = kernels.poly6(0.0);
-                    let mut weighted_v = vel_i * sum_w;
+                    let mut sum_v_diff = Vec3::ZERO;
                     let mut curl = Vec3::ZERO;
 
                     grid.for_each_neighbor_mode(pos_i, is_2d, |j| {
@@ -812,7 +899,7 @@ impl SphSolver {
                                 if visc_c > 0.0 {
                                     let w = kernels.poly6(r2);
                                     sum_w += w;
-                                    weighted_v += vel_j * w;
+                                    sum_v_diff += (vel_j - vel_i) * w;
                                 }
                                 if vort_eps > 1e-5 {
                                     let r = r2.sqrt();
@@ -824,8 +911,8 @@ impl SphSolver {
                     });
 
                     *xsph_out = if visc_c > 0.0 {
-                        let avg_v = weighted_v / sum_w;
-                        vel_i.lerp(avg_v, visc_c)
+                        let denom = sum_w.max(rho0);
+                        vel_i + (sum_v_diff / denom) * visc_c
                     } else {
                         vel_i
                     };
@@ -856,11 +943,16 @@ impl SphSolver {
                 let commit_vort = |(i, v_final_out): (usize, &mut Vec3)| {
                     let mut v_base = xsph_vels[i];
                     let speed = v_base.length();
-                    // Smooth flow gate: resting pools (speed < 0.08 m/s) receive 0 vorticity noise
+                    let pos_i = particles_ro[i].position;
+                    let rho_ratio = particles_ro[i].density * inv_rho0;
+                    // Smooth flow + bulk + wall gate: resting pools, thin wall films, and sparse
+                    // free-surface droplets receive 0 spurious one-sided vorticity noise.
                     let flow_gate = ((speed - 0.08) / 0.35).clamp(0.0, 1.0);
+                    let bulk_gate = ((rho_ratio - 0.72) / 0.22).clamp(0.0, 1.0);
+                    let wall_w = chamber.wall_cohesion_weight(pos_i, radius, h, &bounds, is_2d);
+                    let eff_gate = flow_gate * bulk_gate * (0.20 + 0.80 * wall_w);
 
-                    if flow_gate > 0.0 {
-                        let pos_i = particles_ro[i].position;
+                    if eff_gate > 1e-4 {
                         let omega_i = vorts[i];
                         let omega_i_mag = omega_i.length();
 
@@ -882,8 +974,9 @@ impl SphSolver {
                             let eta_len = eta.length();
                             if eta_len > 1e-5 {
                                 let n_dir = eta / eta_len;
-                                let f_vort = n_dir.cross(omega_i) * (vort_eps * h * 8.0 * flow_gate);
-                                let dv = (f_vort * dt).clamp_length_max(speed * 0.22);
+                                let f_vort = n_dir.cross(omega_i) * (vort_eps * h * 8.0 * eff_gate);
+                                let max_dv = (speed * 0.22).min(speed * 26.0 * dt);
+                                let dv = (f_vort * dt).clamp_length_max(max_dv);
                                 v_base += dv;
                             }
                         }

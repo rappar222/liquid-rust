@@ -803,13 +803,8 @@ impl LiquidApp {
 
         // Quality
         let quality_slug = match self.current_quality {
-            SimulationQuality::Draft => Some("draft"),
-            SimulationQuality::Medium => Some("medium"),
-            SimulationQuality::High => Some("high"),
-            SimulationQuality::Ultra => Some("ultra"),
-            SimulationQuality::Cinematic => Some("cinematic"),
-            SimulationQuality::Extreme => Some("extreme"),
             SimulationQuality::Custom => None,
+            other => Some(other.slug()),
         };
         if let Some(q) = quality_slug {
             parts.push(format!("--quality {}", q));
@@ -959,7 +954,7 @@ impl LiquidApp {
             }
         }
 
-        // Chamber shape & scale
+        // Chamber shape, size & scale
         if self.solver.chamber.shape != ChamberShape::Box {
             let shape_str = match self.solver.chamber.shape {
                 ChamberShape::Bathtub => "bathtub",
@@ -967,6 +962,18 @@ impl LiquidApp {
                 ChamberShape::Box => "box",
             };
             parts.push(format!("--chamber-shape {}", shape_str));
+        }
+
+        if self.solver.chamber.custom_size {
+            let bs = self.solver.chamber.base_size;
+            if self.is_2d {
+                parts.push(format!("--chamber-size {:.2},{:.2}", bs.x, bs.y));
+            } else {
+                parts.push(format!(
+                    "--chamber-size {:.2},{:.2},{:.2}",
+                    bs.x, bs.y, bs.z
+                ));
+            }
         }
 
         let scale = self.solver.chamber.scale;
@@ -977,6 +984,21 @@ impl LiquidApp {
                 parts.push(format!(
                     "--chamber-scale {:.2},{:.2},{:.2}",
                     scale.x, scale.y, scale.z
+                ));
+            }
+        }
+
+        if self.solver.chamber.shape == ChamberShape::Bathtub {
+            if (self.solver.chamber.tub_slope_ratio - 0.28).abs() > 0.005 {
+                parts.push(format!(
+                    "--tub-slope {:.2}",
+                    self.solver.chamber.tub_slope_ratio
+                ));
+            }
+            if !self.is_2d && (self.solver.chamber.tub_fillet_ratio - 0.16).abs() > 0.005 {
+                parts.push(format!(
+                    "--tub-fillet {:.2}",
+                    self.solver.chamber.tub_fillet_ratio
                 ));
             }
         }
@@ -1044,36 +1066,51 @@ impl LiquidApp {
             }
             let pos = f.position;
             match &f.shape {
-                FaucetShape::Rectangle { width, .. } => {
-                    parts.push(format!(
-                        "--faucet \"waterfall:{:.2},{:.2},{:.2}:{:.2}:{:.0}\"",
-                        pos.x, pos.y, pos.z, width, f.flow_rate
-                    ));
+                FaucetShape::Rectangle { width, depth } => {
+                    if (depth - 0.08).abs() <= 0.005 || (depth - 0.05).abs() <= 0.005 {
+                        parts.push(format!(
+                            "--faucet \"waterfall:{:.2},{:.2},{:.2}:{:.2}:{:.0}\"",
+                            pos.x, pos.y, pos.z, width, f.flow_rate
+                        ));
+                    } else {
+                        parts.push(format!(
+                            "--faucet \"waterfall:{:.2},{:.2},{:.2}:{:.2}:{:.0}:{:.2}\"",
+                            pos.x, pos.y, pos.z, width, f.flow_rate, depth
+                        ));
+                    }
                 }
                 FaucetShape::Circle { radius } => {
                     if f.spray_spread > 0.08 {
                         parts.push(format!(
-                            "--faucet \"shower:{:.2},{:.2},{:.2}:{:.2}:{:.0}:{:.2}\"",
+                            "--faucet \"shower:{:.2},{:.2},{:.2}:{:.3}:{:.0}:{:.2}\"",
                             pos.x, pos.y, pos.z, radius, f.flow_rate, f.spray_spread
                         ));
                     } else if (f.direction - Vec3::new(0.0, -2.5, 0.0)).length_squared() > 1e-2 {
                         let d = f.direction;
                         parts.push(format!(
-                            "--faucet \"stream:{:.2},{:.2},{:.2}:{:.2},{:.2},{:.2}:{:.0}:{:.2}\"",
-                            pos.x, pos.y, pos.z, d.x, d.y, d.z, f.flow_rate, f.spray_spread
+                            "--faucet \"stream:{:.2},{:.2},{:.2}:{:.2},{:.2},{:.2}:{:.0}:{:.2}:{:.3}\"",
+                            pos.x, pos.y, pos.z, d.x, d.y, d.z, f.flow_rate, f.spray_spread, radius
                         ));
                     } else {
                         parts.push(format!(
-                            "--faucet \"circle:{:.2},{:.2},{:.2}:{:.2}:{:.0}\"",
+                            "--faucet \"circle:{:.2},{:.2},{:.2}:{:.3}:{:.0}\"",
                             pos.x, pos.y, pos.z, radius, f.flow_rate
                         ));
                     }
                 }
                 FaucetShape::Point => {
-                    parts.push(format!(
-                        "--faucet \"tap:{:.2},{:.2},{:.2}:{:.0}\"",
-                        pos.x, pos.y, pos.z, f.flow_rate
-                    ));
+                    if (f.direction - Vec3::new(0.0, -2.0, 0.0)).length_squared() > 1e-2 {
+                        let d = f.direction;
+                        parts.push(format!(
+                            "--faucet \"tap:{:.2},{:.2},{:.2}:0:{:.0}:{:.2},{:.2},{:.2}\"",
+                            pos.x, pos.y, pos.z, f.flow_rate, d.x, d.y, d.z
+                        ));
+                    } else {
+                        parts.push(format!(
+                            "--faucet \"tap:{:.2},{:.2},{:.2}:0:{:.0}\"",
+                            pos.x, pos.y, pos.z, f.flow_rate
+                        ));
+                    }
                 }
             }
         }
@@ -1167,6 +1204,61 @@ impl LiquidApp {
                 add_contents(ui)
             })
             .inner
+    }
+
+    fn trash_icon_button(ui: &mut egui::Ui, tooltip: &str) -> bool {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 20.0), egui::Sense::click());
+        let hovered = response.hovered();
+        let active = response.is_pointer_button_down_on();
+
+        if ui.is_rect_visible(rect) {
+            let (bg, border, icon_col) = if active {
+                (
+                    egui::Color32::from_rgb(92, 32, 42),
+                    egui::Color32::from_rgb(225, 95, 105),
+                    egui::Color32::from_rgb(255, 165, 170),
+                )
+            } else if hovered {
+                (
+                    egui::Color32::from_rgb(68, 28, 38),
+                    egui::Color32::from_rgb(196, 82, 92),
+                    egui::Color32::from_rgb(252, 132, 138),
+                )
+            } else {
+                (
+                    egui::Color32::from_rgb(24, 34, 52),
+                    egui::Color32::from_rgb(46, 63, 92),
+                    egui::Color32::from_rgb(176, 192, 214),
+                )
+            };
+
+            let p = ui.painter();
+            p.rect(
+                rect,
+                egui::CornerRadius::same(4),
+                bg,
+                egui::Stroke::new(1.0_f32, border),
+                egui::StrokeKind::Inside,
+            );
+
+            let c = rect.center();
+            let s = egui::Stroke::new(1.25_f32, icon_col);
+            // Lid bar
+            p.line_segment([egui::pos2(c.x - 4.8, c.y - 3.0), egui::pos2(c.x + 4.8, c.y - 3.0)], s);
+            // Top handle
+            p.line_segment([egui::pos2(c.x - 1.9, c.y - 3.0), egui::pos2(c.x - 1.9, c.y - 4.9)], s);
+            p.line_segment([egui::pos2(c.x - 1.9, c.y - 4.9), egui::pos2(c.x + 1.9, c.y - 4.9)], s);
+            p.line_segment([egui::pos2(c.x + 1.9, c.y - 4.9), egui::pos2(c.x + 1.9, c.y - 3.0)], s);
+            // Tapered bin walls & base
+            p.line_segment([egui::pos2(c.x - 3.7, c.y - 3.0), egui::pos2(c.x - 2.9, c.y + 4.8)], s);
+            p.line_segment([egui::pos2(c.x - 2.9, c.y + 4.8), egui::pos2(c.x + 2.9, c.y + 4.8)], s);
+            p.line_segment([egui::pos2(c.x + 2.9, c.y + 4.8), egui::pos2(c.x + 3.7, c.y - 3.0)], s);
+            // Inner vertical ribs
+            p.line_segment([egui::pos2(c.x - 1.25, c.y - 1.2), egui::pos2(c.x - 1.05, c.y + 3.2)], s);
+            p.line_segment([egui::pos2(c.x + 1.25, c.y - 1.2), egui::pos2(c.x + 1.05, c.y + 3.2)], s);
+        }
+
+        response.on_hover_text(tooltip).clicked()
     }
 
     fn draw_scene_tab(&mut self, ui: &mut egui::Ui) {
@@ -1485,11 +1577,7 @@ impl LiquidApp {
                             );
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text("Remove obstacle")
-                                .clicked()
-                            {
+                            if Self::trash_icon_button(ui, "Remove obstacle") {
                                 to_remove_col = Some(idx);
                             }
                             if tri_badge.is_some()
@@ -1837,12 +1925,15 @@ impl LiquidApp {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut faucet.enabled, "");
                         ui.strong(&faucet.name);
-                        if ui.small_button("✕").clicked() {
-                            to_remove = Some(idx);
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::trash_icon_button(ui, "Remove faucet / tap") {
+                                to_remove = Some(idx);
+                            }
+                        });
                     });
                     if faucet.enabled {
                         ui.horizontal(|ui| {
+                            ui.weak("Pos:");
                             ui.add(egui::DragValue::new(&mut faucet.position.x).speed(0.01).prefix("X:"));
                             ui.add(egui::DragValue::new(&mut faucet.position.y).speed(0.01).prefix("Y:"));
                             if !self.is_2d {
@@ -1851,7 +1942,51 @@ impl LiquidApp {
                                 faucet.position.z = 0.0;
                             }
                         });
-                        ui.add(egui::Slider::new(&mut faucet.flow_rate, 50.0..=2500.0).text("Rate (p/s)"));
+                        ui.horizontal(|ui| {
+                            ui.weak("Vel:");
+                            ui.add(egui::DragValue::new(&mut faucet.direction.x).speed(0.05).prefix("Vx:"));
+                            ui.add(egui::DragValue::new(&mut faucet.direction.y).speed(0.05).prefix("Vy:"));
+                            if !self.is_2d {
+                                ui.add(egui::DragValue::new(&mut faucet.direction.z).speed(0.05).prefix("Vz:"));
+                            } else {
+                                faucet.direction.z = 0.0;
+                            }
+                        });
+                        match &mut faucet.shape {
+                            FaucetShape::Circle { radius } => {
+                                ui.add(
+                                    egui::Slider::new(radius, 0.005..=0.40)
+                                        .text("Radius (m)"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut faucet.spray_spread, 0.0..=0.5)
+                                        .text("Spray Angle"),
+                                );
+                            }
+                            FaucetShape::Rectangle { width, depth } => {
+                                ui.add(
+                                    egui::Slider::new(width, 0.05..=1.2).text("Width (m)"),
+                                );
+                                if !self.is_2d {
+                                    ui.add(
+                                        egui::Slider::new(depth, 0.01..=0.5).text("Depth (m)"),
+                                    );
+                                }
+                            }
+                            FaucetShape::Point => {
+                                let mut r = 0.0f32;
+                                if ui
+                                    .add(egui::Slider::new(&mut r, 0.0..=0.40).text("Radius (m)"))
+                                    .changed()
+                                    && r > 0.0
+                                {
+                                    faucet.shape = FaucetShape::Circle {
+                                        radius: r.max(0.005),
+                                    };
+                                }
+                            }
+                        }
+                        ui.add(egui::Slider::new(&mut faucet.flow_rate, 25.0..=3000.0).text("Rate (p/s)"));
                     }
                 }
                 if let Some(idx) = to_remove {
@@ -1896,9 +2031,11 @@ impl LiquidApp {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut drain.enabled, "");
                         ui.strong(&drain.name);
-                        if ui.small_button("✕").clicked() {
-                            to_remove = Some(idx);
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::trash_icon_button(ui, "Remove drain") {
+                                to_remove = Some(idx);
+                            }
+                        });
                     });
                     if drain.enabled {
                         ui.add(egui::Slider::new(&mut drain.radius, 0.04..=0.5).text("Radius"));

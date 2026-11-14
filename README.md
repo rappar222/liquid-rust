@@ -103,8 +103,8 @@ sudo apt install liquid-rust
 
 #### Option 2: Download `.deb` Package
 ```bash
-curl -LO https://github.com/rappar222/liquid-rust/releases/latest/download/liquid-rust_0.3.3_amd64.deb
-sudo apt install ./liquid-rust_0.3.3_amd64.deb
+curl -LO https://github.com/rappar222/liquid-rust/releases/latest/download/liquid-rust_0.3.11_amd64.deb
+sudo apt install ./liquid-rust_0.3.11_amd64.deb
 ```
 
 ---
@@ -193,6 +193,9 @@ cargo run --release -- --headless --benchmark --frames 100 --quality ultra
 # Simulate Droplet Splash and export PLY files to a folder
 cargo run --release -- --headless --preset splash --frames 150 --export-ply ./renders
 
+# Export an ultra-detailed CLI-only offline render (Surface Mesh + SSAA + 4K + H.264 CRF 11)
+cargo run --release -- --export-mp4 master_water.mp4 --preset dam-break --quality studio --render-quality master --res 4k --surface-mesh --time 4.0 --fps 60
+
 # Run with custom particle radius and spacing for ultra-fine liquid
 cargo run --release -- --particle-radius 0.008 --spacing 0.014 --time 2.5 --fps 60
 ```
@@ -201,22 +204,32 @@ cargo run --release -- --particle-radius 0.008 --spacing 0.014 --time 2.5 --fps 
 
 ```
 Options:
-      --headless                Run in headless mode without opening GUI window
-      --preset <NAME>           Scene preset: dam-break, double-dam, splash, obstacle, tornado, zero-g [default: dam-break]
-  -q, --quality <QUALITY>       Particle quality: draft, medium, high, ultra, cinematic [default: medium]
-      --particle-radius <R>     Custom particle radius override (smaller = finer fluid)
-      --spacing <S>             Custom particle spacing override
-  -t, --time <SECONDS>          Total simulation duration in seconds (e.g. --time 4.0). Automatically calculates total frames = time * fps
-      --fps <FPS>               Framerate for video export and simulation stepping [default: 60]
-      --frames <FRAMES>         Number of simulation frames to run if --time is not set [default: 120]
-      --dt <DT>                 Custom time step dt per frame (defaults to 1.0 / fps)
-      --export-mp4 <PATH>       Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
-      --video-width <WIDTH>     Video export width in pixels [default: 1280]
-      --video-height <HEIGHT>   Video export height in pixels [default: 720]
-      --export-ply <DIR>        Directory to export PLY point cloud frames
-      --benchmark               Print performance benchmark statistics
-  -h, --help                    Print help
-  -V, --version                 Print version
+      --headless                    Run in headless mode without opening GUI window
+      --preset <NAME>               Scene preset: dam-break, double-dam, splash, obstacle, tornado, zero-g [default: dam-break]
+  -q, --quality <QUALITY>           Interactive: draft, medium, high, ultra, cinematic, extreme; CLI-only: studio (~2.5M), film (~4.9M), master (~8.2M) [default: medium]
+      --render-quality <MODE>       [CLI only] Offline render optics & AA: standard (1x), studio (2x2 SSAA), cinema (3x3 SSAA), master (4x4 SSAA, dispersion, CRF 11)
+      --res, --resolution <RES>     [CLI only] Video resolution preset: 480p, 720p, 1k/1080p, 2k/1440p, 3k, 4k/2160p, 5k, 6k, 8k/4320p, optional -vertical, or WxH
+      --surface-mesh                Enable reconstructed 3D liquid surface mesh + PBR refraction/caustics
+      --chamber-shape <TYPE>        Bounding box type: box, sphere, bathtub (aliases: --box-type, --bounds-type, --chamber-type)
+      --chamber-size <W,H[,D]>      Bounding box size in meters: D, W,H (2D), or W,H,D (aliases: --box-size, --bounds-size)
+      --chamber-scale <SCALE>       Bounding box scale: uniform, X,Y, or X,Y,Z (aliases: --box-scale, --bounds-scale)
+      --faucet <SPEC>               Add emitter: tap:x,y,z[:radius[:rate[:vx,vy,vz]]], stream:x,y,z:vx,vy,vz[:rate[:spread[:radius]]], circle/shower/waterfall
+      --drain <SPEC>                Add drain: floor:radius, floor:x,z:radius, <face>:radius, or custom:x,y,z:radius
+      --obstacle <SPEC>             Add collider: sphere:x,y,z:r, box:x,y,z:hx,hy,hz, cylinder:x,y,z:r,h, or mesh:<path>
+      --particle-radius <R>         Custom particle radius override (smaller = finer fluid)
+      --spacing <S>                 Custom particle spacing override
+  -t, --time <SECONDS>              Total simulation duration in seconds (e.g. --time 4.0)
+      --fps <FPS>                   Framerate for video export and simulation stepping [default: 60]
+      --frames <FRAMES>             Number of simulation frames to run if --time is not set [default: 120]
+      --dt <DT>                     Custom time step dt per frame (defaults to 1.0 / fps)
+      --export-mp4 <PATH>           Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
+      --export-obj <DIR>            Directory to export reconstructed Wavefront .OBJ surface mesh sequence
+      --video-width <WIDTH>         Video export width in pixels [default: 1280]
+      --video-height <HEIGHT>       Video export height in pixels [default: 720]
+      --export-ply <DIR>            Directory to export PLY point cloud frames
+      --benchmark                   Print performance benchmark statistics
+  -h, --help                        Print help
+  -V, --version                     Print version
 ```
 
 ---

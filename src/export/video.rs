@@ -1,6 +1,6 @@
 use crate::math::Aabb;
 use crate::render::{
-    Camera, ColorMap, ColorMapType, ColorMode, SurfaceMesh, SurfaceMeshConfig,
+    Camera, CliRenderQuality, ColorMap, ColorMapType, ColorMode, SurfaceMesh, SurfaceMeshConfig,
 };
 use crate::sph::collider::{Collider, ColliderShape};
 use crate::sph::particle::Particle;
@@ -75,11 +75,17 @@ struct FluidShadowGrid {
 }
 
 impl FluidShadowGrid {
-    fn build(mesh: &SurfaceMesh, bounds: Aabb, light_dir: Vec3, floor_y: f32) -> Option<Self> {
+    fn build_with_res(
+        mesh: &SurfaceMesh,
+        bounds: Aabb,
+        light_dir: Vec3,
+        floor_y: f32,
+        res: usize,
+    ) -> Option<Self> {
         if mesh.vertices.is_empty() || light_dir.y <= 0.08 {
             return None;
         }
-        let res = 128usize;
+        let res = res.clamp(64, 1024);
         let pad = 0.6;
         let min_x = bounds.min.x - pad;
         let max_x = bounds.max.x + pad;
@@ -93,8 +99,12 @@ impl FluidShadowGrid {
         let inv_sx = res as f32 / span_x;
         let inv_sz = res as f32 / span_z;
 
-        // Splat vertex density onto the floor along -light_dir
-        let weight_per_vert = (64.0 / (mesh.vertices.len() as f32).sqrt().max(8.0)).clamp(0.08, 0.55);
+        // Splat vertex density onto the floor along -light_dir (scaled for grid cell area)
+        let res_ratio = res as f32 / 128.0;
+        let weight_per_vert = ((64.0 / (mesh.vertices.len() as f32).sqrt().max(8.0))
+            * res_ratio
+            * res_ratio)
+            .clamp(0.08, 1.5);
         for v in &mesh.vertices {
             let h = (v.position[1] - floor_y).max(0.0);
             let fx = v.position[0] - sun_tan_xz.x * h;
@@ -107,18 +117,40 @@ impl FluidShadowGrid {
             }
         }
 
-        // Fast separable 3x3 box blur for soft penumbra
-        let mut blurred = vec![0.0f32; res * res];
-        for z in 1..(res - 1) {
-            for x in 1..(res - 1) {
-                let mut sum = 0.0;
-                for dz in -1..=1 {
-                    let row = (z as isize + dz) as usize * res;
-                    for dx in -1..=1 {
-                        sum += cells[row + (x as isize + dx) as usize];
+        // Fast separable blur for soft penumbra (2 passes when high-res for smooth Gaussian-like falloff)
+        let radius: isize = if res >= 384 {
+            3
+        } else if res >= 256 {
+            2
+        } else {
+            1
+        };
+        let passes = if res >= 256 { 2 } else { 1 };
+        let inv_k = 1.0 / (2 * radius + 1) as f32;
+        let mut scratch = vec![0.0f32; res * res];
+
+        for _ in 0..passes {
+            for z in 0..res {
+                let row = z * res;
+                for x in 0..res {
+                    let mut sum = 0.0;
+                    for dx in -radius..=radius {
+                        let sx = (x as isize + dx).clamp(0, res as isize - 1) as usize;
+                        sum += cells[row + sx];
                     }
+                    scratch[row + x] = sum * inv_k;
                 }
-                blurred[z * res + x] = sum * (1.0 / 9.0);
+            }
+            for z in 0..res {
+                let row = z * res;
+                for x in 0..res {
+                    let mut sum = 0.0;
+                    for dz in -radius..=radius {
+                        let sz = (z as isize + dz).clamp(0, res as isize - 1) as usize;
+                        sum += scratch[sz * res + x];
+                    }
+                    cells[row + x] = sum * inv_k;
+                }
             }
         }
 
@@ -126,7 +158,7 @@ impl FluidShadowGrid {
             origin_xz: Vec2::new(min_x, min_z),
             inv_size_xz: Vec2::new(1.0 / span_x, 1.0 / span_z),
             sun_tan_xz,
-            cells: blurred,
+            cells,
             res,
         })
     }
@@ -163,6 +195,11 @@ pub struct SoftwareRenderer {
     pub rgb_buffer: Vec<u8>,
     pub depth_buffer: Vec<f32>,
     pub enable_culling: bool,
+    pub render_quality: CliRenderQuality,
+    pub ssaa_factor: usize,
+    render_width: usize,
+    render_height: usize,
+    render_rgb: Vec<u8>,
     // Persistent scratch buffers for zero-allocation surface mesh rendering
     bg_rgb: Vec<u8>,
     front_depth: Vec<f32>,
@@ -170,14 +207,42 @@ pub struct SoftwareRenderer {
     surf_hits: Vec<SurfaceHit>,
 }
 
+const MAX_SSAA_INTERNAL_PIXELS: u64 = 36_000_000;
+
 impl SoftwareRenderer {
     pub fn new(width: usize, height: usize) -> Self {
+        Self::new_with_quality(width, height, CliRenderQuality::Standard)
+    }
+
+    pub fn new_with_quality(
+        width: usize,
+        height: usize,
+        render_quality: CliRenderQuality,
+    ) -> Self {
+        let mut ssaa = render_quality.ssaa_factor().max(1);
+        let base_px = (width as u64).saturating_mul(height as u64);
+        while ssaa > 1 && base_px.saturating_mul((ssaa * ssaa) as u64) > MAX_SSAA_INTERNAL_PIXELS {
+            ssaa -= 1;
+        }
+        let render_width = width.saturating_mul(ssaa);
+        let render_height = height.saturating_mul(ssaa);
+        let render_px = render_width.saturating_mul(render_height);
+
         Self {
             width,
             height,
             rgb_buffer: vec![0; width * height * 3],
-            depth_buffer: vec![f32::INFINITY; width * height],
+            depth_buffer: vec![f32::INFINITY; render_px],
             enable_culling: true,
+            render_quality,
+            ssaa_factor: ssaa,
+            render_width,
+            render_height,
+            render_rgb: if ssaa > 1 {
+                vec![0; render_px * 3]
+            } else {
+                Vec::new()
+            },
             bg_rgb: Vec::new(),
             front_depth: Vec::new(),
             back_depth: Vec::new(),
@@ -185,8 +250,12 @@ impl SoftwareRenderer {
         }
     }
 
+    pub fn internal_dimensions(&self) -> (usize, usize) {
+        (self.render_width, self.render_height)
+    }
+
     fn ensure_mesh_buffers(&mut self) {
-        let px_count = self.width * self.height;
+        let px_count = self.render_width * self.render_height;
         if self.bg_rgb.len() != px_count * 3 {
             self.bg_rgb.resize(px_count * 3, 0);
         }
@@ -201,13 +270,25 @@ impl SoftwareRenderer {
         }
     }
 
-    /// Clear buffer with studio dark gradient background (parallel across rows)
-    pub fn clear(&mut self) {
-        let w = self.width;
-        let h = self.height.max(1);
+    fn clear_active_target(&mut self) {
+        let w = self.render_width;
+        let h = self.render_height.max(1);
+        let target = if self.ssaa_factor > 1 {
+            &mut self.render_rgb
+        } else {
+            &mut self.rgb_buffer
+        };
+        Self::fill_sky_gradient(target, w, h);
+        self.depth_buffer
+            .par_iter_mut()
+            .for_each(|d| *d = f32::INFINITY);
+    }
 
-        self.rgb_buffer
-            .par_chunks_mut(w * 3)
+    fn fill_sky_gradient(rgb: &mut [u8], w: usize, h: usize) {
+        if w == 0 || rgb.is_empty() {
+            return;
+        }
+        rgb.par_chunks_mut(w * 3)
             .enumerate()
             .for_each(|(y, row)| {
                 let t = y as f32 / h as f32;
@@ -221,8 +302,72 @@ impl SoftwareRenderer {
                     px[2] = b;
                 }
             });
+    }
 
-        self.depth_buffer.par_iter_mut().for_each(|d| *d = f32::INFINITY);
+    /// Clear buffer with studio dark gradient background (parallel across rows)
+    pub fn clear(&mut self) {
+        self.clear_active_target();
+        if self.ssaa_factor > 1 {
+            Self::fill_sky_gradient(&mut self.rgb_buffer, self.width, self.height.max(1));
+        }
+    }
+
+    /// Resolve supersampled internal RGB buffer in linear optical space with subtle IGN dithering.
+    fn resolve_ssaa_to_output(&mut self) {
+        let ssaa = self.ssaa_factor;
+        if ssaa <= 1 || self.width == 0 || self.height == 0 {
+            return;
+        }
+        let out_w = self.width;
+        let rw = self.render_width;
+        let inv_samples = 1.0f32 / (ssaa * ssaa) as f32;
+        let mut srgb_lut = [0.0f32; 256];
+        for (i, v) in srgb_lut.iter_mut().enumerate() {
+            *v = (i as f32 / 255.0).powf(2.2);
+        }
+        let src = &self.render_rgb;
+
+        self.rgb_buffer
+            .par_chunks_mut(out_w * 3)
+            .enumerate()
+            .for_each(|(oy, out_row)| {
+                let base_sy = oy * ssaa;
+                for ox in 0..out_w {
+                    let base_sx = ox * ssaa;
+                    let mut acc_r = 0.0f32;
+                    let mut acc_g = 0.0f32;
+                    let mut acc_b = 0.0f32;
+
+                    for dy in 0..ssaa {
+                        let row_off = (base_sy + dy) * rw + base_sx;
+                        for dx in 0..ssaa {
+                            let idx = (row_off + dx) * 3;
+                            acc_r += srgb_lut[src[idx] as usize];
+                            acc_g += srgb_lut[src[idx + 1] as usize];
+                            acc_b += srgb_lut[src[idx + 2] as usize];
+                        }
+                    }
+
+                    let lin_r = (acc_r * inv_samples).clamp(0.0, 1.0);
+                    let lin_g = (acc_g * inv_samples).clamp(0.0, 1.0);
+                    let lin_b = (acc_b * inv_samples).clamp(0.0, 1.0);
+
+                    // Subtle interleaved gradient noise dithering eliminates 8-bit sky/refraction banding
+                    let ign = ((0.06711056f32 * ox as f32 + 0.00583715f32 * oy as f32).fract()
+                        * 52.9829189f32)
+                        .fract()
+                        - 0.5;
+                    let dither = ign * 0.75;
+
+                    let oidx = ox * 3;
+                    out_row[oidx] = (lin_r.powf(1.0 / 2.2) * 255.0 + 0.5 + dither)
+                        .clamp(0.0, 255.0) as u8;
+                    out_row[oidx + 1] = (lin_g.powf(1.0 / 2.2) * 255.0 + 0.5 + dither)
+                        .clamp(0.0, 255.0) as u8;
+                    out_row[oidx + 2] = (lin_b.powf(1.0 / 2.2) * 255.0 + 0.5 + dither)
+                        .clamp(0.0, 255.0) as u8;
+                }
+            });
     }
 
     /// Render SPH particle simulation frame with multi-threaded band-bucketed rasterization
@@ -237,10 +382,10 @@ impl SoftwareRenderer {
         color_map: ColorMapType,
         rest_density: f32,
     ) {
-        self.clear();
+        self.clear_active_target();
 
-        let width = self.width;
-        let height = self.height;
+        let width = self.render_width;
+        let height = self.render_height;
         if width == 0 || height == 0 {
             return;
         }
@@ -332,7 +477,12 @@ impl SoftwareRenderer {
         let light_dir = Vec3::new(0.42, 0.82, 0.38).normalize();
         let half_dir = (light_dir + Vec3::new(0.0, 0.0, 1.0)).normalize();
 
-        let rgb_chunks = self.rgb_buffer.chunks_mut(band_height * width * 3);
+        let target_rgb = if self.ssaa_factor > 1 {
+            &mut self.render_rgb
+        } else {
+            &mut self.rgb_buffer
+        };
+        let rgb_chunks = target_rgb.chunks_mut(band_height * width * 3);
         let depth_chunks = self.depth_buffer.chunks_mut(band_height * width);
 
         rgb_chunks
@@ -401,6 +551,8 @@ impl SoftwareRenderer {
                     }
                 }
             });
+
+        self.resolve_ssaa_to_output();
     }
 
     /// Render reconstructed 3D liquid surface mesh with physically-based optics, Beer-Lambert
@@ -416,8 +568,8 @@ impl SoftwareRenderer {
         anim_time: f32,
         is_2d: bool,
     ) {
-        let width = self.width;
-        let height = self.height;
+        let width = self.render_width;
+        let height = self.render_height;
         if width == 0 || height == 0 {
             return;
         }
@@ -454,7 +606,13 @@ impl SoftwareRenderer {
 
         let floor_y = bounds.min.y - 0.002;
         let shadow_grid = if cfg.cast_shadows && !is_2d {
-            FluidShadowGrid::build(mesh, bounds, light_dir, floor_y)
+            FluidShadowGrid::build_with_res(
+                mesh,
+                bounds,
+                light_dir,
+                floor_y,
+                self.render_quality.shadow_res(),
+            )
         } else {
             None
         };
@@ -467,11 +625,17 @@ impl SoftwareRenderer {
         // 1. Render Studio Sky, 3D Perspective Floor Grid (+ Soft Fluid Shadows/Caustics), and Analytic Obstacles
         let w_f = width as f32;
         let h_f = height as f32;
-        self.rgb_buffer
-            .par_chunks_mut(width * 3)
-            .zip(self.depth_buffer.par_chunks_mut(width))
-            .enumerate()
-            .for_each(|(y, (rgb_row, depth_row))| {
+        {
+            let target_rgb = if self.ssaa_factor > 1 {
+                &mut self.render_rgb
+            } else {
+                &mut self.rgb_buffer
+            };
+            target_rgb
+                .par_chunks_mut(width * 3)
+                .zip(self.depth_buffer.par_chunks_mut(width))
+                .enumerate()
+                .for_each(|(y, (rgb_row, depth_row))| {
                 let ndc_y = 1.0 - 2.0 * ((y as f32 + 0.5) / h_f);
                 let sy = ndc_y * tan_half_fov;
 
@@ -598,6 +762,7 @@ impl SoftwareRenderer {
                     rgb_row[idx + 2] = srgb[2];
                 }
             });
+        }
 
         // Rasterize any custom TriangleMesh colliders into the solid background buffer
         for col in colliders {
@@ -618,7 +783,12 @@ impl SoftwareRenderer {
         }
 
         // Snapshot background color buffer so refracted liquid rays can sample distorted background!
-        self.bg_rgb.copy_from_slice(&self.rgb_buffer);
+        let bg_src = if self.ssaa_factor > 1 {
+            &self.render_rgb
+        } else {
+            &self.rgb_buffer
+        };
+        self.bg_rgb.copy_from_slice(bg_src);
 
         // 2. Project & Rasterize Reconstructed Fluid Surface Mesh
         if !mesh.is_empty() {
@@ -739,7 +909,13 @@ impl SoftwareRenderer {
             }
 
             let bg_rgb_ref = &self.bg_rgb;
-            let rgb_chunks = self.rgb_buffer.chunks_mut(band_height * width * 3);
+            let dispersion = self.render_quality.chromatic_dispersion();
+            let target_rgb = if self.ssaa_factor > 1 {
+                &mut self.render_rgb
+            } else {
+                &mut self.rgb_buffer
+            };
+            let rgb_chunks = target_rgb.chunks_mut(band_height * width * 3);
             let solid_depth_chunks = self.depth_buffer.chunks_mut(band_height * width);
             let front_chunks = self.front_depth.chunks_mut(band_height * width);
             let back_chunks = self.back_depth.chunks_mut(band_height * width);
@@ -911,25 +1087,39 @@ impl SoftwareRenderer {
                                 let fresnel = f0_vec
                                     + (Vec3::ONE - f0_vec) * (1.0 - ndotv).powi(5);
 
-                                // Screen-Space Refraction + Beer-Lambert Volume Absorption
+                                // Screen-Space Refraction + Beer-Lambert Volume Absorption (+ CLI chromatic dispersion)
                                 let refr_scale = cfg.refraction_strength
                                     * (1.0 - cfg.metallic)
                                     * (height as f32 * 0.032)
                                     * (thickness / (thickness + 0.25));
-                                let rx = (x as f32 - n.x * refr_scale)
-                                    .round()
-                                    .clamp(0.0, (width - 1) as f32) as usize;
-                                let ry = (y as f32 + n.y * refr_scale)
-                                    .round()
-                                    .clamp(0.0, (height - 1) as f32) as usize;
+                                let bg_lin = if dispersion > 0.0 {
+                                    let r_rx = x as f32 - n.x * refr_scale * (1.0 - dispersion);
+                                    let r_ry = y as f32 + n.y * refr_scale * (1.0 - dispersion);
+                                    let g_rx = x as f32 - n.x * refr_scale;
+                                    let g_ry = y as f32 + n.y * refr_scale;
+                                    let b_rx = x as f32 - n.x * refr_scale * (1.0 + dispersion);
+                                    let b_ry = y as f32 + n.y * refr_scale * (1.0 + dispersion);
+                                    Vec3::new(
+                                        sample_bg_bilinear_linear(bg_rgb_ref, width, height, r_rx, r_ry).x,
+                                        sample_bg_bilinear_linear(bg_rgb_ref, width, height, g_rx, g_ry).y,
+                                        sample_bg_bilinear_linear(bg_rgb_ref, width, height, b_rx, b_ry).z,
+                                    )
+                                } else {
+                                    let rx = (x as f32 - n.x * refr_scale)
+                                        .round()
+                                        .clamp(0.0, (width - 1) as f32) as usize;
+                                    let ry = (y as f32 + n.y * refr_scale)
+                                        .round()
+                                        .clamp(0.0, (height - 1) as f32) as usize;
 
-                                let bg_idx = (ry * width + rx) * 3;
-                                let bg_srgb = [
-                                    bg_rgb_ref[bg_idx],
-                                    bg_rgb_ref[bg_idx + 1],
-                                    bg_rgb_ref[bg_idx + 2],
-                                ];
-                                let bg_lin = srgb_to_linear(bg_srgb);
+                                    let bg_idx = (ry * width + rx) * 3;
+                                    let bg_srgb = [
+                                        bg_rgb_ref[bg_idx],
+                                        bg_rgb_ref[bg_idx + 1],
+                                        bg_rgb_ref[bg_idx + 2],
+                                    ];
+                                    srgb_to_linear(bg_srgb)
+                                };
 
                                 // Beer-Lambert exponential absorption across fluid thickness (in linear optical space)
                                 let opt_depth = thickness * cfg.absorption;
@@ -1034,6 +1224,7 @@ impl SoftwareRenderer {
 
         // 3. Draw subtle depth-aware Chamber Wireframe on top
         self.draw_chamber_wireframe_depth(chamber, &bounds, view, proj, [78, 136, 205]);
+        self.resolve_ssaa_to_output();
     }
 
     fn rasterize_solid_triangle_mesh(
@@ -1054,10 +1245,17 @@ impl SoftwareRenderer {
         );
         let s = tri_mesh.scale;
         let pos = tri_mesh.position;
-        let w_f = self.width as f32;
-        let h_f = self.height as f32;
-        let w_i = self.width as i32;
-        let h_i = self.height as i32;
+        let rw = self.render_width;
+        let rh = self.render_height;
+        let w_f = rw as f32;
+        let h_f = rh as f32;
+        let w_i = rw as i32;
+        let h_i = rh as i32;
+        let target_rgb = if self.ssaa_factor > 1 {
+            &mut self.render_rgb
+        } else {
+            &mut self.rgb_buffer
+        };
 
         for tri in tri_mesh.triangles.iter() {
             let p0 = pos + rot * (tri.a * s);
@@ -1108,7 +1306,7 @@ impl SoftwareRenderer {
 
             for y in y_min..=y_max {
                 let py = y as f32 + 0.5;
-                let row = y as usize * self.width;
+                let row = y as usize * rw;
                 for x in x_min..=x_max {
                     let px = x as f32 + 0.5;
                     let w0 = ((sx1 - px) * (sy2 - py) - (sy1 - py) * (sx2 - px)) * inv_area;
@@ -1120,9 +1318,9 @@ impl SoftwareRenderer {
                         if z_dist < self.depth_buffer[pix] {
                             self.depth_buffer[pix] = z_dist;
                             let idx = pix * 3;
-                            self.rgb_buffer[idx] = srgb[0];
-                            self.rgb_buffer[idx + 1] = srgb[1];
-                            self.rgb_buffer[idx + 2] = srgb[2];
+                            target_rgb[idx] = srgb[0];
+                            target_rgb[idx + 1] = srgb[1];
+                            target_rgb[idx + 2] = srgb[2];
                         }
                     }
                 }
@@ -1173,6 +1371,18 @@ impl SoftwareRenderer {
         proj: Mat4,
         color: [u8; 3],
     ) {
+        let rw = self.render_width;
+        let rh = self.render_height;
+        let ssaa = self.ssaa_factor;
+        let w = rw as f32;
+        let h = rh as f32;
+        let target_rgb = if ssaa > 1 {
+            &mut self.render_rgb
+        } else {
+            &mut self.rgb_buffer
+        };
+        let depth_buf = &self.depth_buffer;
+
         for (p0, p1) in chamber.generate_wireframe_lines(bounds) {
             let c0_cam = view * p0.extend(1.0);
             let c1_cam = view * p1.extend(1.0);
@@ -1184,13 +1394,16 @@ impl SoftwareRenderer {
             if c0.w <= 0.0 || c1.w <= 0.0 {
                 continue;
             }
-            let w = self.width as f32;
-            let h = self.height as f32;
             let x0 = ((c0.x / c0.w) * 0.5 + 0.5) * w;
             let y0 = (1.0 - ((c0.y / c0.w) * 0.5 + 0.5)) * h;
             let x1 = ((c1.x / c1.w) * 0.5 + 0.5) * w;
             let y1 = (1.0 - ((c1.y / c1.w) * 0.5 + 0.5)) * h;
-            self.draw_depth_line(
+            Self::draw_depth_line_in(
+                target_rgb,
+                depth_buf,
+                rw,
+                rh,
+                ssaa,
                 x0 as i32,
                 y0 as i32,
                 -c0_cam.z,
@@ -1202,8 +1415,13 @@ impl SoftwareRenderer {
         }
     }
 
-    fn draw_depth_line(
-        &mut self,
+    #[allow(clippy::too_many_arguments)]
+    fn draw_depth_line_in(
+        target_rgb: &mut [u8],
+        depth_buffer: &[f32],
+        rw: usize,
+        rh: usize,
+        ssaa: usize,
         mut x0: i32,
         mut y0: i32,
         z0: f32,
@@ -1218,27 +1436,29 @@ impl SoftwareRenderer {
         let sx = if x0 < x1 { 1 } else { -1 };
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
-        let w = self.width as i32;
-        let h = self.height as i32;
+        let w = rw as i32;
+        let h = rh as i32;
         let mut step = 0.0f32;
+        let alpha_boost = 1.0 + ssaa.saturating_sub(1) as f32 * 0.25;
 
         loop {
             if x0 >= 0 && x0 < w && y0 >= 0 && y0 < h {
                 let t = (step / steps).clamp(0.0, 1.0);
                 let z = z0 + (z1 - z0) * t;
-                let pix = y0 as usize * self.width + x0 as usize;
+                let pix = y0 as usize * rw + x0 as usize;
                 let idx = pix * 3;
-                let alpha = if z <= self.depth_buffer[pix] + 0.015 {
+                let base_alpha = if z <= depth_buffer[pix] + 0.015 {
                     0.55f32
                 } else {
                     0.12f32
                 };
-                self.rgb_buffer[idx] =
-                    (self.rgb_buffer[idx] as f32 * (1.0 - alpha) + color[0] as f32 * alpha) as u8;
-                self.rgb_buffer[idx + 1] = (self.rgb_buffer[idx + 1] as f32 * (1.0 - alpha)
-                    + color[1] as f32 * alpha) as u8;
-                self.rgb_buffer[idx + 2] = (self.rgb_buffer[idx + 2] as f32 * (1.0 - alpha)
-                    + color[2] as f32 * alpha) as u8;
+                let alpha = (base_alpha * alpha_boost).min(0.95);
+                target_rgb[idx] =
+                    (target_rgb[idx] as f32 * (1.0 - alpha) + color[0] as f32 * alpha) as u8;
+                target_rgb[idx + 1] =
+                    (target_rgb[idx + 1] as f32 * (1.0 - alpha) + color[1] as f32 * alpha) as u8;
+                target_rgb[idx + 2] =
+                    (target_rgb[idx + 2] as f32 * (1.0 - alpha) + color[2] as f32 * alpha) as u8;
             }
             if x0 == x1 && y0 == y1 {
                 break;
@@ -1264,19 +1484,37 @@ impl SoftwareRenderer {
             return;
         }
 
-        let w = self.width as f32;
-        let h = self.height as f32;
+        let rw = self.render_width;
+        let rh = self.render_height;
+        let w = rw as f32;
+        let h = rh as f32;
 
         let x0 = ((c0.x / c0.w) * 0.5 + 0.5) * w;
         let y0 = (1.0 - ((c0.y / c0.w) * 0.5 + 0.5)) * h;
         let x1 = ((c1.x / c1.w) * 0.5 + 0.5) * w;
         let y1 = (1.0 - ((c1.y / c1.w) * 0.5 + 0.5)) * h;
 
-        self.draw_bresenham_line(x0 as i32, y0 as i32, x1 as i32, y1 as i32, color);
+        let target_rgb = if self.ssaa_factor > 1 {
+            &mut self.render_rgb
+        } else {
+            &mut self.rgb_buffer
+        };
+        Self::draw_bresenham_line_in(
+            target_rgb,
+            rw,
+            rh,
+            x0 as i32,
+            y0 as i32,
+            x1 as i32,
+            y1 as i32,
+            color,
+        );
     }
 
-    fn draw_bresenham_line(
-        &mut self,
+    fn draw_bresenham_line_in(
+        target_rgb: &mut [u8],
+        rw: usize,
+        rh: usize,
         mut x0: i32,
         mut y0: i32,
         x1: i32,
@@ -1289,15 +1527,15 @@ impl SoftwareRenderer {
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
 
-        let w = self.width as i32;
-        let h = self.height as i32;
+        let w = rw as i32;
+        let h = rh as i32;
 
         loop {
             if x0 >= 0 && x0 < w && y0 >= 0 && y0 < h {
-                let idx = (y0 as usize * self.width + x0 as usize) * 3;
-                self.rgb_buffer[idx] = color[0];
-                self.rgb_buffer[idx + 1] = color[1];
-                self.rgb_buffer[idx + 2] = color[2];
+                let idx = (y0 as usize * rw + x0 as usize) * 3;
+                target_rgb[idx] = color[0];
+                target_rgb[idx + 1] = color[1];
+                target_rgb[idx + 2] = color[2];
             }
 
             if x0 == x1 && y0 == y1 {
@@ -1323,6 +1561,31 @@ fn srgb_to_linear(c: [u8; 3]) -> Vec3 {
     let g = (c[1] as f32 / 255.0).powf(2.2);
     let b = (c[2] as f32 / 255.0).powf(2.2);
     Vec3::new(r, g, b)
+}
+
+#[inline]
+fn sample_bg_bilinear_linear(bg: &[u8], w: usize, h: usize, fx: f32, fy: f32) -> Vec3 {
+    let fx = fx.clamp(0.0, (w.saturating_sub(1)) as f32);
+    let fy = fy.clamp(0.0, (h.saturating_sub(1)) as f32);
+    let x0 = fx.floor() as usize;
+    let y0 = fy.floor() as usize;
+    let x1 = (x0 + 1).min(w.saturating_sub(1));
+    let y1 = (y0 + 1).min(h.saturating_sub(1));
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+
+    let read = |x: usize, y: usize| -> Vec3 {
+        let idx = (y * w + x) * 3;
+        srgb_to_linear([bg[idx], bg[idx + 1], bg[idx + 2]])
+    };
+
+    let c00 = read(x0, y0);
+    let c10 = read(x1, y0);
+    let c01 = read(x0, y1);
+    let c11 = read(x1, y1);
+    let top = c00 + (c10 - c00) * tx;
+    let bot = c01 + (c11 - c01) * tx;
+    top + (bot - top) * ty
 }
 
 #[inline]
@@ -1503,6 +1766,17 @@ impl Mp4Encoder {
         height: usize,
         fps: u32,
     ) -> Result<Self, String> {
+        Self::new_with_encoding(output_path, width, height, fps, "medium", 18)
+    }
+
+    pub fn new_with_encoding<P: AsRef<Path>>(
+        output_path: P,
+        width: usize,
+        height: usize,
+        fps: u32,
+        preset: &str,
+        crf: u32,
+    ) -> Result<Self, String> {
         let output_str = output_path
             .as_ref()
             .to_str()
@@ -1524,9 +1798,9 @@ impl Mp4Encoder {
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            preset,
             "-crf",
-            "18",
+            &crf.to_string(),
             "-pix_fmt",
             "yuv420p",
             "-movflags",

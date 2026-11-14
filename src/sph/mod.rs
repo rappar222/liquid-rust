@@ -15,5 +15,8 @@ pub use kernel::SphKernels;
 pub use mesh::{Triangle, TriangleMesh};
 pub use particle::{Particle, ParticleType};
 pub use scene::{SceneGenerator, ScenePreset};
-pub use solver::{compute_lattice_rest_density, SimulationQuality, SolverConfig, SphSolver};
+pub use solver::{
+    compute_lattice_rest_density, compute_lattice_rest_density_2d, SimulationQuality, SolverConfig,
+    SphSolver,
+};
 pub use spatial::SpatialHashGrid;

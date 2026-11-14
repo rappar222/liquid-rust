@@ -550,6 +550,25 @@ fn test_cli_command_generator() {
     app.set_2d(true);
     let cmd_2d = app.generate_cli_command();
     assert!(cmd_2d.contains("--2d"), "Command should include --2d flag");
+
+    // Custom chamber size & tap/stream radius round-trip
+    app.set_2d(false);
+    app.solver.chamber.custom_size = true;
+    app.solver.chamber.base_size = glam::Vec3::new(2.2, 1.4, 1.1);
+    app.solver.faucets.push(Faucet::new_circle(
+        "Tap #1",
+        glam::Vec3::new(-0.5, 0.9, 0.0),
+        glam::Vec3::new(1.8, -1.0, 0.0),
+        0.115,
+        450.0,
+    ));
+    let cmd_custom = app.generate_cli_command();
+    assert!(cmd_custom.contains("--chamber-size 2.20,1.40,1.10"));
+    assert!(
+        cmd_custom.contains("--faucet \"stream:-0.50,0.90,0.00:1.80,-1.00,0.00:450:0.00:0.115\""),
+        "Stream/Tap CLI should preserve nozzle radius: {}",
+        cmd_custom
+    );
 }
 
 #[test]
@@ -1120,5 +1139,205 @@ fn test_high_poly_obj_bvh_normalization_and_transforms() {
         elapsed_ms < 250.0,
         "BVH mesh collision for 20k particles x 32k tris took {:.2} ms (too slow!)",
         elapsed_ms
+    );
+}
+
+#[test]
+fn test_cli_only_simulation_qualities_excluded_from_gui() {
+    use liquid_rust::sph::SimulationQuality;
+
+    // Interactive GUI list must NOT expose offline CLI-only quality presets
+    assert!(
+        SimulationQuality::ALL.iter().all(|q| !q.is_cli_only()),
+        "SimulationQuality::ALL must only contain interactive GUI presets"
+    );
+    assert_eq!(SimulationQuality::CLI_ONLY.len(), 3);
+    for &q in SimulationQuality::CLI_ONLY {
+        assert!(q.is_cli_only());
+    }
+
+    let mut cfg_extreme = SolverConfig::default();
+    let mut cfg_studio = SolverConfig::default();
+    let mut cfg_film = SolverConfig::default();
+    let mut cfg_master = SolverConfig::default();
+    SimulationQuality::Extreme.apply(&mut cfg_extreme, false);
+    SimulationQuality::Studio.apply(&mut cfg_studio, false);
+    SimulationQuality::Film.apply(&mut cfg_film, false);
+    SimulationQuality::Master.apply(&mut cfg_master, false);
+
+    assert!(cfg_studio.spacing < cfg_extreme.spacing);
+    assert!(cfg_film.spacing < cfg_studio.spacing);
+    assert!(cfg_master.spacing < cfg_film.spacing);
+    assert!(cfg_studio.substeps >= cfg_extreme.substeps);
+    assert!(cfg_master.substeps >= cfg_film.substeps);
+}
+
+#[test]
+fn test_cli_render_quality_and_ssaa_software_renderer() {
+    use liquid_rust::export::SoftwareRenderer;
+    use liquid_rust::render::{
+        Camera, CliRenderQuality, ColorMapType, ColorMode, FluidMaterialPreset, SurfaceMesh,
+        SurfaceMeshConfig,
+    };
+    use liquid_rust::sph::SimulationQuality;
+
+    // 1. Verify CliRenderQuality progression and mesh ceiling upgrades
+    let mut mesh_std = SurfaceMeshConfig::default();
+    let mut mesh_master = SurfaceMeshConfig::default();
+    CliRenderQuality::Standard.apply_to_mesh_config(&mut mesh_std, false, false);
+    CliRenderQuality::Master.apply_to_mesh_config(&mut mesh_master, false, false);
+
+    assert!(!CliRenderQuality::Standard.is_cli_only());
+    assert!(CliRenderQuality::Studio.is_cli_only());
+    assert!(CliRenderQuality::Cinema.is_cli_only());
+    assert!(CliRenderQuality::Master.is_cli_only());
+    assert!(mesh_master.max_grid_cells > mesh_std.max_grid_cells);
+    assert!(mesh_master.min_voxel_size < mesh_std.min_voxel_size);
+    assert!(mesh_master.max_smoothing_passes > mesh_std.max_smoothing_passes);
+    assert!(mesh_master.smoothing_passes > mesh_std.smoothing_passes);
+    assert!(CliRenderQuality::Master.ffmpeg_crf() < CliRenderQuality::Standard.ffmpeg_crf());
+
+    // 2. Verify 4K internal SSAA pixel memory cap prevents runaway allocation
+    let rend_4k = SoftwareRenderer::new_with_quality(3840, 2160, CliRenderQuality::Master);
+    assert_eq!(rend_4k.width, 3840);
+    assert_eq!(rend_4k.height, 2160);
+    assert_eq!(rend_4k.rgb_buffer.len(), 3840 * 2160 * 3);
+    assert_eq!(
+        rend_4k.ssaa_factor, 2,
+        "4K Master should auto-cap SSAA to 2x (33.2M internal px <= 36M limit)"
+    );
+
+    // 3. Render both Particles & SurfaceMesh through Studio (2x2 SSAA) and Master (4x4 SSAA)
+    let mut solver = SphSolver::new(
+        Aabb::new(Vec3::new(-0.6, 0.0, -0.6), Vec3::new(0.6, 1.0, 0.6)),
+        SolverConfig::default(),
+    );
+    solver.apply_quality(SimulationQuality::Draft);
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DropletSplash);
+    solver.step(1.0 / 60.0);
+
+    let cam = Camera::default();
+    let mut cfg = SurfaceMeshConfig::default();
+    FluidMaterialPreset::ClearWater.apply(&mut cfg);
+    CliRenderQuality::Studio.apply_to_mesh_config(&mut cfg, false, false);
+    let mesh = SurfaceMesh::from_particles(
+        &solver.particles,
+        solver.config.particle_radius,
+        solver.config.smoothing_length,
+        &cfg,
+    );
+    assert!(!mesh.is_empty());
+
+    for &rq in &[CliRenderQuality::Studio, CliRenderQuality::Master] {
+        let mut rend = SoftwareRenderer::new_with_quality(160, 120, rq);
+        assert_eq!(rend.ssaa_factor, rq.ssaa_factor());
+
+        rend.render_frame(
+            &solver.particles,
+            solver.config.particle_radius,
+            &solver.chamber,
+            solver.bounds,
+            &cam,
+            ColorMode::Velocity,
+            ColorMapType::Ocean,
+            solver.config.rest_density,
+        );
+        assert_eq!(rend.rgb_buffer.len(), 160 * 120 * 3);
+        assert!(rend.rgb_buffer.iter().any(|&v| v > 80));
+
+        rend.render_surface_mesh_frame(
+            &mesh,
+            &cfg,
+            &cam,
+            &solver.chamber,
+            solver.bounds,
+            &solver.colliders,
+            0.25,
+            false,
+        );
+        assert_eq!(rend.rgb_buffer.len(), 160 * 120 * 3);
+        assert!(rend.rgb_buffer.iter().any(|&v| v > 90));
+    }
+}
+
+#[test]
+fn test_vertical_wall_wave_runup_drains_without_lingering_lip() {
+    use liquid_rust::gpu::GpuSphSolver;
+    use liquid_rust::sph::SimulationQuality;
+
+    let bounds = Aabb::new(Vec3::new(-0.8, 0.0, -0.45), Vec3::new(0.8, 1.2, 0.45));
+    let mut solver = SphSolver::new(bounds, SolverConfig::default());
+    solver.apply_quality(SimulationQuality::High);
+    // Exercise high-substep / high-iteration regime (matching Studio/Film CLI tiers)
+    solver.config.substeps = 6;
+    solver.config.solver_iterations = 5;
+    SceneGenerator::setup_scene(&mut solver, ScenePreset::DamBreak);
+
+    let mut gpu = GpuSphSolver::new(solver.bounds, &solver.config, &solver.particles).ok();
+    let dt = 1.0 / 60.0;
+    let r = solver.config.particle_radius;
+    let h = solver.config.smoothing_length;
+    let x_wall_l = solver.bounds.min.x + r;
+
+    for frame in 1..=180 {
+        if let Some(ref mut g) = gpu {
+            g.step(
+                solver.bounds,
+                &solver.chamber,
+                &solver.config,
+                &solver.colliders,
+                None,
+                0.0,
+                0,
+                dt,
+                false,
+            );
+        } else {
+            solver.step(dt);
+        }
+
+        if frame == 30 {
+            if let Some(ref g) = gpu {
+                g.read_particles(&mut solver.particles);
+            }
+            let max_left_initial_drop = solver
+                .particles
+                .iter()
+                .filter(|p| p.position.x < x_wall_l + h)
+                .map(|p| p.position.y)
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_left_initial_drop < 0.86,
+                "Initial DamBreak release must drain smoothly from left wall without back-trench jet, got max_y={:.3}",
+                max_left_initial_drop
+            );
+        }
+    }
+
+    if let Some(ref g) = gpu {
+        g.read_particles(&mut solver.particles);
+    }
+
+    let l_wall_max = solver
+        .particles
+        .iter()
+        .filter(|p| p.position.x < x_wall_l + 0.8 * h)
+        .map(|p| p.position.y)
+        .fold(0.0f32, f32::max);
+
+    let mut near_ys: Vec<f32> = solver
+        .particles
+        .iter()
+        .filter(|p| p.position.x >= -0.68 && p.position.x <= -0.45)
+        .map(|p| p.position.y)
+        .collect();
+    near_ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let l_near_p95 = near_ys[near_ys.len() * 95 / 100];
+
+    assert!(
+        l_wall_max < 0.34 && l_wall_max <= l_near_p95 + 0.08,
+        "Left vertical wall fluid must drain cleanly without lingering meniscus: l_wall_max={:.3}, l_near_p95={:.3}",
+        l_wall_max,
+        l_near_p95
     );
 }

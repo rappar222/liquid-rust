@@ -7,5 +7,6 @@ pub use camera::Camera;
 pub use color_map::{ColorMap, ColorMapType, ColorMode};
 pub use gl_renderer::{GlRenderer, ParticleVertex};
 pub use surface_mesh::{
-    FluidMaterialPreset, MeshTextureMode, MeshVertex, RenderMode, SurfaceMesh, SurfaceMeshConfig,
+    CliRenderQuality, FluidMaterialPreset, MeshTextureMode, MeshVertex, RenderMode, SurfaceMesh,
+    SurfaceMeshConfig,
 };

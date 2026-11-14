@@ -11,10 +11,11 @@ pub use export::{Mp4Encoder, PlyExporter, SoftwareRenderer};
 pub use gpu::GpuSphSolver;
 pub use math::{unproject_mouse_ray, Aabb, Ray};
 pub use render::{
-    Camera, ColorMap, ColorMapType, ColorMode, FluidMaterialPreset, GlRenderer, MeshTextureMode,
-    MeshVertex, RenderMode, SurfaceMesh, SurfaceMeshConfig,
+    Camera, CliRenderQuality, ColorMap, ColorMapType, ColorMode, FluidMaterialPreset, GlRenderer,
+    MeshTextureMode, MeshVertex, RenderMode, SurfaceMesh, SurfaceMeshConfig,
 };
 pub use sph::{
-    compute_lattice_rest_density, Collider, ColliderShape, Particle, ParticleType, SceneGenerator,
-    ScenePreset, SimulationQuality, SolverConfig, SphSolver,
+    compute_lattice_rest_density, compute_lattice_rest_density_2d, Collider, ColliderShape,
+    Particle, ParticleType, SceneGenerator, ScenePreset, SimulationQuality, SolverConfig,
+    SphSolver,
 };

@@ -4,12 +4,13 @@ use glam::Vec3;
 use liquid_rust::export::{Mp4Encoder, PlyExporter, SoftwareRenderer};
 use liquid_rust::gpu::GpuSphSolver;
 use liquid_rust::render::{
-    Camera, ColorMapType, ColorMode, FluidMaterialPreset, MeshTextureMode, RenderMode, SurfaceMesh,
-    SurfaceMeshConfig,
+    Camera, CliRenderQuality, ColorMapType, ColorMode, FluidMaterialPreset, MeshTextureMode,
+    RenderMode, SurfaceMesh, SurfaceMeshConfig,
 };
 use liquid_rust::sph::{
-    compute_lattice_rest_density, Chamber, ChamberShape, Collider, ColliderShape, CubeFace, Drain,
-    Faucet, SceneGenerator, ScenePreset, SimulationQuality, SolverConfig, SphSolver,
+    compute_lattice_rest_density, compute_lattice_rest_density_2d, Chamber, ChamberShape,
+    Collider, ColliderShape, CubeFace, Drain, Faucet, SceneGenerator, ScenePreset,
+    SimulationQuality, SolverConfig, SphSolver,
 };
 use liquid_rust::LiquidApp;
 use std::path::PathBuf;
@@ -37,7 +38,7 @@ struct Args {
     #[arg(long)]
     preset: Option<String>,
 
-    /// Particle quality / resolution: draft, medium, high, ultra, cinematic, extreme (1M+)
+    /// Particle quality / resolution: draft, medium, high, ultra, cinematic, extreme (interactive + CLI), or offline CLI-only tiers: studio (~2.5M), film (~4.9M), master (~8.2M)
     #[arg(long, short = 'q', default_value = "medium")]
     quality: String,
 
@@ -217,7 +218,7 @@ struct Args {
     #[arg(long = "obstacle", action = clap::ArgAction::Append)]
     obstacles: Vec<String>,
 
-    /// Add custom faucet: 'waterfall:x,y,z:width[:rate]', 'shower:x,y,z:radius[:rate[:spread]]', 'circle:x,y,z:radius[:rate]', 'tap:x,y,z[:rate]', 'stream:x,y,z:vx,vy,vz[:rate[:spread]]'
+    /// Add custom faucet: 'waterfall:x,y,z:width[:rate[:depth]]', 'shower:x,y,z:radius[:rate[:spread]]', 'circle:x,y,z:radius[:rate[:vx,vy,vz[:spread]]]', 'tap:x,y,z[:radius[:rate[:vx,vy,vz]]]', 'stream:x,y,z:vx,vy,vz[:rate[:spread[:radius]]]'
     #[arg(long = "faucet", action = clap::ArgAction::Append)]
     faucets: Vec<String>,
 
@@ -225,22 +226,38 @@ struct Args {
     #[arg(long = "drain", action = clap::ArgAction::Append)]
     drains: Vec<String>,
 
-    /// Simulation chamber shape: box, sphere, bathtub
-    #[arg(long, default_value = "box")]
+    /// Bounding box / chamber type: box (cuboid), sphere (globe), bathtub (tub)
+    #[arg(long, default_value = "box", visible_aliases = ["chamber-type", "box-type", "bounds-type", "bounding-box-type"])]
     chamber_shape: String,
 
-    /// Chamber scale factor: uniform (e.g. 1.5) or per-axis (e.g. 1.5,1.2,1.0)
-    #[arg(long)]
+    /// Bounding box / chamber scale factor: uniform (e.g. 1.5), 2D (e.g. 1.5,1.2), or 3D (e.g. 1.5,1.2,1.0)
+    #[arg(long, visible_aliases = ["box-scale", "bounds-scale", "bounding-box-scale"])]
     chamber_scale: Option<String>,
 
-    /// Chamber bounding dimensions: width,height,depth (e.g. 2.0,1.5,1.0)
-    #[arg(long)]
+    /// Bounding box / chamber dimensions in meters: D, W,H (2D), or W,H,D (e.g. 2.0,1.5,1.0 or 2.0x1.5x1.0)
+    #[arg(long, visible_aliases = ["box-size", "bounds-size", "bounding-box-size"])]
     chamber_size: Option<String>,
+
+    /// Bathtub backrest slope ratio (relative to length, 0.05..0.5; default 0.28)
+    #[arg(long)]
+    tub_slope: Option<f32>,
+
+    /// Bathtub bottom fillet radius ratio (relative to width, 0.01..0.45; default 0.16)
+    #[arg(long)]
+    tub_fillet: Option<f32>,
 
     // === Outputs & Compute ===
     /// Export simulation video to MP4 file via ffmpeg (e.g. output.mp4)
     #[arg(long)]
     export_mp4: Option<PathBuf>,
+
+    /// [CLI only] Offline render quality preset (SSAA, high-res surface mesh, soft shadows, dispersion, CRF): standard, studio, cinema, master
+    #[arg(long, alias = "rq")]
+    render_quality: Option<String>,
+
+    /// [CLI only] Output video resolution preset: 480p, 720p, 1k (1080p), 2k (1440p), 3k, 4k (2160p), 5k, 6k, 8k (4320p), optional -vertical/-portrait, or WxH (e.g. 2560x1440)
+    #[arg(long, visible_alias = "res")]
+    resolution: Option<String>,
 
     /// Video export width in pixels
     #[arg(long, default_value_t = 1280)]
@@ -330,18 +347,113 @@ fn parse_preset(name: Option<&str>, has_faucets: bool) -> ScenePreset {
 }
 
 fn parse_quality(name: &str) -> SimulationQuality {
-    match name.to_lowercase().as_str() {
+    match name.trim().to_lowercase().as_str() {
         "draft" | "low" | "fast" => SimulationQuality::Draft,
         "medium" | "med" | "normal" => SimulationQuality::Medium,
         "high" | "hi" | "smooth" => SimulationQuality::High,
         "ultra" | "realistic" => SimulationQuality::Ultra,
         "cinematic" | "vfx" => SimulationQuality::Cinematic,
         "extreme" | "1m" | "insane" => SimulationQuality::Extreme,
+        "studio" | "photoreal" => SimulationQuality::Studio,
+        "film" | "vfx-max" => SimulationQuality::Film,
+        "master" | "hyper" | "insane-cli" => SimulationQuality::Master,
         _ => {
             eprintln!("Unknown quality '{}', defaulting to 'medium'", name);
             SimulationQuality::Medium
         }
     }
+}
+
+fn resolve_cli_render_quality(args: &Args, sim_quality: SimulationQuality) -> CliRenderQuality {
+    if let Some(ref rq) = args.render_quality {
+        if let Some(parsed) = CliRenderQuality::from_slug(rq) {
+            return parsed;
+        }
+        eprintln!(
+            "Unknown --render-quality '{}' (expected standard, studio, cinema, master), defaulting to 'standard'",
+            rq
+        );
+        return CliRenderQuality::Standard;
+    }
+
+    match sim_quality {
+        SimulationQuality::Studio => CliRenderQuality::Studio,
+        SimulationQuality::Film => CliRenderQuality::Cinema,
+        SimulationQuality::Master => CliRenderQuality::Master,
+        _ => CliRenderQuality::Standard,
+    }
+}
+
+fn parse_resolution_spec(spec: &str) -> Option<(usize, usize)> {
+    let normalized = spec.trim().to_ascii_lowercase().replace('_', "-");
+    let (base, vertical) = if let Some(b) = normalized.strip_suffix("-vertical") {
+        (b, true)
+    } else if let Some(b) = normalized.strip_suffix("-portrait") {
+        (b, true)
+    } else {
+        (normalized.as_str(), false)
+    };
+
+    let (w, h) = match base {
+        "360p" => (640, 360),
+        "480p" | "sd" => (854, 480),
+        "540p" | "qhd-half" => (960, 540),
+        "720p" | "hd" => (1280, 720),
+        "900p" | "hd+" | "hdplus" => (1600, 900),
+        "1k" | "1080p" | "fhd" | "fullhd" | "full-hd" => (1920, 1080),
+        "dci-2k" | "2k-dci" => (2048, 1080),
+        "2k" | "1440p" | "qhd" | "wqhd" => (2560, 1440),
+        "3k" | "1800p" => (3200, 1800),
+        "4k" | "2160p" | "uhd" | "4k-uhd" => (3840, 2160),
+        "dci-4k" | "4k-dci" => (4096, 2160),
+        "5k" | "2880p" => (5120, 2880),
+        "6k" | "3456p" => (6144, 3456),
+        "8k" | "4320p" | "8k-uhd" => (7680, 4320),
+        other => {
+            let (lw, lh) = other
+                .split_once('x')
+                .or_else(|| other.split_once('*'))
+                .or_else(|| other.split_once(','))?;
+            let pw = lw.trim().parse::<usize>().ok()?;
+            let ph = lh.trim().parse::<usize>().ok()?;
+            if pw < 16 || ph < 16 {
+                return None;
+            }
+            (pw, ph)
+        }
+    };
+
+    Some(if vertical { (h, w) } else { (w, h) })
+}
+
+fn resolve_video_dimensions(args: &Args) -> (usize, usize) {
+    let (mut w, mut h) = if let Some(ref spec) = args.resolution {
+        if let Some(dims) = parse_resolution_spec(spec) {
+            dims
+        } else {
+            eprintln!(
+                "Warning: unknown --res/--resolution '{}' (try 480p, 720p, 1k, 1080p, 2k, 1440p, 3k, 4k, 5k, 6k, 8k, or WxH), using {}x{}",
+                spec, args.video_width, args.video_height
+            );
+            (args.video_width, args.video_height)
+        }
+    } else {
+        (args.video_width, args.video_height)
+    };
+
+    if args.resolution.is_some() {
+        if args.video_width != 1280 {
+            w = args.video_width;
+        }
+        if args.video_height != 720 {
+            h = args.video_height;
+        }
+    }
+
+    // H.264 yuv420p requires even dimensions >= 16
+    let w_even = (w.max(16) + 1) & !1;
+    let h_even = (h.max(16) + 1) & !1;
+    (w_even, h_even)
 }
 
 fn parse_color_mode(s: &str) -> ColorMode {
@@ -429,13 +541,13 @@ fn build_mesh_config(args: &Args) -> SurfaceMeshConfig {
         cfg.metallic = v.clamp(0.0, 1.0);
     }
     if let Some(v) = args.mesh_scale {
-        cfg.voxel_scale = v.clamp(0.35, 2.0);
+        cfg.voxel_scale = v.clamp(0.30, 2.0);
     }
     if let Some(v) = args.mesh_iso {
         cfg.iso_value = v.clamp(0.10, 0.90);
     }
     if let Some(v) = args.mesh_smooth {
-        cfg.smoothing_passes = v.min(12);
+        cfg.smoothing_passes = v.min(24);
     }
     if let Some(ref ldir) = args.light_dir {
         if let Ok(v) = parse_vec3(ldir) {
@@ -617,6 +729,24 @@ fn parse_obstacle(spec: &str, index: usize) -> Result<Collider, String> {
     }
 }
 
+fn parse_f32_checked(raw: &str, label: &str, min_exclusive: Option<f32>) -> Result<f32, String> {
+    let val = raw
+        .trim()
+        .parse::<f32>()
+        .map_err(|e| format!("invalid {}: {}", label, e))?;
+    if !val.is_finite() {
+        return Err(format!("invalid {}: must be finite", label));
+    }
+    if let Some(min) = min_exclusive {
+        if val <= min {
+            return Err(format!("invalid {}: must be > {}", label, min));
+        }
+    } else if val < 0.0 {
+        return Err(format!("invalid {}: must be >= 0", label));
+    }
+    Ok(val)
+}
+
 fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
     let parts = clean_spec(spec);
     if parts.is_empty() {
@@ -625,30 +755,27 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
     let kind = parts[0].to_lowercase();
     let name = format!("Faucet #{} ({})", index + 1, kind);
 
-    match kind.as_str() {
+    let mut faucet = match kind.as_str() {
         "waterfall" => {
             if parts.len() < 3 {
                 return Err(format!(
-                    "Invalid waterfall spec '{}'. Format: waterfall:x,y,z:width[:flow_rate]",
+                    "Invalid waterfall spec '{}'. Format: waterfall:x,y,z:width[:flow_rate[:depth]]",
                     spec
                 ));
             }
             let pos = parse_vec3(&parts[1])?;
-            let width = parts[2]
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| format!("invalid width: {}", e))?;
+            let width = parse_f32_checked(&parts[2], "width", Some(0.0))?;
             let flow_rate = if parts.len() > 3 {
-                parts[3]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid flow_rate: {}", e))?
+                parse_f32_checked(&parts[3], "flow_rate", None)?
             } else {
                 600.0
             };
-            let mut f = Faucet::new_waterfall(name, pos, width, 0.08, flow_rate);
-            f.id = (index + 1) as u32;
-            Ok(f)
+            let depth = if parts.len() > 4 {
+                parse_f32_checked(&parts[4], "depth", Some(0.0))?
+            } else {
+                0.08
+            };
+            Faucet::new_waterfall(name, pos, width, depth, flow_rate)
         }
         "shower" => {
             if parts.len() < 3 {
@@ -658,110 +785,129 @@ fn parse_faucet(spec: &str, index: usize) -> Result<Faucet, String> {
                 ));
             }
             let pos = parse_vec3(&parts[1])?;
-            let radius = parts[2]
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| format!("invalid radius: {}", e))?;
+            let radius = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
             let flow_rate = if parts.len() > 3 {
-                parts[3]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid flow_rate: {}", e))?
+                parse_f32_checked(&parts[3], "flow_rate", None)?
             } else {
                 500.0
             };
             let spread = if parts.len() > 4 {
-                parts[4]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid spread: {}", e))?
+                parse_f32_checked(&parts[4], "spread", None)?
             } else {
                 0.22
             };
-            let mut f = Faucet::new_shower(name, pos, radius, flow_rate, spread);
-            f.id = (index + 1) as u32;
-            Ok(f)
+            Faucet::new_shower(name, pos, radius, flow_rate, spread)
         }
         "circle" | "pipe" => {
             if parts.len() < 3 {
                 return Err(format!(
-                    "Invalid circle spec '{}'. Format: circle:x,y,z:radius[:flow_rate]",
+                    "Invalid circle spec '{}'. Format: circle:x,y,z:radius[:flow_rate[:vx,vy,vz[:spread]]]",
                     spec
                 ));
             }
             let pos = parse_vec3(&parts[1])?;
-            let radius = parts[2]
-                .trim()
-                .parse::<f32>()
-                .map_err(|e| format!("invalid radius: {}", e))?;
+            let radius = parse_f32_checked(&parts[2], "radius", Some(0.0))?;
             let flow_rate = if parts.len() > 3 {
-                parts[3]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid flow_rate: {}", e))?
+                parse_f32_checked(&parts[3], "flow_rate", None)?
             } else {
                 500.0
             };
-            let mut f =
-                Faucet::new_circle(name, pos, glam::Vec3::new(0.0, -2.5, 0.0), radius, flow_rate);
-            f.id = (index + 1) as u32;
-            Ok(f)
+            let vel = if parts.len() > 4 {
+                parse_vec3(&parts[4])?
+            } else {
+                glam::Vec3::new(0.0, -2.5, 0.0)
+            };
+            let spread = if parts.len() > 5 {
+                parse_f32_checked(&parts[5], "spread", None)?
+            } else {
+                0.0
+            };
+            let mut f = Faucet::new_circle(name, pos, vel, radius, flow_rate);
+            f.spray_spread = spread;
+            f
         }
         "tap" | "point" => {
             if parts.len() < 2 {
                 return Err(format!(
-                    "Invalid tap spec '{}'. Format: tap:x,y,z[:flow_rate]",
-                    spec
+                    "Invalid {} spec '{}'. Format: {}:x,y,z[:radius[:flow_rate[:vx,vy,vz[:spread]]]]",
+                    kind, spec, kind
                 ));
             }
             let pos = parse_vec3(&parts[1])?;
-            let flow_rate = if parts.len() > 2 {
-                parts[2]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid flow_rate: {}", e))?
+            let default_radius = if kind == "tap" { 0.05 } else { 0.0 };
+            let (radius, flow_rate) = if parts.len() == 2 {
+                (default_radius, 400.0)
+            } else if parts.len() == 3 {
+                let val = parse_f32_checked(&parts[2], "radius_or_rate", None)?;
+                if kind == "tap" && val <= 2.0 {
+                    (val, 400.0)
+                } else {
+                    (default_radius, val)
+                }
             } else {
-                400.0
+                let radius = parse_f32_checked(&parts[2], "radius", None)?;
+                let flow_rate = parse_f32_checked(&parts[3], "flow_rate", None)?;
+                (radius, flow_rate)
             };
-            let mut f = Faucet::new_point(name, pos, glam::Vec3::new(0.0, -2.0, 0.0), flow_rate);
-            f.id = (index + 1) as u32;
-            Ok(f)
+            let vel = if parts.len() > 4 {
+                parse_vec3(&parts[4])?
+            } else {
+                glam::Vec3::new(0.0, -2.0, 0.0)
+            };
+            let spread = if parts.len() > 5 {
+                parse_f32_checked(&parts[5], "spread", None)?
+            } else {
+                0.0
+            };
+            let mut f = if radius <= 1e-6 {
+                Faucet::new_point(name, pos, vel, flow_rate)
+            } else {
+                Faucet::new_circle(name, pos, vel, radius, flow_rate)
+            };
+            f.spray_spread = spread;
+            f
         }
         "stream" => {
             if parts.len() < 3 {
                 return Err(format!(
-                    "Invalid stream spec '{}'. Format: stream:x,y,z:vx,vy,vz[:flow_rate[:spread]]",
+                    "Invalid stream spec '{}'. Format: stream:x,y,z:vx,vy,vz[:flow_rate[:spread[:radius]]]",
                     spec
                 ));
             }
             let pos = parse_vec3(&parts[1])?;
             let vel = parse_vec3(&parts[2])?;
             let flow_rate = if parts.len() > 3 {
-                parts[3]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid flow_rate: {}", e))?
+                parse_f32_checked(&parts[3], "flow_rate", None)?
             } else {
                 500.0
             };
             let spread = if parts.len() > 4 {
-                parts[4]
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid spread: {}", e))?
+                parse_f32_checked(&parts[4], "spread", None)?
             } else {
                 0.05
             };
-            let mut f = Faucet::new_circle(name, pos, vel, 0.04, flow_rate);
+            let radius = if parts.len() > 5 {
+                parse_f32_checked(&parts[5], "radius", None)?
+            } else {
+                0.04
+            };
+            let mut f = if radius <= 1e-6 {
+                Faucet::new_point(name, pos, vel, flow_rate)
+            } else {
+                Faucet::new_circle(name, pos, vel, radius, flow_rate)
+            };
             f.spray_spread = spread;
-            f.id = (index + 1) as u32;
-            Ok(f)
+            f
         }
-        _ => Err(format!(
-            "Unknown faucet shape '{}'. Expected 'waterfall', 'shower', 'circle', 'tap', or 'stream'",
-            kind
-        )),
-    }
+        _ => {
+            return Err(format!(
+                "Unknown faucet shape '{}'. Expected 'waterfall', 'shower', 'circle', 'tap', or 'stream'",
+                kind
+            ))
+        }
+    };
+    faucet.id = (index + 1) as u32;
+    Ok(faucet)
 }
 
 fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
@@ -1010,65 +1156,105 @@ fn parse_drain(spec: &str, index: usize) -> Result<Drain, String> {
     Ok(d)
 }
 
-fn parse_chamber(args: &Args) -> Chamber {
-    let chamber_shape = match args.chamber_shape.to_lowercase().as_str() {
-        "sphere" | "globe" | "ball" => ChamberShape::Sphere,
+fn parse_chamber_floats(raw: &str, flag_name: &str) -> Result<Vec<f32>, String> {
+    let cleaned = raw.replace(['[', ']', '(', ')'], "");
+    let parts: Vec<&str> = cleaned.split([',', 'x', 'X']).collect();
+    let mut vals = Vec::with_capacity(parts.len());
+    for part in parts {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err(format!("Invalid {} spec '{}': empty value", flag_name, raw));
+        }
+        let v = parse_f32_checked(trimmed, flag_name, Some(0.0))?;
+        vals.push(v);
+    }
+    Ok(vals)
+}
+
+fn parse_chamber(args: &Args) -> Result<Chamber, String> {
+    let chamber_shape = match args.chamber_shape.trim().to_lowercase().as_str() {
+        "box" | "cuboid" | "rect" | "rectangle" | "" => ChamberShape::Box,
+        "sphere" | "globe" | "ball" | "circle" => ChamberShape::Sphere,
         "bathtub" | "tub" | "bath" => ChamberShape::Bathtub,
-        _ => ChamberShape::Box,
+        other => {
+            return Err(format!(
+                "Unknown bounding box / chamber type '{}'. Valid options: box, sphere, bathtub",
+                other
+            ))
+        }
     };
     let mut chamber = Chamber::new(chamber_shape);
 
-    if let Some(ref scale_str) = args.chamber_scale {
-        let cleaned = scale_str.replace(['[', ']', '(', ')'], "");
-        let parts: Vec<&str> = cleaned.split(',').collect();
-        if parts.len() == 1 {
-            if let Ok(s) = parts[0].trim().parse::<f32>() {
-                chamber.scale = Vec3::splat(s);
-            }
-        } else if parts.len() == 3 {
-            if let (Ok(x), Ok(y), Ok(z)) = (
-                parts[0].trim().parse::<f32>(),
-                parts[1].trim().parse::<f32>(),
-                parts[2].trim().parse::<f32>(),
-            ) {
-                chamber.scale = Vec3::new(x, y, z);
-            }
-        }
-    }
-
     if let Some(ref size_str) = args.chamber_size {
-        let cleaned = size_str.replace(['[', ']', '(', ')'], "");
-        let parts: Vec<&str> = cleaned.split(',').collect();
-        if parts.len() == 3 {
-            if let (Ok(w), Ok(h), Ok(d)) = (
-                parts[0].trim().parse::<f32>(),
-                parts[1].trim().parse::<f32>(),
-                parts[2].trim().parse::<f32>(),
-            ) {
-                chamber.base_size = Vec3::new(w, h, d);
-                chamber.scale = Vec3::ONE;
+        let vals = parse_chamber_floats(size_str, "chamber-size")?;
+        chamber.base_size = match vals.as_slice() {
+            [s] => {
+                if args.mode_2d {
+                    Vec3::new(*s, *s, 0.1)
+                } else {
+                    Vec3::splat(*s)
+                }
             }
-        }
+            [w, h] => Vec3::new(*w, *h, if args.mode_2d { 0.1 } else { 0.9 }),
+            [w, h, d] => Vec3::new(*w, *h, *d),
+            _ => {
+                return Err(format!(
+                    "Invalid chamber size '{}'. Expected D, W,H (2D), or W,H,D (e.g. 2.0,1.5,1.0)",
+                    size_str
+                ))
+            }
+        };
+        chamber.custom_size = true;
     }
 
-    chamber
+    if let Some(ref scale_str) = args.chamber_scale {
+        let vals = parse_chamber_floats(scale_str, "chamber-scale")?;
+        chamber.scale = match vals.as_slice() {
+            [s] => Vec3::splat(*s),
+            [x, y] => Vec3::new(*x, *y, 1.0),
+            [x, y, z] => Vec3::new(*x, *y, *z),
+            _ => {
+                return Err(format!(
+                    "Invalid chamber scale '{}'. Expected S, X,Y, or X,Y,Z (e.g. 1.5 or 1.5,1.2,1.0)",
+                    scale_str
+                ))
+            }
+        };
+    }
+
+    if let Some(slope) = args.tub_slope {
+        chamber.tub_slope_ratio = slope.clamp(0.05, 0.5);
+    }
+    if let Some(fillet) = args.tub_fillet {
+        chamber.tub_fillet_ratio = fillet.clamp(0.01, 0.45);
+    }
+
+    Ok(chamber)
 }
 
 fn run_headless(
     args: Args,
+    chamber: Chamber,
     parsed_colliders: Vec<Collider>,
     parsed_faucets: Vec<Faucet>,
     parsed_drains: Vec<Drain>,
 ) {
     let preset = parse_preset(args.preset.as_deref(), !parsed_faucets.is_empty());
     let quality = parse_quality(&args.quality);
+    let cli_render_quality = resolve_cli_render_quality(&args, quality);
+    let (video_width, video_height) = resolve_video_dimensions(&args);
     let fps = args.fps.max(1);
     let render_mode = if args.surface_mesh {
         RenderMode::SurfaceMesh
     } else {
         RenderMode::from_slug(&args.render_mode)
     };
-    let mesh_cfg = build_mesh_config(&args);
+    let mut mesh_cfg = build_mesh_config(&args);
+    cli_render_quality.apply_to_mesh_config(
+        &mut mesh_cfg,
+        args.mesh_smooth.is_some(),
+        args.mesh_scale.is_some(),
+    );
     let camera = build_camera(&args);
     let color_mode = parse_color_mode(&args.color_mode);
     let color_map = parse_color_map(&args.color_map);
@@ -1087,6 +1273,17 @@ fn run_headless(
     println!("Preset:      {:?}", preset);
     println!("Quality:     {} ({:?})", quality.name_for(args.mode_2d), quality);
     println!("Render Mode: {}", render_mode.name());
+    if cli_render_quality != CliRenderQuality::Standard || args.export_mp4.is_some() || args.export_obj.is_some() {
+        println!(
+            "CLI Optics:  {} | SSAA {}x | Shadow {}px | Mesh max {:.0} cells | H.264 {} CRF {}",
+            cli_render_quality.name(),
+            cli_render_quality.ssaa_factor(),
+            cli_render_quality.shadow_res(),
+            mesh_cfg.max_grid_cells,
+            cli_render_quality.ffmpeg_preset(),
+            cli_render_quality.ffmpeg_crf(),
+        );
+    }
     if render_mode == RenderMode::SurfaceMesh {
         println!(
             "Mesh Optics: Material={} | Shallow={} | Deep={} | Texture={} (scale {:.1}, str {:.2}) | IOR={:.3} | Rough={:.3}",
@@ -1111,7 +1308,6 @@ fn run_headless(
         dt
     );
 
-    let chamber = parse_chamber(&args);
     let bounds = chamber.compute_bounds();
     let mut config = SolverConfig::default();
     quality.apply(&mut config, args.mode_2d);
@@ -1148,7 +1344,11 @@ fn run_headless(
     if let Some(visc) = args.viscosity {
         config.viscosity = visc.clamp(0.0, 1.0);
     }
-    config.rest_density = compute_lattice_rest_density(config.smoothing_length, config.spacing);
+    config.rest_density = if args.mode_2d {
+        compute_lattice_rest_density_2d(config.smoothing_length, config.spacing)
+    } else {
+        compute_lattice_rest_density(config.smoothing_length, config.spacing)
+    };
 
     let mut solver = SphSolver::new(bounds, config);
     if args.mode_2d {
@@ -1156,6 +1356,14 @@ fn run_headless(
     }
     solver.set_chamber(chamber);
     SceneGenerator::setup_scene(&mut solver, preset);
+    let bsz = solver.bounds.size();
+    println!(
+        "Bounds:      {} ({:.2} x {:.2} x {:.2} m)",
+        solver.chamber.shape.name(),
+        bsz.x,
+        bsz.y,
+        bsz.z
+    );
 
     for col in parsed_colliders {
         println!("  + Obstacle: {} (id: {})", col.name, col.id);
@@ -1212,14 +1420,22 @@ fn run_headless(
 
     let mut mp4_encoder = if let Some(ref path) = args.export_mp4 {
         println!(
-            "Encoding MP4 video ({}x{} @ {} fps, {}) to: {}",
-            args.video_width,
-            args.video_height,
+            "Encoding MP4 video ({}x{} @ {} fps, {}, {}) to: {}",
+            video_width,
+            video_height,
             fps,
             render_mode.slug(),
+            cli_render_quality.slug(),
             path.display()
         );
-        match Mp4Encoder::new(path, args.video_width, args.video_height, fps) {
+        match Mp4Encoder::new_with_encoding(
+            path,
+            video_width,
+            video_height,
+            fps,
+            cli_render_quality.ffmpeg_preset(),
+            cli_render_quality.ffmpeg_crf(),
+        ) {
             Ok(enc) => Some(enc),
             Err(e) => {
                 eprintln!("Error starting MP4 encoder: {}", e);
@@ -1232,8 +1448,15 @@ fn run_headless(
 
     let use_culling = args.culling && !args.no_culling;
     let mut software_renderer = if mp4_encoder.is_some() {
-        let mut rend = SoftwareRenderer::new(args.video_width, args.video_height);
+        let mut rend = SoftwareRenderer::new_with_quality(video_width, video_height, cli_render_quality);
         rend.enable_culling = use_culling;
+        if rend.ssaa_factor != cli_render_quality.ssaa_factor() {
+            let (rw, rh) = rend.internal_dimensions();
+            println!(
+                "  (SSAA automatically capped to {}x [{}x{}] at {}x{} to bound RAM within 36M internal pixels)",
+                rend.ssaa_factor, rw, rh, video_width, video_height
+            );
+        }
         Some(rend)
     } else {
         None
@@ -1617,7 +1840,13 @@ fn main() {
     }
 
     let preset = parse_preset(args.preset.as_deref(), !parsed_faucets.is_empty());
-    let chamber = parse_chamber(&args);
+    let chamber = match parse_chamber(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing bounding box / chamber flags: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     if args.headless
         || args.benchmark
@@ -1625,9 +1854,21 @@ fn main() {
         || args.export_ply.is_some()
         || args.export_obj.is_some()
     {
-        run_headless(args, parsed_colliders, parsed_faucets, parsed_drains);
+        run_headless(args, chamber, parsed_colliders, parsed_faucets, parsed_drains);
     } else {
-        let initial_quality = parse_quality(&args.quality);
+        let mut initial_quality = parse_quality(&args.quality);
+        if initial_quality.is_cli_only() {
+            eprintln!(
+                "Note: Quality '{}' is a high-density rendering-CLI-only mode; clamping interactive GUI to 'extreme'. Use --headless or --export-mp4 for offline CLI tiers.",
+                initial_quality.slug()
+            );
+            initial_quality = SimulationQuality::Extreme;
+        }
+        if args.render_quality.is_some() || args.resolution.is_some() {
+            eprintln!(
+                "Note: --render-quality and --resolution apply only to CLI offline renders (--headless, --export-mp4, --export-obj, --export-ply)."
+            );
+        }
         if let Err(e) = run_gui(
             args,
             preset,
@@ -1639,5 +1880,115 @@ fn main() {
         ) {
             eprintln!("GUI Error: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_human_readable_cli_resolutions() {
+        assert_eq!(parse_resolution_spec("480p"), Some((854, 480)));
+        assert_eq!(parse_resolution_spec("720p"), Some((1280, 720)));
+        assert_eq!(parse_resolution_spec("hd"), Some((1280, 720)));
+        assert_eq!(parse_resolution_spec("1k"), Some((1920, 1080)));
+        assert_eq!(parse_resolution_spec("1080p"), Some((1920, 1080)));
+        assert_eq!(parse_resolution_spec("fhd"), Some((1920, 1080)));
+        assert_eq!(parse_resolution_spec("2k"), Some((2560, 1440)));
+        assert_eq!(parse_resolution_spec("1440p"), Some((2560, 1440)));
+        assert_eq!(parse_resolution_spec("3k"), Some((3200, 1800)));
+        assert_eq!(parse_resolution_spec("4k"), Some((3840, 2160)));
+        assert_eq!(parse_resolution_spec("2160p"), Some((3840, 2160)));
+        assert_eq!(parse_resolution_spec("uhd"), Some((3840, 2160)));
+        assert_eq!(parse_resolution_spec("5k"), Some((5120, 2880)));
+        assert_eq!(parse_resolution_spec("6k"), Some((6144, 3456)));
+        assert_eq!(parse_resolution_spec("8k"), Some((7680, 4320)));
+        assert_eq!(parse_resolution_spec("4320p"), Some((7680, 4320)));
+        assert_eq!(parse_resolution_spec("1080p-vertical"), Some((1080, 1920)));
+        assert_eq!(parse_resolution_spec("4K_Portrait"), Some((2160, 3840)));
+        assert_eq!(parse_resolution_spec("2560x1080"), Some((2560, 1080)));
+        assert_eq!(parse_resolution_spec("bad-res"), None);
+    }
+
+    #[test]
+    fn test_cli_bounding_box_flags_and_setup_scene() {
+        let args = Args::try_parse_from([
+            "liquid-rust",
+            "--box-type",
+            "bathtub",
+            "--box-size",
+            "2.4x1.5x1.1",
+            "--box-scale",
+            "1.0",
+            "--tub-slope",
+            "0.35",
+            "--tub-fillet",
+            "0.20",
+        ])
+        .expect("bounding box flags should parse");
+        let chamber = parse_chamber(&args).expect("chamber should parse");
+        assert_eq!(chamber.shape, ChamberShape::Bathtub);
+        assert!(chamber.custom_size);
+        assert!((chamber.base_size - Vec3::new(2.4, 1.5, 1.1)).length() < 1e-5);
+        assert!((chamber.tub_slope_ratio - 0.35).abs() < 1e-5);
+        assert!((chamber.tub_fillet_ratio - 0.20).abs() < 1e-5);
+
+        let mut solver = SphSolver::new(chamber.compute_bounds(), SolverConfig::default());
+        solver.set_chamber(chamber);
+        SceneGenerator::setup_scene(&mut solver, ScenePreset::Empty);
+        let sz = solver.bounds.size();
+        assert!((sz - Vec3::new(2.4, 1.5, 1.1)).length() < 1e-4);
+
+        // 2D bounding box with W,H shorthand
+        let args_2d = Args::try_parse_from([
+            "liquid-rust",
+            "--2d",
+            "--bounds-type",
+            "box",
+            "--bounds-size",
+            "3.0,1.6",
+        ])
+        .expect("2D bounds flags should parse");
+        let ch_2d = parse_chamber(&args_2d).expect("2D chamber should parse");
+        let mut solver_2d = SphSolver::new(ch_2d.compute_bounds(), SolverConfig::default());
+        solver_2d.set_2d(true);
+        solver_2d.set_chamber(ch_2d);
+        SceneGenerator::setup_scene(&mut solver_2d, ScenePreset::DamBreak);
+        let sz_2d = solver_2d.bounds.size();
+        assert!((sz_2d.x - 3.0).abs() < 1e-4);
+        assert!((sz_2d.y - 1.6).abs() < 1e-4);
+        assert!((sz_2d.z - 0.1).abs() < 1e-4);
+
+        // Invalid box type errors cleanly
+        let bad_args = Args::try_parse_from(["liquid-rust", "--box-type", "pyramid"]).unwrap();
+        assert!(parse_chamber(&bad_args).is_err());
+    }
+
+    #[test]
+    fn test_cli_faucet_and_tap_radius() {
+        use liquid_rust::sph::FaucetShape;
+        let tap_with_radius = parse_faucet("tap:-0.5,0.9,0:0.12:550", 0).unwrap();
+        assert_eq!(tap_with_radius.shape, FaucetShape::Circle { radius: 0.12 });
+        assert!((tap_with_radius.flow_rate - 550.0).abs() < 1e-4);
+
+        let tap_shorthand_radius = parse_faucet("tap:0,0.8,0:0.09", 1).unwrap();
+        assert_eq!(tap_shorthand_radius.shape, FaucetShape::Circle { radius: 0.09 });
+        assert!((tap_shorthand_radius.flow_rate - 400.0).abs() < 1e-4);
+
+        // Legacy tap:x,y,z:flow_rate stays backward compatible
+        let tap_legacy_rate = parse_faucet("tap:0,0.8,0:650", 2).unwrap();
+        assert_eq!(tap_legacy_rate.shape, FaucetShape::Circle { radius: 0.05 });
+        assert!((tap_legacy_rate.flow_rate - 650.0).abs() < 1e-4);
+
+        let tap_point = parse_faucet("tap:0,0.8,0:0:300", 3).unwrap();
+        assert_eq!(tap_point.shape, FaucetShape::Point);
+        assert!((tap_point.flow_rate - 300.0).abs() < 1e-4);
+
+        let stream_custom_r =
+            parse_faucet("stream:-0.5,0.9,0:1.8,-1.0,0:450:0.02:0.115", 4).unwrap();
+        assert_eq!(stream_custom_r.shape, FaucetShape::Circle { radius: 0.115 });
+        assert!((stream_custom_r.flow_rate - 450.0).abs() < 1e-4);
+        assert!((stream_custom_r.spray_spread - 0.02).abs() < 1e-4);
     }
 }

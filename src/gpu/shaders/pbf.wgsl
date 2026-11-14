@@ -162,6 +162,77 @@ fn fold_wall_gpu(
     return bc;
 }
 
+fn fold_chamber_wall_gpu(
+    bc_in: BoundaryContrib,
+    d_clearance: f32,
+    n_inward: vec3<f32>,
+    s: f32,
+    xi: f32,
+    grad_xi: vec3<f32>,
+    rough_amp: f32,
+    h: f32,
+    inv_h: f32,
+    gamma_w: f32,
+) -> BoundaryContrib {
+    // Restrict anti-crystallization micro-texture to upward-facing floor surfaces so vertical
+    // container walls remain hydrodynamically smooth with zero vertical washboard drag.
+    let floor_w = clamp(n_inward.y, 0.0, 1.0);
+    let eff_amp = rough_amp * floor_w;
+    let d_offset = (1.0 - eff_amp * xi) * s;
+    let grad_bump = -grad_xi * eff_amp;
+    return fold_wall_gpu(bc_in, d_clearance, n_inward + grad_bump, d_offset, h, inv_h, gamma_w);
+}
+
+fn wall_cohesion_weight_gpu(pos: vec3<f32>) -> f32 {
+    let radius = uniforms.bounds_max.w;
+    let h = max(uniforms.kernel_params.x, 1e-5);
+    let inv_h = 1.0 / h;
+    let is_2d = (uniforms.counts.w & 0x80000000u) != 0u;
+    let b_min = uniforms.bounds_min.xyz;
+    let b_max = uniforms.bounds_max.xyz;
+    let shape = u32(uniforms.chamber_info.x + 0.5);
+
+    var d_floor = (pos.y - b_min.y) - radius;
+    var d_wall = 1e6;
+
+    if (shape == 1u) {
+        let r_chamber = (b_max.y - b_min.y) * 0.5;
+        let center = vec3<f32>((b_min.x + b_max.x) * 0.5, b_min.y + r_chamber, (b_min.z + b_max.z) * 0.5);
+        let to_p = pos - center;
+        let dist = length(to_p);
+        let n_in_y = select(1.0, -to_p.y / dist, dist > 1e-6);
+        let d_sph = (r_chamber - radius) - dist;
+        if (n_in_y >= 0.70) {
+            d_floor = d_sph;
+        } else {
+            d_wall = d_sph;
+        }
+    } else if (shape == 2u) {
+        let H_tub = max(b_max.y - b_min.y, 1e-4);
+        let slope_offset = uniforms.chamber_info.w;
+        let back_n = normalize(vec3<f32>(H_tub, slope_offset, 0.0));
+        let p_back_bot = vec3<f32>(b_min.x + slope_offset, b_min.y, 0.0);
+        let d_back = dot(pos - p_back_bot, back_n) - radius;
+        d_wall = min(d_back, min(b_max.x - pos.x, b_max.y - pos.y) - radius);
+        if (!is_2d) {
+            d_wall = min(d_wall, min(pos.z - b_min.z, b_max.z - pos.z) - radius);
+        }
+    } else {
+        d_wall = min(min(pos.x - b_min.x, b_max.x - pos.x), b_max.y - pos.y) - radius;
+        if (!is_2d) {
+            d_wall = min(d_wall, min(pos.z - b_min.z, b_max.z - pos.z) - radius);
+        }
+    }
+
+    let t_floor = clamp(d_floor * inv_h, 0.0, 1.0);
+    let w_floor = mix(0.25, 1.0, t_floor * t_floor * (3.0 - 2.0 * t_floor));
+
+    let t_side = clamp((d_wall - 0.55 * h) / (1.20 * h), 0.0, 1.0);
+    let w_side = t_side * t_side * (3.0 - 2.0 * t_side);
+
+    return w_floor * w_side;
+}
+
 fn boundary_contribution_gpu(pos: vec3<f32>) -> BoundaryContrib {
     let radius = uniforms.bounds_max.w;
     let h = max(uniforms.kernel_params.x, 1e-5);
@@ -195,8 +266,6 @@ fn boundary_contribution_gpu(pos: vec3<f32>) -> BoundaryContrib {
         );
     }
     let rough_amp = select(0.055, 0.025, is_2d);
-    let d_offset = (1.0 - rough_amp * xi) * s;
-    let grad_bump = -grad_xi * rough_amp;
     let gamma_w = select(1.20, 1.42, is_2d) * (s * inv_h);
 
     var bc = BoundaryContrib(0.0, vec3<f32>(0.0));
@@ -211,7 +280,7 @@ fn boundary_contribution_gpu(pos: vec3<f32>) -> BoundaryContrib {
         let dist = length(to_p);
         let n_in = select(vec3<f32>(0.0, 1.0, 0.0), -to_p / max(dist, 1e-6), dist > 1e-6);
         let d_c = (r_chamber - radius) - dist;
-        bc = fold_wall_gpu(bc, d_c, n_in + grad_bump, d_offset, h, inv_h, gamma_w);
+        bc = fold_chamber_wall_gpu(bc, d_c, n_in, s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
     } else if (shape == 2u) {
         let H_tub = max(b_max.y - b_min.y, 1e-4);
         let slope_offset = uniforms.chamber_info.w;
@@ -219,22 +288,22 @@ fn boundary_contribution_gpu(pos: vec3<f32>) -> BoundaryContrib {
         let p_back_bot = vec3<f32>(b_min.x + slope_offset, b_min.y, 0.0);
         let d_back = dot(pos - p_back_bot, back_n) - radius;
 
-        bc = fold_wall_gpu(bc, (pos.y - b_min.y) - radius, vec3<f32>(0.0, 1.0, 0.0) + grad_bump, d_offset, h, inv_h, gamma_w);
-        bc = fold_wall_gpu(bc, (b_max.y - pos.y) - radius, vec3<f32>(0.0, -1.0, 0.0) + grad_bump, d_offset, h, inv_h, gamma_w);
-        bc = fold_wall_gpu(bc, d_back, back_n + grad_bump, d_offset, h, inv_h, gamma_w);
-        bc = fold_wall_gpu(bc, (b_max.x - pos.x) - radius, vec3<f32>(-1.0, 0.0, 0.0) + grad_bump, d_offset, h, inv_h, gamma_w);
+        bc = fold_chamber_wall_gpu(bc, (pos.y - b_min.y) - radius, vec3<f32>(0.0, 1.0, 0.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
+        bc = fold_chamber_wall_gpu(bc, (b_max.y - pos.y) - radius, vec3<f32>(0.0, -1.0, 0.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
+        bc = fold_chamber_wall_gpu(bc, d_back, back_n, s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
+        bc = fold_chamber_wall_gpu(bc, (b_max.x - pos.x) - radius, vec3<f32>(-1.0, 0.0, 0.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
         if (!is_2d) {
-            bc = fold_wall_gpu(bc, (pos.z - b_min.z) - radius, vec3<f32>(0.0, 0.0, 1.0) + grad_bump, d_offset, h, inv_h, gamma_w);
-            bc = fold_wall_gpu(bc, (b_max.z - pos.z) - radius, vec3<f32>(0.0, 0.0, -1.0) + grad_bump, d_offset, h, inv_h, gamma_w);
+            bc = fold_chamber_wall_gpu(bc, (pos.z - b_min.z) - radius, vec3<f32>(0.0, 0.0, 1.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
+            bc = fold_chamber_wall_gpu(bc, (b_max.z - pos.z) - radius, vec3<f32>(0.0, 0.0, -1.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
         }
     } else {
-        bc = fold_wall_gpu(bc, (pos.y - b_min.y) - radius, vec3<f32>(0.0, 1.0, 0.0) + grad_bump, d_offset, h, inv_h, gamma_w);
-        bc = fold_wall_gpu(bc, (b_max.y - pos.y) - radius, vec3<f32>(0.0, -1.0, 0.0) + grad_bump, d_offset, h, inv_h, gamma_w);
-        bc = fold_wall_gpu(bc, (pos.x - b_min.x) - radius, vec3<f32>(1.0, 0.0, 0.0) + grad_bump, d_offset, h, inv_h, gamma_w);
-        bc = fold_wall_gpu(bc, (b_max.x - pos.x) - radius, vec3<f32>(-1.0, 0.0, 0.0) + grad_bump, d_offset, h, inv_h, gamma_w);
+        bc = fold_chamber_wall_gpu(bc, (pos.y - b_min.y) - radius, vec3<f32>(0.0, 1.0, 0.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
+        bc = fold_chamber_wall_gpu(bc, (b_max.y - pos.y) - radius, vec3<f32>(0.0, -1.0, 0.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
+        bc = fold_chamber_wall_gpu(bc, (pos.x - b_min.x) - radius, vec3<f32>(1.0, 0.0, 0.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
+        bc = fold_chamber_wall_gpu(bc, (b_max.x - pos.x) - radius, vec3<f32>(-1.0, 0.0, 0.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
         if (!is_2d) {
-            bc = fold_wall_gpu(bc, (pos.z - b_min.z) - radius, vec3<f32>(0.0, 0.0, 1.0) + grad_bump, d_offset, h, inv_h, gamma_w);
-            bc = fold_wall_gpu(bc, (b_max.z - pos.z) - radius, vec3<f32>(0.0, 0.0, -1.0) + grad_bump, d_offset, h, inv_h, gamma_w);
+            bc = fold_chamber_wall_gpu(bc, (pos.z - b_min.z) - radius, vec3<f32>(0.0, 0.0, 1.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
+            bc = fold_chamber_wall_gpu(bc, (b_max.z - pos.z) - radius, vec3<f32>(0.0, 0.0, -1.0), s, xi, grad_xi, rough_amp, h, inv_h, gamma_w);
         }
     }
 
@@ -347,7 +416,7 @@ fn predict_positions(@builtin(global_invocation_id) id: vec3<u32>) {
         vel.z = 0.0;
     }
 
-    predicted_positions[i] = vec4<f32>(pred, 0.0);
+    predicted_positions[i] = vec4<f32>(pred, wall_cohesion_weight_gpu(pred));
     particles[i].vel_dens = vec4<f32>(vel, particles[i].vel_dens.w);
 }
 
@@ -474,7 +543,9 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     
-    let pos_i = predicted_positions[i].xyz;
+    let pred_i = predicted_positions[i];
+    let pos_i = pred_i.xyz;
+    let wall_w_i = pred_i.w;
     let lambda_i = lambdas[i];
     let h = uniforms.kernel_params.x;
     let h2 = uniforms.kernel_params.y;
@@ -499,7 +570,6 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
     
     var delta = vec3<f32>(0.0);
     let bc = boundary_contribution_gpu(pos_i);
-    let wall_cohesion_scale = clamp(1.0 - bc.psi * 3.5, 0.08, 1.0);
     
     let is_2d = (uniforms.counts.w & 0x80000000u) != 0u;
     let z_min = select(-1, 0, is_2d);
@@ -524,7 +594,8 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
                     iter_count++;
                     
                     if (i != j) {
-                        let pos_j = predicted_positions[j].xyz;
+                        let pred_j = predicted_positions[j];
+                        let pos_j = pred_j.xyz;
                         let r_vec = pos_i - pos_j;
                         let r2 = dot(r_vec, r_vec);
                         
@@ -543,14 +614,15 @@ fn compute_delta_positions(@builtin(global_invocation_id) id: vec3<u32>) {
                             let grad_w = spiky_gradient(r_vec, r, h, spiky_factor);
                             delta += grad_w * ((lambda_sum + s_corr) * inv_rho0);
                             
-                            if (surface_tension > 0.0) {
+                            let pair_wall_scale = min(wall_w_i, pred_j.w);
+                            if (surface_tension > 0.0 && pair_wall_scale > 1e-4) {
                                 let q = r / h;
                                 let omq = 1.0 - q;
                                 let c_q = 64.0 * (q * q * q) * (omq * omq * omq);
                                 let rho_i = particles[i].vel_dens.w;
                                 let rho_j = particles[j].vel_dens.w;
                                 let surf_w = clamp(2.0 - (rho_i + rho_j) * inv_rho0, 0.15, 1.40);
-                                let cohesion = c_q * surf_w * surface_tension * wall_cohesion_scale * 0.016 * h;
+                                let cohesion = c_q * surf_w * surface_tension * pair_wall_scale * 0.016 * h;
                                 delta -= (r_vec / r) * cohesion;
                             }
                         }
@@ -659,7 +731,7 @@ fn apply_delta_and_collide(@builtin(global_invocation_id) id: vec3<u32>) {
         pos.z = 0.0;
     }
 
-    predicted_positions[i] = vec4<f32>(pos, 0.0);
+    predicted_positions[i] = vec4<f32>(pos, wall_cohesion_weight_gpu(pos));
 }
 
 // 7. Update velocity and apply XSPH artificial viscosity
@@ -685,7 +757,7 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
     let friction = uniforms.solver_params.w;
     let margin = max(radius * 0.20, 0.002);
     let slip_floor = clamp(1.0 - max(1.0 - friction, 0.0) * dt * 1.5, 0.985, 1.0);
-    let slip_wall = 0.999;
+    let slip_wall = 1.0;
     let rest_threshold = 0.12;
     let b_min = uniforms.bounds_min.xyz;
     let b_max = uniforms.bounds_max.xyz;
@@ -876,7 +948,10 @@ fn update_velocity_and_xsph(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         
         if (viscosity > 0.0 && sum_weights > 1e-6) {
-            vel += (sum_v_diff / sum_weights) * viscosity;
+            let rho0 = uniforms.kernel_params.w;
+            let w_self = poly6(0.0, h2, poly6_factor);
+            let denom = max(sum_weights + w_self, rho0);
+            vel += (sum_v_diff / denom) * viscosity;
         }
     }
     
@@ -911,7 +986,11 @@ fn apply_vorticity(@builtin(global_invocation_id) id: vec3<u32>) {
     var vel = particles[i].vel_dens.xyz;
     let speed = length(vel);
     let flow_gate = clamp((speed - 0.08) / 0.35, 0.0, 1.0);
-    if (flow_gate <= 0.0) {
+    let rho_ratio = particles[i].vel_dens.w * uniforms.kernel_params.z;
+    let bulk_gate = clamp((rho_ratio - 0.72) / 0.22, 0.0, 1.0);
+    let wall_gate = 0.20 + 0.80 * predicted_positions[i].w;
+    let eff_gate = flow_gate * bulk_gate * wall_gate;
+    if (eff_gate <= 1e-4) {
         return;
     }
 
@@ -981,10 +1060,10 @@ fn apply_vorticity(@builtin(global_invocation_id) id: vec3<u32>) {
     let eta_len = length(eta);
     if (eta_len > 1e-5) {
         let n_dir = eta / eta_len;
-        let f_vort = cross(n_dir, omega_i) * (vort_eps * h * 8.0 * flow_gate);
+        let f_vort = cross(n_dir, omega_i) * (vort_eps * h * 8.0 * eff_gate);
         var dv = f_vort * dt;
         let dv_len = length(dv);
-        let max_dv = speed * 0.22;
+        let max_dv = min(speed * 0.22, speed * 26.0 * dt);
         if (dv_len > max_dv && dv_len > 1e-6) {
             dv *= (max_dv / dv_len);
         }

@@ -1,6 +1,6 @@
 # Maintainer: Radu <rappar2018@gmail.com>
 pkgname=liquid-rust-bin
-pkgver=0.3.3
+pkgver=0.3.11
 pkgrel=1
 pkgdesc="High-performance 2D/3D SPH fluid simulator in Rust with GPU acceleration (Vulkan) and real-time visualization"
 arch=('x86_64')
@@ -20,7 +20,7 @@ source=(
 )
 
 sha256sums=(
-    '72b2ede8b981f1d44981023db22156a39a00ddc4dfe8219a7346a97ab03cef02'
+    'ce49e7a8c8422fdd50dd2166cf989645b902dadc11fb624ec6e6ba8a56b595d4'
     '9816d5fed7378931000aa9cd4d062c89bc4773f66f87a60c5604a9d7e796c380'
     '18c3ecc29ee7bad5096fc6a06cb4760ddbbc5810ca85178d25d870fe0a4a5f33'
     'ddad1e02aba607db00a36fe4cdcc81e715d0352a2a9e4e76ca03413d304c8fa9'

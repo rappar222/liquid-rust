@@ -32,6 +32,8 @@ pub struct Chamber {
     pub scale: Vec3,
     /// Base size for standard box / tub: default (1.6, 1.2, 0.9)
     pub base_size: Vec3,
+    /// True when base_size was explicitly overridden (e.g. via CLI --chamber-size / --box-size)
+    pub custom_size: bool,
     /// Bathtub backrest slope horizontal offset ratio (relative to length): default 0.28
     pub tub_slope_ratio: f32,
     /// Bathtub bottom fillet radius ratio (relative to width): default 0.16
@@ -50,6 +52,7 @@ impl Chamber {
             shape,
             scale: Vec3::ONE,
             base_size: Vec3::new(1.6, 1.2, 0.9),
+            custom_size: false,
             tub_slope_ratio: 0.28,
             tub_fillet_ratio: 0.16,
         }
@@ -190,7 +193,7 @@ impl Chamber {
     ) {
         let margin = (radius * 0.20).max(0.002);
         let slip_floor = (1.0 - (1.0 - friction).max(0.0) * dt * 1.5).clamp(0.985, 1.0);
-        let slip_wall = 0.999f32; // Smooth non-sticking container walls
+        let slip_wall = 1.0f32; // True free-slip smooth container walls
         let rest_threshold = 0.12; // m/s: below this normal speed, restitution is zero (inelastic resting)
         match self.shape {
             ChamberShape::Box => {
@@ -387,6 +390,74 @@ impl Chamber {
         }
     }
 
+    /// Smooth wall-neutrality weight in `[0.0, 1.0]` for symmetric free-surface cohesion:
+    /// returns `0.0` adjacent to vertical/ceiling container walls (90° neutral contact angle,
+    /// zero capillary meniscus climbing or asymmetric wall suction) and `1.0` in the interior.
+    #[inline]
+    pub fn wall_cohesion_weight(
+        &self,
+        pos: Vec3,
+        radius: f32,
+        h: f32,
+        bounds: &Aabb,
+        is_2d: bool,
+    ) -> f32 {
+        let h_eff = h.max(1e-5);
+        let inv_h = 1.0 / h_eff;
+        let mut d_floor = (pos.y - bounds.min.y) - radius;
+        let mut d_wall = 1e6f32;
+
+        match self.shape {
+            ChamberShape::Sphere => {
+                let r_chamber = (bounds.max.y - bounds.min.y) * 0.5;
+                let center = Vec3::new(
+                    (bounds.min.x + bounds.max.x) * 0.5,
+                    bounds.min.y + r_chamber,
+                    (bounds.min.z + bounds.max.z) * 0.5,
+                );
+                let to_p = pos - center;
+                let dist = to_p.length();
+                let n_in_y = if dist > 1e-6 { -to_p.y / dist } else { 1.0 };
+                let d_sph = (r_chamber - radius) - dist;
+                if n_in_y >= 0.70 {
+                    d_floor = d_sph;
+                } else {
+                    d_wall = d_sph;
+                }
+            }
+            ChamberShape::Bathtub => {
+                let h_tub = (bounds.max.y - bounds.min.y).max(1e-4);
+                let l_tub = bounds.max.x - bounds.min.x;
+                let slope_offset = (l_tub * self.tub_slope_ratio).min(l_tub * 0.45);
+                let back_n = Vec3::new(h_tub, slope_offset, 0.0).normalize();
+                let p_back_bot = Vec3::new(bounds.min.x + slope_offset, bounds.min.y, 0.0);
+                let d_back = (pos - p_back_bot).dot(back_n) - radius;
+                d_wall = d_back.min((bounds.max.x - pos.x).min(bounds.max.y - pos.y) - radius);
+                if !is_2d {
+                    d_wall = d_wall.min((pos.z - bounds.min.z).min(bounds.max.z - pos.z) - radius);
+                }
+            }
+            ChamberShape::Box => {
+                d_wall = (pos.x - bounds.min.x)
+                    .min(bounds.max.x - pos.x)
+                    .min(bounds.max.y - pos.y)
+                    - radius;
+                if !is_2d {
+                    d_wall = d_wall.min((pos.z - bounds.min.z).min(bounds.max.z - pos.z) - radius);
+                }
+            }
+        }
+
+        let t_floor = (d_floor * inv_h).clamp(0.0, 1.0);
+        let s_floor = t_floor * t_floor * (3.0 - 2.0 * t_floor);
+        let w_floor = 0.25 + 0.75 * s_floor;
+
+        let t_side = ((d_wall - 0.55 * h_eff) / (1.20 * h_eff)).clamp(0.0, 1.0);
+        let w_side = t_side * t_side * (3.0 - 2.0 * t_side);
+
+        w_floor * w_side
+    }
+
     /// Analytical Akinci boundary volume fraction `psi_b` (dimensionless fraction of `rho0`)
     /// and its spatial gradient `grad_psi_b` (pointing into the solid boundary, matching
     /// `spiky_gradient * inv_rho0` of virtual boundary particles).
@@ -406,14 +477,16 @@ impl Chamber {
         let inv_h = 1.0 / h.max(1e-5);
         let (xi, grad_xi) = Self::wall_micro_texture(pos, s, is_2d);
         let rough_amp = if is_2d { 0.025 } else { 0.055 };
-        let d_offset = (1.0 - rough_amp * xi) * s;
-        let grad_bump = -grad_xi * rough_amp;
         let gamma_w = (if is_2d { 1.42 } else { 1.20 }) * (s * inv_h);
 
         let mut psi = 0.0f32;
         let mut grad = Vec3::ZERO;
 
         let mut fold_wall = |d_clearance: f32, n_inward: Vec3| {
+            let floor_w = n_inward.y.clamp(0.0, 1.0);
+            let eff_amp = rough_amp * floor_w;
+            let d_offset = (1.0 - eff_amp * xi) * s;
+            let grad_bump = -grad_xi * eff_amp;
             Self::fold_wall_plane(
                 &mut psi,
                 &mut grad,

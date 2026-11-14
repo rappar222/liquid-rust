@@ -115,7 +115,7 @@ public final class AppUpdater {
                 return pi.versionName;
             }
         } catch (Throwable ignored) {}
-        return "0.3.3";
+        return "0.3.11";
     }
 
     @SuppressWarnings("deprecation")

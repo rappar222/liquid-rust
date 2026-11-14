@@ -326,21 +326,46 @@ impl GpuSphSolver {
         };
 
         if !initial_particles.is_empty() {
-            solver.init_buffers(bounds, config, initial_particles);
+            solver.try_init_buffers(bounds, config, initial_particles)?;
         }
 
         Ok(solver)
     }
 
     pub fn init_buffers(&mut self, bounds: Aabb, config: &SolverConfig, particles: &[Particle]) {
+        if let Err(err) = self.try_init_buffers(bounds, config, particles) {
+            eprintln!("GPU buffer allocation warning: {}", err);
+        }
+    }
+
+    pub fn try_init_buffers(
+        &mut self,
+        bounds: Aabb,
+        config: &SolverConfig,
+        particles: &[Particle],
+    ) -> Result<(), String> {
         let count = particles.len();
-        self.particle_count = count;
         let is_2d = bounds.size().z < 0.15;
         let capacity = if count > 1_000_000 {
             count + (count / 20).max(10_000)
         } else {
             (count * 2).max(1024)
         };
+        let particle_buf_bytes = (capacity * std::mem::size_of::<GpuParticle>()) as u64;
+        let limits = self.device.limits();
+        if particle_buf_bytes > limits.max_storage_buffer_binding_size as u64
+            || particle_buf_bytes > limits.max_buffer_size
+        {
+            return Err(format!(
+                "Particle count {} requires {:.1} MiB storage buffer, exceeding GPU adapter limits (max binding {:.1} MiB, max buffer {:.1} MiB)",
+                count,
+                particle_buf_bytes as f64 / (1024.0 * 1024.0),
+                limits.max_storage_buffer_binding_size as f64 / (1024.0 * 1024.0),
+                limits.max_buffer_size as f64 / (1024.0 * 1024.0),
+            ));
+        }
+
+        self.particle_count = count;
         self.particle_capacity = capacity;
 
         let mut cell_size = config.smoothing_length.max(1e-5);
@@ -481,6 +506,7 @@ impl GpuSphSolver {
         self.grid_next_buf = Some(grid_next_buf);
         self.readback_buf = Some(readback_buf);
         self.bind_group = Some(bind_group);
+        Ok(())
     }
 
     /// Incrementally synchronize CPU particle changes (e.g. faucet emissions or drain removals)
@@ -557,7 +583,10 @@ impl GpuSphSolver {
             return;
         }
 
-        let substeps = config.substeps.max(1);
+        // Keep physical substep dt <= (1/60s)/config.substeps even at lower video frame rates
+        // (e.g. default --fps 30 or --fps 24) so simulation crispness is frame-rate independent.
+        let fps_substep_mult = ((dt * 60.0 - 1e-4).ceil() as usize).clamp(1, 8);
+        let substeps = config.substeps.max(1) * fps_substep_mult;
         let sub_dt = dt / substeps as f32;
 
         let h = config.smoothing_length;
@@ -639,12 +668,31 @@ impl GpuSphSolver {
             ([0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
         };
 
-        let dt_ref = 1.0 / 60.0;
-        let dt_ratio = (dt_ref / sub_dt.max(1e-5)).max(1.0);
-        let cfm_scale = dt_ratio * dt_ratio;
-        let dt_factor = (sub_dt / dt_ref).clamp(0.0001, 1.0);
-        let relaxation_epsilon = 1200.0 * (0.075 / h).powi(2) * cfm_scale;
-        let max_displacement = (config.particle_radius * 0.45).max(h * 0.25) * dt_factor;
+        // Keep full PBF stiffness across normal real-time multi-substep tiers (2..8 substeps at
+        // 60..120 fps), while scaling compliance smoothly in true slow-motion (frame_dt << 1/90s).
+        let frame_dt_ref = 1.0 / 90.0;
+        let slow_ratio = (frame_dt_ref / dt.max(1e-5)).max(1.0);
+        let cfm_scale = slow_ratio * slow_ratio;
+        let slow_factor = (dt / frame_dt_ref).clamp(0.0001, 1.0);
+        let relaxation_epsilon = 1000.0 * (0.075 / h).powi(2) * cfm_scale;
+        let max_displacement = (config.particle_radius * 0.40)
+            .max(h * 0.18)
+            .min(2.8 * sub_dt.max(1e-5))
+            * slow_factor;
+
+        // Force-like terms applied inside each PBF solver iteration scale with sub_dt^2 / iters
+        // so surface tension and tensile anti-clumping produce identical physical acceleration
+        // across 2..8 substeps, 3..6 solver iterations, and slow-motion playback.
+        let iter_scale = 3.0 / (config.solver_iterations.max(1) as f32);
+        let force_dt_scale = ((sub_dt / (1.0 / 60.0)).powi(2)).clamp(1e-6, 1.0) * iter_scale;
+
+        // Substep-independent XSPH viscosity factor (calibrated to 120 Hz reference substep)
+        let visc_base = config.viscosity.clamp(0.0, 0.95);
+        let visc_substep = if visc_base > 0.0 {
+            1.0 - (1.0 - visc_base).powf((sub_dt * 120.0).clamp(0.001, 2.0))
+        } else {
+            0.0
+        };
 
         let mut ch_info = chamber.gpu_info(&bounds);
         ch_info[1] = config.vorticity.max(0.0);
@@ -658,7 +706,7 @@ impl GpuSphSolver {
             mouse_dir: m_dir,
             collider_pos,
             kernel_params: [h, h2, inv_rho0, rho0],
-            kernel_factors: [poly6_factor, spiky_factor, w_q, config.tensile_k / cfm_scale],
+            kernel_factors: [poly6_factor, spiky_factor, w_q, config.tensile_k * force_dt_scale],
             solver_params: [
                 relaxation_epsilon,
                 max_displacement,
@@ -666,8 +714,8 @@ impl GpuSphSolver {
                 config.boundary_friction,
             ],
             fluid_params: [
-                config.viscosity,
-                config.surface_tension / cfm_scale,
+                visc_substep,
+                config.surface_tension * force_dt_scale,
                 config.max_velocity,
                 collider_enabled,
             ],
@@ -697,57 +745,95 @@ impl GpuSphSolver {
         let bind_group = self.bind_group.as_ref().unwrap();
         let has_vorticity = config.vorticity > 1e-5;
 
-        // Batch ALL substeps and solver dispatches into a single CommandEncoder,
-        // single ComputePass, and single GPU queue submission per frame!
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("PBF Frame Batched Encoder"),
-        });
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("PBF Batched Frame Compute Pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_bind_group(0, bind_group, &[]);
-
-            for _ in 0..substeps {
-                // 1. Predict positions
-                cpass.set_pipeline(&self.pipeline_predict);
-                cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-
-                // 2. Clear uniform grid
-                cpass.set_pipeline(&self.pipeline_clear_grid);
-                cpass.dispatch_workgroups(workgroups_cells, 1, 1);
-
-                // 3. Insert particles into grid
-                cpass.set_pipeline(&self.pipeline_insert_particles);
-                cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-
-                // 4. PBF Solver Iterations
-                for _ in 0..config.solver_iterations {
-                    cpass.set_pipeline(&self.pipeline_density_lambda);
-                    cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-
-                    cpass.set_pipeline(&self.pipeline_delta_positions);
-                    cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-
-                    cpass.set_pipeline(&self.pipeline_apply_delta);
-                    cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-                }
-
-                // 5. Update velocity, XSPH viscosity & Vorticity Curl
-                cpass.set_pipeline(&self.pipeline_update_velocity);
-                cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
-
-                // 6. Vorticity Confinement (only when enabled)
-                if has_vorticity {
-                    cpass.set_pipeline(&self.pipeline_vorticity);
-                    cpass.dispatch_workgroups(disp_p_x, disp_p_y, 1);
+        let submit_dispatches = |label: &str, jobs: &[(&wgpu::ComputePipeline, u32, u32)], sync_wait: bool| {
+            let mut encoder =
+                self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some(label),
+                });
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(label),
+                    timestamp_writes: None,
+                });
+                cpass.set_bind_group(0, bind_group, &[]);
+                for &(pipeline, wx, wy) in jobs {
+                    cpass.set_pipeline(pipeline);
+                    cpass.dispatch_workgroups(wx, wy, 1);
                 }
             }
-        }
+            self.queue.submit(Some(encoder.finish()));
+            if sync_wait {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+        };
 
-        self.queue.submit(Some(encoder.finish()));
+        // Multi-million-particle CLI runs can exceed the ~2s OS/driver GPU TDR watchdog if all
+        // substeps and solver iterations are queued into one giant command buffer.
+        if self.particle_count > 1_200_000 {
+            for _ in 0..substeps {
+                submit_dispatches(
+                    "PBF Substep Setup",
+                    &[
+                        (&self.pipeline_predict, disp_p_x, disp_p_y),
+                        (&self.pipeline_clear_grid, workgroups_cells, 1),
+                        (&self.pipeline_insert_particles, disp_p_x, disp_p_y),
+                    ],
+                    true,
+                );
+                for _ in 0..config.solver_iterations {
+                    submit_dispatches(
+                        "PBF Solver Iteration",
+                        &[
+                            (&self.pipeline_density_lambda, disp_p_x, disp_p_y),
+                            (&self.pipeline_delta_positions, disp_p_x, disp_p_y),
+                            (&self.pipeline_apply_delta, disp_p_x, disp_p_y),
+                        ],
+                        true,
+                    );
+                }
+                if has_vorticity {
+                    submit_dispatches(
+                        "PBF Substep Finalize + Vorticity",
+                        &[
+                            (&self.pipeline_update_velocity, disp_p_x, disp_p_y),
+                            (&self.pipeline_vorticity, disp_p_x, disp_p_y),
+                        ],
+                        true,
+                    );
+                } else {
+                    submit_dispatches(
+                        "PBF Substep Finalize",
+                        &[(&self.pipeline_update_velocity, disp_p_x, disp_p_y)],
+                        true,
+                    );
+                }
+            }
+        } else {
+            let mut jobs: Vec<(&wgpu::ComputePipeline, u32, u32)> =
+                Vec::with_capacity(5 + config.solver_iterations * 3);
+            let per_substep = self.particle_count > 400_000;
+            for _ in 0..substeps {
+                jobs.push((&self.pipeline_predict, disp_p_x, disp_p_y));
+                jobs.push((&self.pipeline_clear_grid, workgroups_cells, 1));
+                jobs.push((&self.pipeline_insert_particles, disp_p_x, disp_p_y));
+                for _ in 0..config.solver_iterations {
+                    jobs.push((&self.pipeline_density_lambda, disp_p_x, disp_p_y));
+                    jobs.push((&self.pipeline_delta_positions, disp_p_x, disp_p_y));
+                    jobs.push((&self.pipeline_apply_delta, disp_p_x, disp_p_y));
+                }
+                jobs.push((&self.pipeline_update_velocity, disp_p_x, disp_p_y));
+                if has_vorticity {
+                    jobs.push((&self.pipeline_vorticity, disp_p_x, disp_p_y));
+                }
+                if per_substep {
+                    submit_dispatches("PBF Substep Pass", &jobs, true);
+                    jobs.clear();
+                }
+            }
+            if !per_substep && !jobs.is_empty() {
+                submit_dispatches("PBF Batched Frame Pass", &jobs, false);
+            }
+        }
     }
 
     /// Read particle data back from GPU to CPU

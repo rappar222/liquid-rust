@@ -45,9 +45,15 @@ pub struct SceneGenerator;
 impl SceneGenerator {
     /// Apply small deterministic quasi-random offset to break artificial initial Cartesian axes
     /// without significantly changing bulk lattice density.
-    fn apply_spawn_jitter(particles: &mut [Particle], spacing: f32, is_2d: bool, bounds: &Aabb) {
+    fn apply_spawn_jitter(
+        particles: &mut [Particle],
+        spacing: f32,
+        radius: f32,
+        is_2d: bool,
+        bounds: &Aabb,
+    ) {
         let amp = spacing * 0.08;
-        let pad = spacing * 0.52;
+        let pad = radius.max(spacing * 0.55);
         for p in particles.iter_mut() {
             let mut h = p.id.wrapping_mul(0x9E37_79B9).wrapping_add(0x85EB_CA6B);
             h ^= h >> 15;
@@ -141,6 +147,7 @@ impl SceneGenerator {
         let mut id = 0;
 
         let spacing = solver.config.spacing;
+        let wall_inset = (solver.config.particle_radius - 0.45 * spacing).max(0.0);
 
         if solver.is_2d {
             solver.config.rest_density =
@@ -153,7 +160,7 @@ impl SceneGenerator {
                     solver.config.viscosity = 0.08;
 
                     let particles = Self::spawn_block(
-                        Vec3::new(-0.85, 0.02, 0.0),
+                        Vec3::new(-0.9 + wall_inset, wall_inset, 0.0),
                         Vec3::new(-0.25, 0.95, 0.0),
                         spacing,
                         Vec3::ZERO,
@@ -170,7 +177,7 @@ impl SceneGenerator {
                     solver.config.viscosity = 0.08;
 
                     let p1 = Self::spawn_block(
-                        Vec3::new(-0.95, 0.02, 0.0),
+                        Vec3::new(-1.0 + wall_inset, wall_inset, 0.0),
                         Vec3::new(-0.45, 0.95, 0.0),
                         spacing,
                         Vec3::ZERO,
@@ -182,8 +189,8 @@ impl SceneGenerator {
                     }
 
                     let p2 = Self::spawn_block(
-                        Vec3::new(0.45, 0.02, 0.0),
-                        Vec3::new(0.95, 0.95, 0.0),
+                        Vec3::new(0.45, wall_inset, 0.0),
+                        Vec3::new(1.0 - wall_inset, 0.95, 0.0),
                         spacing,
                         Vec3::ZERO,
                         &mut id,
@@ -199,8 +206,8 @@ impl SceneGenerator {
                     solver.config.viscosity = 0.05;
 
                     let pool = Self::spawn_block(
-                        Vec3::new(-0.80, 0.02, 0.0),
-                        Vec3::new(0.80, 0.35, 0.0),
+                        Vec3::new(-0.85 + wall_inset, wall_inset, 0.0),
+                        Vec3::new(0.85 - wall_inset, 0.35, 0.0),
                         spacing,
                         Vec3::ZERO,
                         &mut id,
@@ -318,10 +325,10 @@ impl SceneGenerator {
                     solver.config.gravity = Vec3::new(0.0, -9.81, 0.0);
                     solver.config.viscosity = 0.08;
 
-                    // Fluid column on left side
+                    // Fluid column resting flush against left wall, floor, and front/back walls
                     let particles = Self::spawn_block(
-                        Vec3::new(-0.76, 0.02, -0.41),
-                        Vec3::new(-0.15, 0.85, 0.41),
+                        Vec3::new(-0.8 + wall_inset, wall_inset, -0.45 + wall_inset),
+                        Vec3::new(-0.15, 0.85, 0.45 - wall_inset),
                         spacing,
                         Vec3::ZERO,
                         &mut id,
@@ -337,8 +344,8 @@ impl SceneGenerator {
 
                     // Left column
                     let p1 = Self::spawn_block(
-                        Vec3::new(-0.96, 0.02, -0.41),
-                        Vec3::new(-0.45, 0.85, 0.41),
+                        Vec3::new(-1.0 + wall_inset, wall_inset, -0.45 + wall_inset),
+                        Vec3::new(-0.45, 0.85, 0.45 - wall_inset),
                         spacing,
                         Vec3::ZERO,
                         &mut id,
@@ -349,8 +356,8 @@ impl SceneGenerator {
 
                     // Right column
                     let p2 = Self::spawn_block(
-                        Vec3::new(0.45, 0.02, -0.41),
-                        Vec3::new(0.96, 0.85, 0.41),
+                        Vec3::new(0.45, wall_inset, -0.45 + wall_inset),
+                        Vec3::new(1.0 - wall_inset, 0.85, 0.45 - wall_inset),
                         spacing,
                         Vec3::ZERO,
                         &mut id,
@@ -366,8 +373,8 @@ impl SceneGenerator {
 
                     // Resting reservoir at bottom
                     let pool = Self::spawn_block(
-                        Vec3::new(-0.61, 0.02, -0.61),
-                        Vec3::new(0.61, 0.32, 0.61),
+                        Vec3::new(-0.65 + wall_inset, wall_inset, -0.65 + wall_inset),
+                        Vec3::new(0.65 - wall_inset, 0.32, 0.65 - wall_inset),
                         spacing,
                         Vec3::ZERO,
                         &mut id,
@@ -485,14 +492,40 @@ impl SceneGenerator {
             preset,
             ScenePreset::DamBreak | ScenePreset::DoubleDamBreak | ScenePreset::ObstacleDrop
         ) {
-            Self::apply_spawn_jitter(&mut solver.particles, spacing, solver.is_2d, &solver.bounds);
+            Self::apply_spawn_jitter(
+                &mut solver.particles,
+                spacing,
+                solver.config.particle_radius,
+                solver.is_2d,
+                &solver.bounds,
+            );
         }
 
-        // If the chamber has a custom shape or scale, re-apply the chamber bounds
-        if solver.chamber.shape != ChamberShape::Box || solver.chamber.scale != Vec3::ONE {
-            solver.bounds = solver.chamber.compute_bounds();
-        } else {
+        // Respect explicit chamber size overrides, custom shapes, or non-unit scaling
+        if !solver.chamber.custom_size {
             solver.chamber.base_size = solver.bounds.size();
+        }
+        if solver.chamber.custom_size
+            || solver.chamber.shape != ChamberShape::Box
+            || (solver.chamber.scale - Vec3::ONE).length_squared() > 1e-6
+        {
+            solver.bounds = solver.chamber.compute_bounds();
+            if solver.is_2d {
+                solver.bounds.min.z = -0.05;
+                solver.bounds.max.z = 0.05;
+            }
+            if solver.chamber.custom_size {
+                let margin = solver.config.particle_radius;
+                let b = solver.bounds;
+                solver.particles.retain(|p| {
+                    p.position.x >= b.min.x + margin
+                        && p.position.x <= b.max.x - margin
+                        && p.position.y >= b.min.y + margin
+                        && p.position.y <= b.max.y - margin
+                        && (solver.is_2d
+                            || (p.position.z >= b.min.z + margin && p.position.z <= b.max.z - margin))
+                });
+            }
         }
     }
 }

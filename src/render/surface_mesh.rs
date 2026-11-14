@@ -301,6 +301,154 @@ pub struct SurfaceTexSample {
 }
 
 /// Full configuration for surface meshing geometry, texture, color, and optical light behavior.
+/// Offline CLI rendering quality tiers (strictly for headless CLI exports; never shown in interactive GUI).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CliRenderQuality {
+    /// Standard 1x rasterization, 260-cell surface mesh cap, 128px shadow map, H.264 CRF 18.
+    #[default]
+    Standard,
+    /// Studio offline quality: 2x2 SSAA, 384-cell mesh cap, 256px soft shadow map, H.264 CRF 15.
+    Studio,
+    /// Cinema offline quality: 3x3 SSAA, 512-cell mesh cap, 384px shadow map, dispersion, H.264 CRF 13.
+    Cinema,
+    /// Master offline quality: 4x4 SSAA, 640-cell mesh cap, 512px shadow map, dispersion + high smoothing, H.264 CRF 11.
+    Master,
+}
+
+impl CliRenderQuality {
+    pub const ALL: &'static [CliRenderQuality] = &[
+        CliRenderQuality::Standard,
+        CliRenderQuality::Studio,
+        CliRenderQuality::Cinema,
+        CliRenderQuality::Master,
+    ];
+
+    pub fn is_cli_only(&self) -> bool {
+        !matches!(self, CliRenderQuality::Standard)
+    }
+
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "standard" | "default" | "1x" => Some(Self::Standard),
+            "studio" | "photoreal" | "2x" => Some(Self::Studio),
+            "cinema" | "film" | "3x" => Some(Self::Cinema),
+            "master" | "hyper" | "ultra-cli" | "4x" => Some(Self::Master),
+            _ => None,
+        }
+    }
+
+    pub fn slug(&self) -> &'static str {
+        match self {
+            CliRenderQuality::Standard => "standard",
+            CliRenderQuality::Studio => "studio",
+            CliRenderQuality::Cinema => "cinema",
+            CliRenderQuality::Master => "master",
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            CliRenderQuality::Standard => "Standard (1x)",
+            CliRenderQuality::Studio => "Studio [CLI] (2x2 SSAA)",
+            CliRenderQuality::Cinema => "Cinema [CLI] (3x3 SSAA)",
+            CliRenderQuality::Master => "Master [CLI] (4x4 SSAA)",
+        }
+    }
+
+    pub fn ssaa_factor(&self) -> usize {
+        match self {
+            CliRenderQuality::Standard => 1,
+            CliRenderQuality::Studio => 2,
+            CliRenderQuality::Cinema => 3,
+            CliRenderQuality::Master => 4,
+        }
+    }
+
+    pub fn shadow_res(&self) -> usize {
+        match self {
+            CliRenderQuality::Standard => 128,
+            CliRenderQuality::Studio => 256,
+            CliRenderQuality::Cinema => 384,
+            CliRenderQuality::Master => 512,
+        }
+    }
+
+    pub fn ffmpeg_preset(&self) -> &'static str {
+        match self {
+            CliRenderQuality::Standard => "medium",
+            CliRenderQuality::Studio => "slow",
+            CliRenderQuality::Cinema => "slow",
+            CliRenderQuality::Master => "slower",
+        }
+    }
+
+    pub fn ffmpeg_crf(&self) -> u32 {
+        match self {
+            CliRenderQuality::Standard => 18,
+            CliRenderQuality::Studio => 15,
+            CliRenderQuality::Cinema => 13,
+            CliRenderQuality::Master => 11,
+        }
+    }
+
+    pub fn chromatic_dispersion(&self) -> f32 {
+        match self {
+            CliRenderQuality::Standard => 0.0,
+            CliRenderQuality::Studio => 0.008,
+            CliRenderQuality::Cinema => 0.018,
+            CliRenderQuality::Master => 0.028,
+        }
+    }
+
+    pub fn apply_to_mesh_config(
+        &self,
+        cfg: &mut SurfaceMeshConfig,
+        user_set_smooth: bool,
+        user_set_voxel: bool,
+    ) {
+        match self {
+            CliRenderQuality::Standard => {
+                cfg.max_grid_cells = 260.0;
+                cfg.min_voxel_size = 0.0025;
+                cfg.max_smoothing_passes = 10;
+            }
+            CliRenderQuality::Studio => {
+                cfg.max_grid_cells = 384.0;
+                cfg.min_voxel_size = 0.0014;
+                cfg.max_smoothing_passes = 14;
+                if !user_set_smooth {
+                    cfg.smoothing_passes = cfg.smoothing_passes.max(7);
+                }
+                if !user_set_voxel {
+                    cfg.voxel_scale = cfg.voxel_scale.min(0.62);
+                }
+            }
+            CliRenderQuality::Cinema => {
+                cfg.max_grid_cells = 512.0;
+                cfg.min_voxel_size = 0.0009;
+                cfg.max_smoothing_passes = 18;
+                if !user_set_smooth {
+                    cfg.smoothing_passes = cfg.smoothing_passes.max(9);
+                }
+                if !user_set_voxel {
+                    cfg.voxel_scale = cfg.voxel_scale.min(0.55);
+                }
+            }
+            CliRenderQuality::Master => {
+                cfg.max_grid_cells = 640.0;
+                cfg.min_voxel_size = 0.0006;
+                cfg.max_smoothing_passes = 24;
+                if !user_set_smooth {
+                    cfg.smoothing_passes = cfg.smoothing_passes.max(12);
+                }
+                if !user_set_voxel {
+                    cfg.voxel_scale = cfg.voxel_scale.min(0.48);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SurfaceMeshConfig {
     // 1. Meshing Geometry
@@ -332,8 +480,12 @@ pub struct SurfaceMeshConfig {
     pub metallic: f32,            // Metallic reflectance [0.0..1.0]
     pub light_dir: Vec3,          // Normalized key sun direction
     pub light_intensity: f32,     // Key light radiance
-    pub ambient_intensity: f32,   // Hemisphere ambient illumination
-    pub cast_shadows: bool,       // Floor shadow & caustic projection in CLI renders
+    pub ambient_intensity: f32,     // Hemisphere ambient illumination
+    pub cast_shadows: bool,         // Floor shadow & caustic projection in CLI renders
+    // 5. Resolution & Smoothing Ceilings (raised for offline CLI modes)
+    pub max_grid_cells: f32,        // Max marching-cubes cells along longest axis (default 260)
+    pub min_voxel_size: f32,        // Minimum marching-cubes voxel size in meters (default 0.0025)
+    pub max_smoothing_passes: usize,// Upper bound for Taubin smoothing iterations (default 10)
 }
 
 impl Default for SurfaceMeshConfig {
@@ -363,6 +515,9 @@ impl Default for SurfaceMeshConfig {
             light_intensity: 1.25,
             ambient_intensity: 0.32,
             cast_shadows: true,
+            max_grid_cells: 260.0,
+            min_voxel_size: 0.0025,
+            max_smoothing_passes: 10,
         };
         FluidMaterialPreset::ClearWater.apply(&mut cfg);
         cfg
@@ -673,7 +828,8 @@ impl SurfaceMesh {
         let splat_r2 = splat_radius * splat_radius;
         let inv_splat_r2 = 1.0 / splat_r2.max(1e-10);
 
-        let mut voxel_size = (particle_radius * config.voxel_scale.clamp(0.35, 1.8)).max(0.0025);
+        let min_voxel = config.min_voxel_size.max(0.00025);
+        let mut voxel_size = (particle_radius * config.voxel_scale.clamp(0.30, 1.8)).max(min_voxel);
 
         // Tight bounding box around fluid particles
         let mut min_p = Vec3::splat(f32::INFINITY);
@@ -688,9 +844,9 @@ impl SurfaceMesh {
         let grid_max = max_p + Vec3::splat(pad);
         let extent = grid_max - grid_min;
 
-        // Cap maximum grid resolution (~260 cells along longest axis) so memory and time stay bounded
+        // Cap maximum grid resolution along longest axis so memory and time stay bounded
         let max_axis_extent = extent.x.max(extent.y).max(extent.z);
-        let max_cells_axis = 260.0f32;
+        let max_cells_axis = config.max_grid_cells.max(32.0);
         if max_axis_extent / voxel_size > max_cells_axis {
             voxel_size = max_axis_extent / max_cells_axis;
         }
@@ -956,7 +1112,9 @@ impl SurfaceMesh {
         }
 
         // Volume-preserving Taubin (lambda / mu) mesh smoothing to erase particle blobbiness
-        let smooth_iters = config.smoothing_passes.min(10);
+        let smooth_iters = config
+            .smoothing_passes
+            .min(config.max_smoothing_passes.max(1));
         if smooth_iters > 0 {
             let mut sum_pos = vec![Vec3::ZERO; v_count];
             let mut sum_vel = vec![Vec3::ZERO; v_count];

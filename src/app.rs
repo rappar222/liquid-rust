@@ -1,5 +1,5 @@
 use crate::export::{Mp4Encoder, PlyExporter, PngExporter, SoftwareRenderer};
-use crate::gpu::GpuSphSolver;
+use crate::gpu::{create_headless_wgpu_device, GpuRenderer, GpuSphSolver, GpuSurfaceField};
 use crate::math::{unproject_mouse_ray, Aabb};
 use crate::render::{
     Camera, CliRenderQuality, ColorMap, ColorMapType, ColorMode, EnvironmentPreset,
@@ -15,7 +15,9 @@ use crate::sph::solver::{
     compute_lattice_rest_density, compute_lattice_rest_density_2d, FluidPhysicsPreset,
     SimulationQuality, SolverConfig, SphSolver,
 };
-use crate::sph::{ChamberShape, Collider, ColliderShape, CubeFace, Drain, Faucet, FaucetShape};
+use crate::sph::{
+    Chamber, ChamberShape, Collider, ColliderShape, CubeFace, Drain, Faucet, FaucetShape, Particle,
+};
 use crate::updater::{
     cleanup_old_binary, format_bytes, restart_into_updated_binary, UpdatePhase, UpdaterHandle,
     CURRENT_VERSION,
@@ -62,7 +64,26 @@ pub enum InspectorTab {
     Scene,
     Physics,
     Surface,
+    Render,
     RenderCli,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CentralView {
+    LiveViewport,
+    RenderResult,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StudioRenderKind {
+    StillFrame,
+    Animation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimationStartSource {
+    PresetStart,
+    CurrentState,
 }
 
 /// Crisp geometric vector icons painted directly via `egui::Painter` so every button, tab,
@@ -75,6 +96,7 @@ enum UiIcon {
     Play,
     Pause,
     Step,
+    StepBack,
     Reset,
     Camera,
     Spheres,
@@ -90,13 +112,262 @@ enum UiIcon {
     Bolt,
 }
 
-/// Shared progress state for non-blocking background MP4 video rendering initiated from the GUI.
+/// Packed RGB8 frame stored for in-GUI render result display, animation scrubbing, and lossless PNG saving.
+#[derive(Clone)]
+pub struct PreviewFrameRgb {
+    pub width: usize,
+    pub height: usize,
+    pub rgb: Arc<Vec<u8>>,
+}
+
+/// Shared progress & output state for non-blocking studio still & animation rendering in the GUI.
 pub struct BgRenderState {
     pub is_running: bool,
+    pub kind: StudioRenderKind,
     pub completed_frames: usize,
     pub total_frames: usize,
     pub elapsed_secs: f32,
+    pub backend_label: String,
+    pub output_width: usize,
+    pub output_height: usize,
+    pub quality: CliRenderQuality,
+    pub fps: u32,
+    pub saved_path: Option<String>,
     pub finished_message: Option<String>,
+    pub full_res_frame: Option<PreviewFrameRgb>,
+    pub anim_frames: Vec<PreviewFrameRgb>,
+    pub frame_revision: u64,
+    pub anim_generation: u64,
+    pub just_finished_anim: bool,
+}
+
+/// Hardware Vulkan GPU offline renderer with automatic multi-core CPU SSAA fallback.
+enum GuiOfflineRenderer {
+    Gpu {
+        renderer: GpuRenderer,
+        surface_field: Option<GpuSurfaceField>,
+    },
+    Cpu(SoftwareRenderer),
+}
+
+impl GuiOfflineRenderer {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        width: usize,
+        height: usize,
+        rq: CliRenderQuality,
+        use_gpu: bool,
+        shared_gpu: Option<&GpuSphSolver>,
+        enable_culling: bool,
+        lit_spheres: bool,
+        particle_foam: bool,
+        mesh_cfg: &SurfaceMeshConfig,
+    ) -> Self {
+        if use_gpu {
+            let gpu_try = if let Some(gs) = shared_gpu {
+                GpuRenderer::new_with_device(
+                    Arc::clone(&gs.device),
+                    Arc::clone(&gs.queue),
+                    gs.device_name.clone(),
+                    width,
+                    height,
+                    rq,
+                )
+                .ok()
+                .map(|r| {
+                    let sf =
+                        GpuSurfaceField::new(Arc::clone(&gs.device), Arc::clone(&gs.queue)).ok();
+                    (r, sf)
+                })
+            } else {
+                create_headless_wgpu_device()
+                    .ok()
+                    .and_then(|(dev, queue, name)| {
+                        let sf = GpuSurfaceField::new(Arc::clone(&dev), Arc::clone(&queue)).ok();
+                        GpuRenderer::new_with_device(dev, queue, name, width, height, rq)
+                            .ok()
+                            .map(|r| (r, sf))
+                    })
+            };
+
+            if let Some((mut r, sf)) = gpu_try {
+                r.lit_spheres = lit_spheres;
+                r.particle_foam = particle_foam;
+                r.env_preset = mesh_cfg.env_preset;
+                r.exposure = mesh_cfg.exposure;
+                r.show_grid = mesh_cfg.show_grid;
+                r.show_wireframe = mesh_cfg.show_wireframe;
+                r.light_dir = mesh_cfg.light_dir;
+                r.light_intensity = mesh_cfg.light_intensity;
+                r.ambient_intensity = mesh_cfg.ambient_intensity;
+                return Self::Gpu {
+                    renderer: r,
+                    surface_field: sf,
+                };
+            }
+        }
+
+        let mut sw = SoftwareRenderer::new_with_quality(width, height, rq);
+        sw.enable_culling = enable_culling;
+        sw.lit_spheres = lit_spheres;
+        sw.particle_foam = particle_foam;
+        sw.env_preset = mesh_cfg.env_preset;
+        sw.exposure = mesh_cfg.exposure;
+        sw.show_grid = mesh_cfg.show_grid;
+        sw.show_wireframe = mesh_cfg.show_wireframe;
+        sw.light_dir = mesh_cfg.light_dir;
+        sw.light_intensity = mesh_cfg.light_intensity;
+        sw.ambient_intensity = mesh_cfg.ambient_intensity;
+        Self::Cpu(sw)
+    }
+
+    fn backend_label(&self) -> String {
+        match self {
+            Self::Gpu { renderer, .. } => {
+                format!("Vulkan GPU ({}x SSAA)", renderer.ssaa_factor)
+            }
+            Self::Cpu(sw) => format!("CPU Raster ({}x SSAA)", sw.ssaa_factor),
+        }
+    }
+
+    fn current_rgb(&self) -> &[u8] {
+        match self {
+            Self::Gpu { renderer, .. } => &renderer.rgb_buffer,
+            Self::Cpu(sw) => &sw.rgb_buffer,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_frame(
+        &mut self,
+        render_mode: RenderMode,
+        particles: &[Particle],
+        gpu_solver: Option<&GpuSphSolver>,
+        particle_radius: f32,
+        smoothing_length: f32,
+        display_size_factor: f32,
+        rest_density: f32,
+        mesh_cfg: &SurfaceMeshConfig,
+        camera: &Camera,
+        chamber: &Chamber,
+        bounds: Aabb,
+        colliders: &[Collider],
+        color_mode: ColorMode,
+        color_map: ColorMapType,
+        anim_time: f32,
+        is_2d: bool,
+    ) -> &[u8] {
+        match render_mode {
+            RenderMode::Particles => {
+                let rad = particle_radius * display_size_factor;
+                match self {
+                    Self::Gpu { renderer, .. } => {
+                        if let Some(gs) = gpu_solver {
+                            if gs.supports_vertex_storage() {
+                                if let Some(buf) = gs.particle_buffer() {
+                                    renderer.render_particles_from_gpu_buffer(
+                                        buf,
+                                        gs.particle_count,
+                                        rad,
+                                        chamber,
+                                        bounds,
+                                        colliders,
+                                        camera,
+                                        color_mode,
+                                        color_map,
+                                        rest_density,
+                                        is_2d,
+                                    );
+                                    return &renderer.rgb_buffer;
+                                }
+                            }
+                        }
+                        renderer.render_particles_studio(
+                            particles,
+                            rad,
+                            chamber,
+                            bounds,
+                            colliders,
+                            camera,
+                            color_mode,
+                            color_map,
+                            rest_density,
+                            is_2d,
+                        );
+                        &renderer.rgb_buffer
+                    }
+                    Self::Cpu(sw) => {
+                        sw.render_particles_studio(
+                            particles,
+                            rad,
+                            chamber,
+                            bounds,
+                            colliders,
+                            camera,
+                            color_mode,
+                            color_map,
+                            rest_density,
+                            is_2d,
+                        );
+                        &sw.rgb_buffer
+                    }
+                }
+            }
+            RenderMode::SurfaceMesh => match self {
+                Self::Gpu {
+                    renderer,
+                    surface_field,
+                } => {
+                    let mesh = if let Some(ref mut sf) = surface_field {
+                        SurfaceMesh::from_particles_with_gpu(
+                            particles,
+                            particle_radius,
+                            smoothing_length,
+                            mesh_cfg,
+                            sf,
+                        )
+                    } else {
+                        SurfaceMesh::from_particles(
+                            particles,
+                            particle_radius,
+                            smoothing_length,
+                            mesh_cfg,
+                        )
+                    };
+                    renderer.render_surface_mesh_frame(
+                        &mesh,
+                        mesh_cfg,
+                        camera,
+                        chamber,
+                        bounds,
+                        colliders,
+                        anim_time,
+                        is_2d,
+                    );
+                    &renderer.rgb_buffer
+                }
+                Self::Cpu(sw) => {
+                    let mesh = SurfaceMesh::from_particles(
+                        particles,
+                        particle_radius,
+                        smoothing_length,
+                        mesh_cfg,
+                    );
+                    sw.render_surface_mesh_frame(
+                        &mesh,
+                        mesh_cfg,
+                        camera,
+                        chamber,
+                        bounds,
+                        colliders,
+                        anim_time,
+                        is_2d,
+                    );
+                    &sw.rgb_buffer
+                }
+            },
+        }
+    }
 }
 
 pub struct LiquidApp {
@@ -145,8 +416,23 @@ pub struct LiquidApp {
     pub current_fps: f32,
     pub last_step_time_ms: f32,
 
-    // Inspector & Export / CLI Generator
+    // Inspector & Studio Render / Export / CLI Generator
     pub active_tab: InspectorTab,
+    pub central_view: CentralView,
+    pub render_kind: StudioRenderKind,
+    pub render_anim_start: AnimationStartSource,
+    pub render_save_mp4: bool,
+    pub render_auto_save_png: bool,
+    render_texture: Option<egui::TextureHandle>,
+    render_uploaded_key: (u64, Option<usize>),
+    pub render_zoom: f32,
+    pub render_pan: egui::Vec2,
+    pub anim_playing: bool,
+    pub anim_loop: bool,
+    pub anim_speed: f32,
+    pub anim_play_idx: usize,
+    anim_accum_secs: f32,
+    last_anim_tick: Instant,
     pub theme_applied: bool,
     pub export_path: String,
     pub png_output_path: String,
@@ -305,6 +591,21 @@ impl LiquidApp {
             current_fps: 60.0,
             last_step_time_ms: 0.0,
             active_tab: InspectorTab::Scene,
+            central_view: CentralView::LiveViewport,
+            render_kind: StudioRenderKind::StillFrame,
+            render_anim_start: AnimationStartSource::PresetStart,
+            render_save_mp4: true,
+            render_auto_save_png: false,
+            render_texture: None,
+            render_uploaded_key: (0, None),
+            render_zoom: 0.0,
+            render_pan: egui::Vec2::ZERO,
+            anim_playing: false,
+            anim_loop: true,
+            anim_speed: 1.0,
+            anim_play_idx: 0,
+            anim_accum_secs: 0.0,
+            last_anim_tick: now,
             theme_applied: false,
             export_path: "exports".to_string(),
             png_output_path: "snapshot.png".to_string(),
@@ -328,15 +629,27 @@ impl LiquidApp {
             cli_duration: 5.0,
             cli_fps: 60,
             cli_mp4_output: "simulation.mp4".to_string(),
-            gui_render_quality: CliRenderQuality::Standard,
+            gui_render_quality: CliRenderQuality::Studio,
             video_width: 1280,
             video_height: 720,
             bg_render: Arc::new(Mutex::new(BgRenderState {
                 is_running: false,
+                kind: StudioRenderKind::StillFrame,
                 completed_frames: 0,
                 total_frames: 0,
                 elapsed_secs: 0.0,
+                backend_label: String::new(),
+                output_width: 1280,
+                output_height: 720,
+                quality: CliRenderQuality::Studio,
+                fps: 60,
+                saved_path: None,
                 finished_message: None,
+                full_res_frame: None,
+                anim_frames: Vec::new(),
+                frame_revision: 0,
+                anim_generation: 0,
+                just_finished_anim: false,
             })),
             bg_render_cancel: Arc::new(AtomicBool::new(false)),
             updater: UpdaterHandle::new(),
@@ -780,6 +1093,53 @@ impl LiquidApp {
         self.last_step_time_ms = start.elapsed().as_secs_f32() * 1000.0;
     }
 
+    fn make_preview_frame(
+        rgb: &[u8],
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> PreviewFrameRgb {
+        if src_w == dst_w && src_h == dst_h {
+            return PreviewFrameRgb {
+                width: src_w,
+                height: src_h,
+                rgb: Arc::new(rgb.to_vec()),
+            };
+        }
+        let mut out = vec![0u8; dst_w * dst_h * 3];
+        let sx = src_w as f32 / dst_w.max(1) as f32;
+        let sy = src_h as f32 / dst_h.max(1) as f32;
+        for y in 0..dst_h {
+            let fy = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, (src_h.saturating_sub(1)) as f32);
+            let y0 = fy as usize;
+            let y1 = (y0 + 1).min(src_h.saturating_sub(1));
+            let wy = fy - y0 as f32;
+            for x in 0..dst_w {
+                let fx = ((x as f32 + 0.5) * sx - 0.5).clamp(0.0, (src_w.saturating_sub(1)) as f32);
+                let x0 = fx as usize;
+                let x1 = (x0 + 1).min(src_w.saturating_sub(1));
+                let wx = fx - x0 as f32;
+
+                let i00 = (y0 * src_w + x0) * 3;
+                let i10 = (y0 * src_w + x1) * 3;
+                let i01 = (y1 * src_w + x0) * 3;
+                let i11 = (y1 * src_w + x1) * 3;
+                let dst = (y * dst_w + x) * 3;
+                for c in 0..3 {
+                    let top = rgb[i00 + c] as f32 * (1.0 - wx) + rgb[i10 + c] as f32 * wx;
+                    let bot = rgb[i01 + c] as f32 * (1.0 - wx) + rgb[i11 + c] as f32 * wx;
+                    out[dst + c] = (top * (1.0 - wy) + bot * wy + 0.5).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        PreviewFrameRgb {
+            width: dst_w,
+            height: dst_h,
+            rgb: Arc::new(out),
+        }
+    }
+
     pub fn export_current_png(&mut self) {
         let dir = std::path::Path::new(&self.export_path);
         if let Err(e) = std::fs::create_dir_all(dir) {
@@ -789,67 +1149,284 @@ impl LiquidApp {
         let path = dir.join(format!("fluid_frame_{:05}.png", self.exported_frames_count));
         let width = self.video_width.max(320);
         let height = self.video_height.max(240);
+        let t_start = Instant::now();
 
-        let mut sw = SoftwareRenderer::new_with_quality(width, height, self.gui_render_quality);
-        sw.enable_culling = self.enable_culling;
-        sw.lit_spheres = self.lit_spheres;
-        sw.particle_foam = self.particle_foam;
-        sw.env_preset = self.mesh_config.env_preset;
-        sw.exposure = self.mesh_config.exposure;
-        sw.show_grid = self.mesh_config.show_grid;
-        sw.show_wireframe = self.mesh_config.show_wireframe;
-        sw.light_dir = self.mesh_config.light_dir;
-        sw.light_intensity = self.mesh_config.light_intensity;
-        sw.ambient_intensity = self.mesh_config.ambient_intensity;
+        let mut mcfg = self.mesh_config.clone();
+        self.gui_render_quality
+            .apply_to_mesh_config(&mut mcfg, false, false);
 
-        match self.render_mode {
-            RenderMode::Particles => {
-                sw.render_particles_studio(
-                    &self.solver.particles,
-                    self.solver.config.particle_radius * self.display_size_factor,
-                    &self.solver.chamber,
-                    self.solver.bounds,
-                    &self.solver.colliders,
-                    &self.camera,
-                    self.color_mode,
-                    self.color_map,
-                    self.solver.config.rest_density,
-                    self.is_2d,
-                );
-            }
-            RenderMode::SurfaceMesh => {
-                let mut mcfg = self.mesh_config.clone();
-                self.gui_render_quality
-                    .apply_to_mesh_config(&mut mcfg, false, false);
-                let mesh = SurfaceMesh::from_particles(
-                    &self.solver.particles,
-                    self.solver.config.particle_radius,
-                    self.solver.config.smoothing_length,
-                    &mcfg,
-                );
-                sw.render_surface_mesh_frame(
-                    &mesh,
-                    &mcfg,
-                    &self.camera,
-                    &self.solver.chamber,
-                    self.solver.bounds,
-                    &self.solver.colliders,
-                    self.sim_time,
-                    self.is_2d,
-                );
-            }
-        }
+        let mut off = GuiOfflineRenderer::new(
+            width,
+            height,
+            self.gui_render_quality,
+            self.use_gpu,
+            None,
+            self.enable_culling,
+            self.lit_spheres,
+            self.particle_foam,
+            &mcfg,
+        );
+        let backend_lbl = off.backend_label();
+        let rgb_slice = off.render_frame(
+            self.render_mode,
+            &self.solver.particles,
+            None,
+            self.solver.config.particle_radius,
+            self.solver.config.smoothing_length,
+            self.display_size_factor,
+            self.solver.config.rest_density,
+            &mcfg,
+            &self.camera,
+            &self.solver.chamber,
+            self.solver.bounds,
+            &self.solver.colliders,
+            self.color_mode,
+            self.color_map,
+            self.sim_time,
+            self.is_2d,
+        );
 
-        match PngExporter::save_rgb(&path, width, height, &sw.rgb_buffer) {
+        let rgb_vec = rgb_slice.to_vec();
+        let elapsed = t_start.elapsed().as_secs_f32();
+
+        match PngExporter::save_rgb(&path, width, height, &rgb_vec) {
             Ok(_) => {
-                self.status_message =
-                    format!("Saved {}x{} PNG to {}", width, height, path.display());
+                let path_str = path.display().to_string();
+                self.status_message = format!("Saved {}x{} PNG to {}", width, height, path_str);
                 self.exported_frames_count += 1;
+                if let Ok(mut g) = self.bg_render.lock() {
+                    if !g.is_running {
+                        g.kind = StudioRenderKind::StillFrame;
+                        g.completed_frames = 1;
+                        g.total_frames = 1;
+                        g.elapsed_secs = elapsed;
+                        g.backend_label = backend_lbl;
+                        g.output_width = width;
+                        g.output_height = height;
+                        g.quality = self.gui_render_quality;
+                        g.saved_path = Some(path_str);
+                        g.full_res_frame = Some(PreviewFrameRgb {
+                            width,
+                            height,
+                            rgb: Arc::new(rgb_vec),
+                        });
+                        g.anim_frames.clear();
+                        g.frame_revision = g.frame_revision.wrapping_add(1);
+                    }
+                }
             }
             Err(e) => {
                 self.status_message = format!("PNG export error: {}", e);
             }
         }
+    }
+
+    /// Save the currently displayed studio render result (full-res still or current animation frame) to PNG.
+    pub fn save_rendered_result_png(&mut self) {
+        let frame_opt = {
+            if let Ok(g) = self.bg_render.lock() {
+                if !g.anim_frames.is_empty() {
+                    let idx = self.anim_play_idx.min(g.anim_frames.len() - 1);
+                    if idx + 1 == g.anim_frames.len() && g.full_res_frame.is_some() {
+                        g.full_res_frame.clone()
+                    } else {
+                        Some(g.anim_frames[idx].clone())
+                    }
+                } else {
+                    g.full_res_frame.clone()
+                }
+            } else {
+                None
+            }
+        };
+
+        let Some(frame) = frame_opt else {
+            self.status_message = "No rendered image available to save yet".to_string();
+            return;
+        };
+
+        let dir = std::path::Path::new(&self.export_path);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            self.status_message = format!("PNG save error: {}", e);
+            return;
+        }
+        let path = dir.join(format!("render_result_{:05}.png", self.exported_frames_count));
+        match PngExporter::save_rgb(&path, frame.width, frame.height, &frame.rgb) {
+            Ok(_) => {
+                let p_str = path.display().to_string();
+                self.exported_frames_count += 1;
+                self.status_message = format!(
+                    "Saved rendered image ({}x{}) to {}",
+                    frame.width, frame.height, p_str
+                );
+                if let Ok(mut g) = self.bg_render.lock() {
+                    g.saved_path = Some(p_str);
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("PNG save error: {}", e);
+            }
+        }
+    }
+
+    /// Launch a non-blocking Studio Still Frame render of the current simulation state and display the end result.
+    pub fn start_gui_still_render(&mut self, ctx: Option<egui::Context>, save_to_disk: bool) {
+        if let Ok(guard) = self.bg_render.lock() {
+            if guard.is_running {
+                return;
+            }
+        }
+
+        let width = self.video_width.max(320);
+        let height = self.video_height.max(240);
+        let rq = self.gui_render_quality;
+        let render_mode = self.render_mode;
+        let mut mesh_cfg = self.mesh_config.clone();
+        rq.apply_to_mesh_config(&mut mesh_cfg, false, false);
+
+        let particles = self.solver.particles.clone();
+        let particle_radius = self.solver.config.particle_radius;
+        let smoothing_length = self.solver.config.smoothing_length;
+        let rest_density = self.solver.config.rest_density;
+        let display_size_factor = self.display_size_factor;
+        let camera = self.camera.clone();
+        let chamber = self.solver.chamber.clone();
+        let bounds = self.solver.bounds;
+        let colliders = self.solver.colliders.clone();
+        let color_mode = self.color_mode;
+        let color_map = self.color_map;
+        let sim_time = self.sim_time;
+        let is_2d = self.is_2d;
+        let use_gpu = self.use_gpu;
+        let enable_culling = self.enable_culling;
+        let lit_spheres = self.lit_spheres;
+        let particle_foam = self.particle_foam;
+
+        let save_target = if save_to_disk {
+            let dir = std::path::PathBuf::from(&self.export_path);
+            let idx = self.exported_frames_count;
+            self.exported_frames_count += 1;
+            Some((dir, format!("render_frame_{:05}.png", idx)))
+        } else {
+            None
+        };
+
+        self.anim_playing = false;
+        self.bg_render_cancel.store(false, Ordering::SeqCst);
+        let state_arc = Arc::clone(&self.bg_render);
+
+        if let Ok(mut g) = state_arc.lock() {
+            g.is_running = true;
+            g.kind = StudioRenderKind::StillFrame;
+            g.completed_frames = 0;
+            g.total_frames = 1;
+            g.elapsed_secs = 0.0;
+            g.output_width = width;
+            g.output_height = height;
+            g.quality = rq;
+            g.saved_path = None;
+            g.finished_message = None;
+            g.just_finished_anim = false;
+        }
+        self.status_message = format!(
+            "Rendering {}x{} Studio frame ({})...",
+            width,
+            height,
+            rq.name()
+        );
+
+        std::thread::spawn(move || {
+            let t_start = Instant::now();
+            let mut off = GuiOfflineRenderer::new(
+                width,
+                height,
+                rq,
+                use_gpu,
+                None,
+                enable_culling,
+                lit_spheres,
+                particle_foam,
+                &mesh_cfg,
+            );
+            let backend_lbl = off.backend_label();
+            let rgb_slice = off.render_frame(
+                render_mode,
+                &particles,
+                None,
+                particle_radius,
+                smoothing_length,
+                display_size_factor,
+                rest_density,
+                &mesh_cfg,
+                &camera,
+                &chamber,
+                bounds,
+                &colliders,
+                color_mode,
+                color_map,
+                sim_time,
+                is_2d,
+            );
+            let rgb_vec = rgb_slice.to_vec();
+            let elapsed = t_start.elapsed().as_secs_f32();
+
+            let mut saved_path_str = None;
+            let mut err_str = None;
+            if let Some((dir, fname)) = save_target {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    err_str = Some(format!("PNG save error: {}", e));
+                } else {
+                    let full_p = dir.join(fname);
+                    match PngExporter::save_rgb(&full_p, width, height, &rgb_vec) {
+                        Ok(_) => saved_path_str = Some(full_p.display().to_string()),
+                        Err(e) => err_str = Some(format!("PNG save error: {}", e)),
+                    }
+                }
+            }
+
+            if let Ok(mut g) = state_arc.lock() {
+                g.is_running = false;
+                g.kind = StudioRenderKind::StillFrame;
+                g.completed_frames = 1;
+                g.total_frames = 1;
+                g.elapsed_secs = elapsed;
+                g.backend_label = backend_lbl.clone();
+                g.output_width = width;
+                g.output_height = height;
+                g.quality = rq;
+                g.saved_path = saved_path_str.clone();
+                g.full_res_frame = Some(PreviewFrameRgb {
+                    width,
+                    height,
+                    rgb: Arc::new(rgb_vec),
+                });
+                g.anim_frames.clear();
+                g.frame_revision = g.frame_revision.wrapping_add(1);
+                g.finished_message = Some(if let Some(e) = err_str {
+                    e
+                } else if let Some(ref p) = saved_path_str {
+                    format!(
+                        "Rendered {}x{} frame in {:.0} ms [{}] -> {}",
+                        width,
+                        height,
+                        elapsed * 1000.0,
+                        backend_lbl,
+                        p
+                    )
+                } else {
+                    format!(
+                        "Rendered {}x{} studio frame in {:.0} ms [{}]",
+                        width,
+                        height,
+                        elapsed * 1000.0,
+                        backend_lbl
+                    )
+                });
+            }
+            if let Some(c) = ctx {
+                c.request_repaint();
+            }
+        });
     }
 
     pub fn export_current_frame(&mut self) {
@@ -908,14 +1485,24 @@ impl LiquidApp {
         }
     }
 
-    /// Launch a non-blocking studio MP4 render directly from the GUI using current scene & surface mesh settings.
+    /// Launch a non-blocking studio animation render directly from the GUI using current scene & optics settings.
     pub fn start_gui_mp4_render(&mut self) {
+        self.start_gui_mp4_render_with_ctx(None);
+    }
+
+    /// Launch a non-blocking studio animation render, streaming rendered frames into the GUI Render Result player
+    /// and optionally encoding an H.264 MP4 video file.
+    pub fn start_gui_mp4_render_with_ctx(&mut self, ctx: Option<egui::Context>) {
         if let Ok(guard) = self.bg_render.lock() {
             if guard.is_running {
                 return;
             }
         }
 
+        self.is_playing = false;
+        self.anim_playing = false;
+
+        let save_mp4 = self.render_save_mp4;
         let out_path = if self.cli_mp4_output.trim().is_empty() {
             "simulation.mp4".to_string()
         } else {
@@ -928,12 +1515,33 @@ impl LiquidApp {
         let width = ((self.video_width.max(320) + 1) & !1).max(320);
         let height = ((self.video_height.max(240) + 1) & !1).max(240);
 
-        // Clone an independent simulation snapshot starting cleanly from the current preset & scene objects
+        let max_budget_pixels =
+            ((384usize * 1024 * 1024) / 3 / total_frames.max(1)).clamp(640 * 360, 1920 * 1080);
+        let full_pixels = width * height;
+        let (prev_w, prev_h) = if full_pixels <= max_budget_pixels {
+            (width, height)
+        } else {
+            let scale = (max_budget_pixels as f64 / full_pixels as f64).sqrt();
+            let pw = ((width as f64 * scale).round() as usize).max(160);
+            let ph = ((height as f64 * scale).round() as usize).max(90);
+            (pw, ph)
+        };
+
+        // Snapshot either a fresh t=0 preset scene or the current live fluid state
         let active_cfg = self.solver.config.clone();
         let mut render_solver = SphSolver::new(self.solver.bounds, active_cfg.clone());
         render_solver.set_2d(self.is_2d);
         render_solver.set_chamber(self.solver.chamber.clone());
-        SceneGenerator::setup_scene(&mut render_solver, self.current_preset);
+        let initial_anim_t = match self.render_anim_start {
+            AnimationStartSource::PresetStart => {
+                SceneGenerator::setup_scene(&mut render_solver, self.current_preset);
+                0.0
+            }
+            AnimationStartSource::CurrentState => {
+                render_solver.particles = self.solver.particles.clone();
+                self.sim_time
+            }
+        };
         render_solver.config = active_cfg;
         render_solver.colliders = self.solver.colliders.clone();
         render_solver.faucets = self.solver.faucets.clone();
@@ -965,31 +1573,54 @@ impl LiquidApp {
 
         if let Ok(mut guard) = state_arc.lock() {
             guard.is_running = true;
+            guard.kind = StudioRenderKind::Animation;
             guard.completed_frames = 0;
             guard.total_frames = total_frames;
             guard.elapsed_secs = 0.0;
+            guard.output_width = width;
+            guard.output_height = height;
+            guard.quality = rq;
+            guard.fps = fps;
+            guard.saved_path = None;
             guard.finished_message = None;
+            guard.full_res_frame = None;
+            guard.anim_frames.clear();
+            guard.anim_frames.reserve(total_frames.min(1800));
+            guard.anim_generation = guard.anim_generation.wrapping_add(1);
+            guard.just_finished_anim = false;
         }
-        self.status_message = format!("Rendering {} ({} frames)...", out_path, total_frames);
+        self.status_message = if save_mp4 {
+            format!(
+                "Rendering {}x{} animation ({} frames) -> {}...",
+                width, height, total_frames, out_path
+            )
+        } else {
+            format!(
+                "Rendering {}x{} studio animation ({} frames)...",
+                width, height, total_frames
+            )
+        };
 
         std::thread::spawn(move || {
             let t_start = Instant::now();
-            let mut encoder = match Mp4Encoder::new_with_encoding(
-                &out_path,
-                width,
-                height,
-                fps,
-                rq.ffmpeg_preset(),
-                rq.ffmpeg_crf(),
-            ) {
-                Ok(enc) => enc,
-                Err(e) => {
-                    if let Ok(mut g) = state_arc.lock() {
-                        g.is_running = false;
-                        g.finished_message = Some(format!("MP4 error: {}", e));
+            let mut mp4_warn: Option<String> = None;
+            let mut encoder = if save_mp4 {
+                match Mp4Encoder::new_with_encoding(
+                    &out_path,
+                    width,
+                    height,
+                    fps,
+                    rq.ffmpeg_preset(),
+                    rq.ffmpeg_crf(),
+                ) {
+                    Ok(enc) => Some(enc),
+                    Err(e) => {
+                        mp4_warn = Some(format!("MP4 file skipped ({})", e));
+                        None
                     }
-                    return;
                 }
+            } else {
+                None
             };
 
             let mut gpu_opt = if use_gpu {
@@ -1003,20 +1634,37 @@ impl LiquidApp {
                 None
             };
 
-            let mut sw = SoftwareRenderer::new_with_quality(width, height, rq);
-            sw.enable_culling = enable_culling;
-            sw.lit_spheres = lit_spheres;
-            sw.particle_foam = particle_foam;
-            sw.env_preset = mesh_cfg.env_preset;
-            sw.exposure = mesh_cfg.exposure;
-            sw.show_grid = mesh_cfg.show_grid;
-            sw.show_wireframe = mesh_cfg.show_wireframe;
-            sw.light_dir = mesh_cfg.light_dir;
-            sw.light_intensity = mesh_cfg.light_intensity;
-            sw.ambient_intensity = mesh_cfg.ambient_intensity;
+            let mut off = GuiOfflineRenderer::new(
+                width,
+                height,
+                rq,
+                use_gpu,
+                gpu_opt.as_ref(),
+                enable_culling,
+                lit_spheres,
+                particle_foam,
+                &mesh_cfg,
+            );
+            let backend_lbl = off.backend_label();
+            if let Ok(mut g) = state_arc.lock() {
+                g.backend_label = backend_lbl.clone();
+            }
 
-            let mut anim_t = 0.0f32;
+            let has_mesh_col = render_solver
+                .colliders
+                .iter()
+                .any(|c| c.enabled && matches!(c.shape, ColliderShape::Mesh(_)));
+            let has_drains = !render_solver.drains.is_empty();
+            let need_mesh = render_mode == RenderMode::SurfaceMesh;
+            let need_cpu_render = matches!(off, GuiOfflineRenderer::Cpu(_))
+                || gpu_opt
+                    .as_ref()
+                    .map_or(true, |gs| !gs.supports_vertex_storage());
+            let need_cpu_particles = has_mesh_col || has_drains || need_mesh || need_cpu_render;
+
+            let mut anim_t = initial_anim_t;
             let mut done = 0usize;
+            let mut cpu_particles_synced = true;
 
             for _frame in 0..total_frames {
                 if cancel_flag.load(Ordering::SeqCst) {
@@ -1026,7 +1674,13 @@ impl LiquidApp {
                 if let Some(ref mut gpu) = gpu_opt {
                     let prev_n = render_solver.particles.len();
                     render_solver.emit_faucets(dt);
-                    if render_solver.particles.len() != prev_n {
+                    let new_n = render_solver.particles.len();
+                    if new_n != prev_n {
+                        if new_n > gpu.particle_capacity && !cpu_particles_synced {
+                            let newly_emitted = render_solver.particles.split_off(prev_n);
+                            gpu.read_particles(&mut render_solver.particles);
+                            render_solver.particles.extend(newly_emitted);
+                        }
                         gpu.sync_particles(
                             render_solver.bounds,
                             &render_solver.config,
@@ -1045,39 +1699,53 @@ impl LiquidApp {
                         dt,
                         is_2d,
                     );
-                    gpu.read_particles(&mut render_solver.particles);
 
-                    let has_mesh_col = render_solver
-                        .colliders
-                        .iter()
-                        .any(|c| c.enabled && matches!(c.shape, ColliderShape::Mesh(_)));
-                    if has_mesh_col {
-                        let radius = render_solver.config.particle_radius;
-                        let colliders = &render_solver.colliders;
-                        let b_min = render_solver.bounds.min + Vec3::splat(radius);
-                        let b_max = render_solver.bounds.max - Vec3::splat(radius);
-                        let hit = render_solver
-                            .particles
-                            .par_iter_mut()
-                            .map(|p| {
-                                let mut p_hit = false;
-                                for col in colliders {
-                                    if let ColliderShape::Mesh(_) = &col.shape {
-                                        p_hit |=
-                                            col.resolve(&mut p.position, &mut p.velocity, radius);
+                    if need_cpu_particles {
+                        gpu.read_particles(&mut render_solver.particles);
+                        cpu_particles_synced = true;
+
+                        if has_mesh_col {
+                            let radius = render_solver.config.particle_radius;
+                            let colliders = &render_solver.colliders;
+                            let b_min = render_solver.bounds.min + Vec3::splat(radius);
+                            let b_max = render_solver.bounds.max - Vec3::splat(radius);
+                            let hit = render_solver
+                                .particles
+                                .par_iter_mut()
+                                .map(|p| {
+                                    let mut p_hit = false;
+                                    for col in colliders {
+                                        if let ColliderShape::Mesh(_) = &col.shape {
+                                            p_hit |= col.resolve(
+                                                &mut p.position,
+                                                &mut p.velocity,
+                                                radius,
+                                            );
+                                        }
                                     }
-                                }
-                                if p_hit {
-                                    p.position = p.position.clamp(b_min.min(b_max), b_max.max(b_min));
-                                    if is_2d {
-                                        p.position.z = 0.0;
-                                        p.velocity.z = 0.0;
+                                    if p_hit {
+                                        p.position =
+                                            p.position.clamp(b_min.min(b_max), b_max.max(b_min));
+                                        if is_2d {
+                                            p.position.z = 0.0;
+                                            p.velocity.z = 0.0;
+                                        }
                                     }
-                                }
-                                p_hit
-                            })
-                            .reduce(|| false, |a, b| a || b);
-                        if hit {
+                                    p_hit
+                                })
+                                .reduce(|| false, |a, b| a || b);
+                            if hit {
+                                gpu.sync_particles(
+                                    render_solver.bounds,
+                                    &render_solver.config,
+                                    &render_solver.particles,
+                                    false,
+                                );
+                            }
+                        }
+
+                        let drained = render_solver.drain_particles();
+                        if drained > 0 {
                             gpu.sync_particles(
                                 render_solver.bounds,
                                 &render_solver.config,
@@ -1085,86 +1753,102 @@ impl LiquidApp {
                                 false,
                             );
                         }
-                    }
-
-                    let drained = render_solver.drain_particles();
-                    if drained > 0 {
-                        gpu.sync_particles(
-                            render_solver.bounds,
-                            &render_solver.config,
-                            &render_solver.particles,
-                            false,
-                        );
+                    } else {
+                        cpu_particles_synced = false;
                     }
                 } else {
                     render_solver.step(dt);
                 }
                 anim_t += dt;
 
-                match render_mode {
-                    RenderMode::Particles => {
-                        sw.render_particles_studio(
-                            &render_solver.particles,
-                            render_solver.config.particle_radius * display_size_factor,
-                            &render_solver.chamber,
-                            render_solver.bounds,
-                            &render_solver.colliders,
-                            &camera,
-                            color_mode,
-                            color_map,
-                            render_solver.config.rest_density,
-                            is_2d,
-                        );
-                    }
-                    RenderMode::SurfaceMesh => {
-                        let mesh = SurfaceMesh::from_particles(
-                            &render_solver.particles,
-                            render_solver.config.particle_radius,
-                            render_solver.config.smoothing_length,
-                            &mesh_cfg,
-                        );
-                        sw.render_surface_mesh_frame(
-                            &mesh,
-                            &mesh_cfg,
-                            &camera,
-                            &render_solver.chamber,
-                            render_solver.bounds,
-                            &render_solver.colliders,
-                            anim_t,
-                            is_2d,
-                        );
-                    }
-                }
+                let rgb_slice = off.render_frame(
+                    render_mode,
+                    &render_solver.particles,
+                    gpu_opt.as_ref(),
+                    render_solver.config.particle_radius,
+                    render_solver.config.smoothing_length,
+                    display_size_factor,
+                    render_solver.config.rest_density,
+                    &mesh_cfg,
+                    &camera,
+                    &render_solver.chamber,
+                    render_solver.bounds,
+                    &render_solver.colliders,
+                    color_mode,
+                    color_map,
+                    anim_t,
+                    is_2d,
+                );
 
                 camera.azimuth += orbit_rad_per_sec * wall_frame_dt;
 
-                if let Err(e) = encoder.write_frame(&sw.rgb_buffer) {
-                    if let Ok(mut g) = state_arc.lock() {
-                        g.is_running = false;
-                        g.finished_message = Some(format!("Encode error: {}", e));
+                let preview = Self::make_preview_frame(rgb_slice, width, height, prev_w, prev_h);
+
+                if let Some(ref mut enc) = encoder {
+                    if let Err(e) = enc.write_frame(rgb_slice) {
+                        mp4_warn = Some(format!("MP4 encode error: {}", e));
+                        encoder = None;
                     }
-                    return;
                 }
 
                 done += 1;
                 if let Ok(mut g) = state_arc.lock() {
+                    g.anim_frames.push(preview);
                     g.completed_frames = done;
                     g.elapsed_secs = t_start.elapsed().as_secs_f32();
+                    g.frame_revision = g.frame_revision.wrapping_add(1);
+                }
+                if let Some(ref c) = ctx {
+                    c.request_repaint();
                 }
             }
 
-            let finish_res = encoder.finish();
+            let saved_mp4 = if let Some(enc) = encoder {
+                match enc.finish() {
+                    Ok(_) if done > 0 => Some(out_path.clone()),
+                    Ok(_) => None,
+                    Err(e) => {
+                        mp4_warn = Some(format!("FFmpeg finalize error: {}", e));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let elapsed = t_start.elapsed().as_secs_f32();
             if let Ok(mut g) = state_arc.lock() {
                 g.is_running = false;
                 g.completed_frames = done;
-                g.elapsed_secs = t_start.elapsed().as_secs_f32();
-                g.finished_message = Some(match finish_res {
-                    Ok(_) => format!(
-                        "Saved {} ({} frames in {:.1}s)",
-                        out_path, done, g.elapsed_secs
-                    ),
-                    Err(e) => format!("FFmpeg finalize error: {}", e),
+                g.elapsed_secs = elapsed;
+                g.saved_path = saved_mp4.clone();
+                if done > 0 {
+                    g.full_res_frame = Some(PreviewFrameRgb {
+                        width,
+                        height,
+                        rgb: Arc::new(off.current_rgb().to_vec()),
+                    });
+                    g.just_finished_anim = true;
+                }
+                g.finished_message = Some(if let Some(ref p) = saved_mp4 {
+                    format!(
+                        "Rendered {} frames in {:.1}s [{}] -> {}",
+                        done, elapsed, backend_lbl, p
+                    )
+                } else if let Some(w) = mp4_warn {
+                    format!(
+                        "Rendered {} frames in {:.1}s [{}] ({})",
+                        done, elapsed, backend_lbl, w
+                    )
+                } else {
+                    format!(
+                        "Rendered {} frames in {:.1}s [{}]",
+                        done, elapsed, backend_lbl
+                    )
                 });
+            }
+            if let Some(c) = ctx {
+                c.request_repaint();
             }
         });
     }
@@ -1885,6 +2569,24 @@ impl LiquidApp {
                     egui::Stroke::new(1.8_f32, color),
                 );
             }
+            UiIcon::StepBack => {
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x - 3.4, center.y - 4.2),
+                        egui::pos2(center.x - 3.4, center.y + 4.2),
+                    ],
+                    egui::Stroke::new(1.8_f32, color),
+                );
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(center.x + 4.4, center.y - 4.0),
+                        egui::pos2(center.x - 1.4, center.y),
+                        egui::pos2(center.x + 4.4, center.y + 4.0),
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            }
             UiIcon::Reset => {
                 painter.circle_stroke(center, 4.3, s);
                 painter.add(egui::Shape::convex_polygon(
@@ -2092,6 +2794,65 @@ impl LiquidApp {
                     fg,
                 );
             }
+        }
+        response
+    }
+
+    fn inspector_tab_button(
+        ui: &mut egui::Ui,
+        icon: UiIcon,
+        label: &str,
+        selected: bool,
+        width: f32,
+    ) -> egui::Response {
+        let font_id = egui::FontId::proportional(11.5);
+        let galley = ui.fonts(|f| {
+            f.layout_no_wrap(label.to_string(), font_id.clone(), egui::Color32::WHITE)
+        });
+        let text_w = galley.size().x;
+        let icon_w = 11.5;
+        let gap = 4.0;
+        let desired = egui::vec2(width, 26.0);
+
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let visuals = ui.style().interact_selectable(&response, selected);
+            let bg = if selected {
+                egui::Color32::from_rgb(20, 110, 200)
+            } else {
+                visuals.bg_fill
+            };
+            let stroke = if selected {
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(88, 184, 255))
+            } else {
+                visuals.bg_stroke
+            };
+            let fg = if selected {
+                egui::Color32::WHITE
+            } else {
+                visuals.fg_stroke.color
+            };
+
+            let p = ui.painter();
+            p.rect(
+                rect,
+                visuals.corner_radius,
+                bg,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+
+            let content_w = icon_w + gap + text_w;
+            let start_x = rect.center().x - content_w * 0.5;
+            let icon_center = egui::pos2(start_x + icon_w * 0.5, rect.center().y);
+            Self::paint_icon(p, icon_center, icon, fg);
+            p.text(
+                egui::pos2(start_x + icon_w + gap, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                font_id,
+                fg,
+            );
         }
         response
     }
@@ -3778,6 +4539,444 @@ impl LiquidApp {
         });
     }
 
+    fn draw_render_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let (
+            is_running,
+            bg_kind,
+            done,
+            total,
+            elapsed,
+            has_still,
+            anim_len,
+            backend_lbl,
+            out_w,
+            out_h,
+            qual,
+            saved_path,
+        ) = {
+            if let Ok(g) = self.bg_render.lock() {
+                (
+                    g.is_running,
+                    g.kind,
+                    g.completed_frames,
+                    g.total_frames,
+                    g.elapsed_secs,
+                    g.full_res_frame.is_some(),
+                    g.anim_frames.len(),
+                    g.backend_label.clone(),
+                    g.output_width,
+                    g.output_height,
+                    g.quality,
+                    g.saved_path.clone(),
+                )
+            } else {
+                (
+                    false,
+                    StudioRenderKind::StillFrame,
+                    0,
+                    0,
+                    0.0,
+                    false,
+                    0,
+                    String::new(),
+                    self.video_width,
+                    self.video_height,
+                    self.gui_render_quality,
+                    None,
+                )
+            }
+        };
+        let has_result = has_still || anim_len > 0;
+
+        // 1. Studio Render Mode, Resolution & Optics Quality
+        Self::section_card(ui, "Studio Render Setup", |ui| {
+            ui.horizontal(|ui| {
+                let half_w = (ui.available_width() - 6.0) * 0.5;
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Camera,
+                    "Still Image",
+                    self.render_kind == StudioRenderKind::StillFrame,
+                    Some(egui::vec2(half_w, 27.0)),
+                )
+                .on_hover_text("Render a high-resolution supersampled studio still frame")
+                .clicked()
+                {
+                    self.render_kind = StudioRenderKind::StillFrame;
+                }
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Film,
+                    "Video Animation",
+                    self.render_kind == StudioRenderKind::Animation,
+                    Some(egui::vec2(half_w, 27.0)),
+                )
+                .on_hover_text("Simulate & render a multi-frame animation with in-GUI playback and MP4 export")
+                .clicked()
+                {
+                    self.render_kind = StudioRenderKind::Animation;
+                }
+            });
+
+            ui.add_space(2.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Geometry:");
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Spheres,
+                    "Spheres",
+                    self.render_mode == RenderMode::Particles,
+                    None,
+                )
+                .clicked()
+                {
+                    self.render_mode = RenderMode::Particles;
+                }
+                if Self::icon_button(
+                    ui,
+                    UiIcon::Mesh,
+                    "Surface Mesh",
+                    self.render_mode == RenderMode::SurfaceMesh,
+                    None,
+                )
+                .clicked()
+                {
+                    self.render_mode = RenderMode::SurfaceMesh;
+                    self.mesh_dirty = true;
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Resolution:");
+                for &(w, h, lbl) in &[
+                    (1280usize, 720usize, "720p"),
+                    (1920usize, 1080usize, "1080p"),
+                    (2560usize, 1440usize, "1440p"),
+                    (3840usize, 2160usize, "4K"),
+                    (1080usize, 1920usize, "9:16"),
+                ] {
+                    if ui
+                        .selectable_label(self.video_width == w && self.video_height == h, lbl)
+                        .clicked()
+                    {
+                        self.video_width = w;
+                        self.video_height = h;
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Custom Size:");
+                let mut w_i = self.video_width as u32;
+                let mut h_i = self.video_height as u32;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut w_i)
+                            .range(320..=7680)
+                            .speed(4)
+                            .suffix(" px"),
+                    )
+                    .changed()
+                {
+                    self.video_width = ((w_i as usize + 1) & !1).clamp(320, 7680);
+                }
+                ui.label("×");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut h_i)
+                            .range(240..=4320)
+                            .speed(4)
+                            .suffix(" px"),
+                    )
+                    .changed()
+                {
+                    self.video_height = ((h_i as usize + 1) & !1).clamp(240, 4320);
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Optics Tier:");
+                for &rq in CliRenderQuality::ALL {
+                    let short = match rq {
+                        CliRenderQuality::Standard => "Standard",
+                        CliRenderQuality::Studio => "Studio 2x",
+                        CliRenderQuality::Cinema => "Cinema 3x",
+                        CliRenderQuality::Master => "Master 4x",
+                    };
+                    if ui
+                        .selectable_label(self.gui_render_quality == rq, short)
+                        .on_hover_text(rq.name())
+                        .clicked()
+                    {
+                        self.gui_render_quality = rq;
+                    }
+                }
+            });
+            ui.weak(format!(
+                "{}x SSAA • {}px soft shadow map • H.264 CRF {}",
+                self.gui_render_quality.ssaa_factor(),
+                self.gui_render_quality.shadow_res(),
+                self.gui_render_quality.ffmpeg_crf(),
+            ));
+
+            ui.checkbox(
+                &mut self.use_gpu,
+                "Hardware Vulkan GPU Rendering & Compute",
+            )
+            .on_hover_text(
+                "Uses Vulkan wgpu offscreen SSAA rasterizer + GPU Marching Cubes (falls back to multi-core CPU when unchecked)",
+            );
+        });
+
+        ui.add_space(6.0);
+
+        // 2. Still Image OR Video Animation Render Trigger Card
+        match self.render_kind {
+            StudioRenderKind::StillFrame => {
+                Self::section_card(ui, "Still Frame Render", |ui| {
+                    ui.checkbox(
+                        &mut self.render_auto_save_png,
+                        "Auto-save rendered PNG to exports/ folder",
+                    );
+
+                    ui.add_space(4.0);
+
+                    if is_running {
+                        let txt = if bg_kind == StudioRenderKind::StillFrame {
+                            format!(
+                                "Rendering {}×{} Studio Frame...",
+                                self.video_width, self.video_height
+                            )
+                        } else {
+                            format!("Rendering Animation Frame {}/{}...", done, total)
+                        };
+                        let frac = if total > 1 {
+                            done as f32 / total as f32
+                        } else {
+                            0.5
+                        };
+                        ui.add(egui::ProgressBar::new(frac).animate(true).text(txt));
+                        if bg_kind == StudioRenderKind::Animation
+                            && ui.button("Stop & Finalize").clicked()
+                        {
+                            self.bg_render_cancel.store(true, Ordering::SeqCst);
+                        }
+                        ctx.request_repaint();
+                    } else if Self::icon_button(
+                        ui,
+                        UiIcon::Camera,
+                        "Render Current Frame (F12)",
+                        true,
+                        Some(egui::vec2(ui.available_width(), 32.0)),
+                    )
+                    .on_hover_text(
+                        "Render the current simulation frame at full Studio quality and display the end result",
+                    )
+                    .clicked()
+                    {
+                        self.central_view = CentralView::RenderResult;
+                        self.start_gui_still_render(
+                            Some(ctx.clone()),
+                            self.render_auto_save_png,
+                        );
+                    }
+
+                    if has_result && !is_running {
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            let half_w = (ui.available_width() - 6.0) * 0.5;
+                            if Self::icon_button(
+                                ui,
+                                UiIcon::Save,
+                                "Save Result PNG",
+                                false,
+                                Some(egui::vec2(half_w, 26.0)),
+                            )
+                            .clicked()
+                            {
+                                self.save_rendered_result_png();
+                            }
+                            let toggle_lbl = if self.central_view == CentralView::RenderResult {
+                                "Live 3D View"
+                            } else {
+                                "Show Result"
+                            };
+                            if Self::icon_button(
+                                ui,
+                                UiIcon::Image,
+                                toggle_lbl,
+                                self.central_view == CentralView::RenderResult,
+                                Some(egui::vec2(half_w, 26.0)),
+                            )
+                            .clicked()
+                            {
+                                self.central_view = match self.central_view {
+                                    CentralView::RenderResult => CentralView::LiveViewport,
+                                    CentralView::LiveViewport => CentralView::RenderResult,
+                                };
+                            }
+                        });
+                    }
+                });
+            }
+            StudioRenderKind::Animation => {
+                Self::section_card(ui, "Video Animation Render", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Start From:");
+                        if ui
+                            .selectable_label(
+                                self.render_anim_start == AnimationStartSource::PresetStart,
+                                "Preset Start (t=0)",
+                            )
+                            .on_hover_text("Start cleanly from t = 0s of the active scene preset")
+                            .clicked()
+                        {
+                            self.render_anim_start = AnimationStartSource::PresetStart;
+                        }
+                        if ui
+                            .selectable_label(
+                                self.render_anim_start == AnimationStartSource::CurrentState,
+                                "Current State",
+                            )
+                            .on_hover_text("Continue simulating forward from the current live particles")
+                            .clicked()
+                        {
+                            self.render_anim_start = AnimationStartSource::CurrentState;
+                        }
+                    });
+
+                    ui.add(
+                        egui::Slider::new(&mut self.cli_duration, 0.5..=30.0)
+                            .text("Duration (s)")
+                            .fixed_decimals(1),
+                    );
+
+                    let planned_frames =
+                        (self.cli_duration * self.cli_fps.max(1) as f32).round().max(1.0) as usize;
+                    ui.horizontal(|ui| {
+                        ui.label("FPS:");
+                        for &f in &[24u32, 30, 60, 120] {
+                            if ui
+                                .selectable_label(self.cli_fps == f, format!("{}", f))
+                                .clicked()
+                            {
+                                self.cli_fps = f;
+                            }
+                        }
+                        ui.weak(format!("({} frames)", planned_frames));
+                    });
+
+                    ui.checkbox(&mut self.render_save_mp4, "Save H.264 MP4 video file");
+                    if self.render_save_mp4 {
+                        ui.horizontal(|ui| {
+                            ui.label("Output MP4:");
+                            ui.text_edit_singleline(&mut self.cli_mp4_output);
+                        });
+                    }
+
+                    ui.add_space(4.0);
+
+                    if is_running {
+                        let frac = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let rate = if elapsed > 0.05 && done > 0 {
+                            done as f32 / elapsed
+                        } else {
+                            0.0
+                        };
+                        ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!(
+                            "Frame {}/{} ({:.1}s • {:.1} fps)",
+                            done, total, elapsed, rate
+                        )));
+                        if ui.button("Stop & Finalize Animation").clicked() {
+                            self.bg_render_cancel.store(true, Ordering::SeqCst);
+                        }
+                        ctx.request_repaint();
+                    } else if Self::icon_button(
+                        ui,
+                        UiIcon::Film,
+                        "Render Animation & Show Result",
+                        true,
+                        Some(egui::vec2(ui.available_width(), 32.0)),
+                    )
+                    .clicked()
+                    {
+                        self.central_view = CentralView::RenderResult;
+                        self.start_gui_mp4_render_with_ctx(Some(ctx.clone()));
+                    }
+                });
+            }
+        }
+
+        // 3. End-Result Telemetry & Saved File Card
+        if has_result || is_running {
+            ui.add_space(6.0);
+            Self::section_card(ui, "Rendered End Result", |ui| {
+                egui::Grid::new("render_result_summary_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.weak("Output:");
+                        ui.monospace(format!("{}×{} ({})", out_w, out_h, qual.name()));
+                        ui.end_row();
+
+                        if !backend_lbl.is_empty() {
+                            ui.weak("Backend:");
+                            ui.colored_label(
+                                egui::Color32::from_rgb(114, 198, 255),
+                                &backend_lbl,
+                            );
+                            ui.end_row();
+                        }
+
+                        ui.weak("Result:");
+                        if anim_len > 0 || bg_kind == StudioRenderKind::Animation {
+                            let rate = if elapsed > 0.01 && done > 0 {
+                                done as f32 / elapsed
+                            } else {
+                                0.0
+                            };
+                            ui.monospace(format!(
+                                "{} frames • {:.2}s ({:.1} fps)",
+                                done.max(anim_len),
+                                elapsed,
+                                rate
+                            ));
+                        } else {
+                            ui.monospace(format!("Still frame • {:.0} ms", elapsed * 1000.0));
+                        }
+                        ui.end_row();
+                    });
+
+                if let Some(ref p) = saved_path {
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.weak("Saved:");
+                        ui.monospace(
+                            egui::RichText::new(p)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(120, 224, 158)),
+                        );
+                        if Self::icon_button(ui, UiIcon::Copy, "", false, Some(egui::vec2(22.0, 20.0)))
+                            .on_hover_text("Copy file path to clipboard")
+                            .clicked()
+                        {
+                            ctx.copy_text(p.clone());
+                            self.status_message = format!("Copied path '{}'", p);
+                        }
+                    });
+                }
+
+                ui.add_space(2.0);
+                ui.weak("Tip: Scroll to zoom & drag to pan in Render Result view; double-click to fit.");
+            });
+        }
+    }
+
     fn draw_render_cli_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         // 1. Single-Frame Studio Snapshot & Geometry Export (PNG / PLY / OBJ)
         Self::section_card(ui, "Frame Snapshot & 3D Geometry Export", |ui| {
@@ -3839,140 +5038,23 @@ impl LiquidApp {
 
         ui.add_space(6.0);
 
-        // 2. Direct Studio MP4 Video Renderer
-        Self::section_card(ui, "Studio MP4 Video Renderer", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Mode:");
-                if Self::icon_button(
-                    ui,
-                    UiIcon::Spheres,
-                    "Spheres",
-                    self.render_mode == RenderMode::Particles,
-                    None,
-                )
-                .clicked()
-                {
-                    self.render_mode = RenderMode::Particles;
-                }
-                if Self::icon_button(
-                    ui,
-                    UiIcon::Mesh,
-                    "Surface Mesh",
-                    self.render_mode == RenderMode::SurfaceMesh,
-                    None,
-                )
-                .clicked()
-                {
-                    self.render_mode = RenderMode::SurfaceMesh;
-                    self.mesh_dirty = true;
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Output MP4:");
-                ui.text_edit_singleline(&mut self.cli_mp4_output);
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Resolution:");
-                for &(w, h, lbl) in &[
-                    (1280usize, 720usize, "720p"),
-                    (1920usize, 1080usize, "1080p"),
-                    (2560usize, 1440usize, "1440p"),
-                    (3840usize, 2160usize, "4K"),
-                ] {
-                    if ui
-                        .selectable_label(self.video_width == w && self.video_height == h, lbl)
-                        .clicked()
-                    {
-                        self.video_width = w;
-                        self.video_height = h;
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Optics Tier:");
-                for &rq in CliRenderQuality::ALL {
-                    let short = match rq {
-                        CliRenderQuality::Standard => "Standard",
-                        CliRenderQuality::Studio => "Studio 2x",
-                        CliRenderQuality::Cinema => "Cinema 3x",
-                        CliRenderQuality::Master => "Master 4x",
-                    };
-                    if ui
-                        .selectable_label(self.gui_render_quality == rq, short)
-                        .on_hover_text(rq.name())
-                        .clicked()
-                    {
-                        self.gui_render_quality = rq;
-                    }
-                }
-            });
-
-            ui.add(
-                egui::Slider::new(&mut self.cli_duration, 0.5..=30.0)
-                    .text("Duration (s)")
-                    .fixed_decimals(1),
+        // 2. Quick Link to Dedicated Studio Render Tab
+        Self::section_card(ui, "Studio Image & Video Rendering", |ui| {
+            ui.weak(
+                "Use the Render tab to configure resolution & optics, preview rendered frames, and play back animations right inside the viewport.",
             );
-
-            ui.horizontal(|ui| {
-                ui.label("FPS:");
-                for &f in &[24u32, 30, 60, 120] {
-                    if ui
-                        .selectable_label(self.cli_fps == f, format!("{}", f))
-                        .clicked()
-                    {
-                        self.cli_fps = f;
-                    }
-                }
-            });
-
-            ui.add_space(4.0);
-
-            let (is_running, done, total, elapsed, finished_msg) = {
-                if let Ok(mut g) = self.bg_render.lock() {
-                    let msg = g.finished_message.take();
-                    (
-                        g.is_running,
-                        g.completed_frames,
-                        g.total_frames,
-                        g.elapsed_secs,
-                        msg,
-                    )
-                } else {
-                    (false, 0, 0, 0.0, None)
-                }
-            };
-            if let Some(msg) = finished_msg {
-                self.status_message = msg;
-            }
-
-            if is_running {
-                let frac = if total > 0 {
-                    done as f32 / total as f32
-                } else {
-                    0.0
-                };
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .show_percentage()
-                        .text(format!("Frame {}/{} ({:.1}s)", done, total, elapsed)),
-                );
-                if ui.button("Stop & Finalize Video").clicked() {
-                    self.bg_render_cancel.store(true, Ordering::SeqCst);
-                }
-                ctx.request_repaint();
-            } else if Self::icon_button(
+            ui.add_space(3.0);
+            if Self::icon_button(
                 ui,
-                UiIcon::Film,
-                "Render MP4 Video Now",
-                true,
-                Some(egui::vec2(ui.available_width(), 30.0)),
+                UiIcon::Camera,
+                "Open Studio Render Tab",
+                false,
+                Some(egui::vec2(ui.available_width(), 28.0)),
             )
             .clicked()
             {
-                self.start_gui_mp4_render();
+                self.active_tab = InspectorTab::Render;
+                self.central_view = CentralView::RenderResult;
             }
         });
 
@@ -4026,8 +5108,110 @@ impl eframe::App for LiquidApp {
             self.theme_applied = true;
         }
 
+        // Sync background studio render progress, messages, and animation auto-play state
+        let (
+            bg_is_running,
+            bg_kind,
+            bg_done,
+            bg_total,
+            bg_elapsed,
+            bg_has_still,
+            bg_anim_len,
+            bg_fps,
+            bg_out_w,
+            bg_out_h,
+            bg_qual,
+            bg_backend,
+        ) = {
+            let mut finished_msg = None;
+            let mut start_playback = false;
+            let mut snap = (
+                false,
+                StudioRenderKind::StillFrame,
+                0usize,
+                0usize,
+                0.0f32,
+                false,
+                0usize,
+                60u32,
+                self.video_width,
+                self.video_height,
+                self.gui_render_quality,
+                String::new(),
+            );
+            if let Ok(mut g) = self.bg_render.lock() {
+                finished_msg = g.finished_message.take();
+                if g.just_finished_anim {
+                    g.just_finished_anim = false;
+                    start_playback = true;
+                }
+                snap = (
+                    g.is_running,
+                    g.kind,
+                    g.completed_frames,
+                    g.total_frames,
+                    g.elapsed_secs,
+                    g.full_res_frame.is_some(),
+                    g.anim_frames.len(),
+                    g.fps.max(1),
+                    g.output_width,
+                    g.output_height,
+                    g.quality,
+                    g.backend_label.clone(),
+                );
+            }
+            if let Some(msg) = finished_msg {
+                self.status_message = msg;
+            }
+            if start_playback && snap.6 > 1 {
+                self.central_view = CentralView::RenderResult;
+                self.anim_play_idx = 0;
+                self.anim_accum_secs = 0.0;
+                self.anim_playing = true;
+                self.last_anim_tick = Instant::now();
+            }
+            snap
+        };
+
+        if bg_is_running {
+            if bg_anim_len > 0 {
+                self.anim_play_idx = bg_anim_len - 1;
+            }
+            ctx.request_repaint();
+        }
+
+        // Advance rendered animation playback clock
+        let now_anim = Instant::now();
+        let anim_wall_dt = now_anim
+            .duration_since(self.last_anim_tick)
+            .as_secs_f32()
+            .min(0.1);
+        self.last_anim_tick = now_anim;
+        if self.central_view == CentralView::RenderResult
+            && self.anim_playing
+            && !bg_is_running
+            && bg_anim_len > 1
+        {
+            self.anim_accum_secs += anim_wall_dt * self.anim_speed.max(0.05);
+            let frame_dur = 1.0 / bg_fps as f32;
+            while self.anim_accum_secs >= frame_dur {
+                self.anim_accum_secs -= frame_dur;
+                if self.anim_play_idx + 1 < bg_anim_len {
+                    self.anim_play_idx += 1;
+                } else if self.anim_loop {
+                    self.anim_play_idx = 0;
+                } else {
+                    self.anim_playing = false;
+                    self.anim_accum_secs = 0.0;
+                    break;
+                }
+            }
+            ctx.request_repaint();
+        }
+
         // Studio keyboard shortcuts (only when not typing into a text input widget)
         if !ctx.wants_keyboard_input() {
+            let mut key_space = false;
             let mut key_step = false;
             let mut key_reset = false;
             let mut key_cam = false;
@@ -4036,11 +5220,14 @@ impl eframe::App for LiquidApp {
             let mut key_wire = false;
             let mut key_orbit = false;
             let mut key_png = false;
+            let mut key_f12 = false;
             let mut key_help = false;
+            let mut key_left = false;
+            let mut key_right = false;
 
             ctx.input(|i| {
                 if i.key_pressed(egui::Key::Space) {
-                    self.is_playing = !self.is_playing;
+                    key_space = true;
                 }
                 if i.key_pressed(egui::Key::Period) {
                     key_step = true;
@@ -4063,8 +5250,17 @@ impl eframe::App for LiquidApp {
                 if i.key_pressed(egui::Key::O) {
                     key_orbit = true;
                 }
-                if i.key_pressed(egui::Key::P) || i.key_pressed(egui::Key::F12) {
+                if i.key_pressed(egui::Key::P) {
                     key_png = true;
+                }
+                if i.key_pressed(egui::Key::F12) {
+                    key_f12 = true;
+                }
+                if i.key_pressed(egui::Key::ArrowLeft) {
+                    key_left = true;
+                }
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    key_right = true;
                 }
                 if i.key_pressed(egui::Key::F1)
                     || (i.key_pressed(egui::Key::Slash) && i.modifiers.shift)
@@ -4073,6 +5269,40 @@ impl eframe::App for LiquidApp {
                 }
             });
 
+            if key_space {
+                if self.central_view == CentralView::RenderResult
+                    && !bg_is_running
+                    && bg_anim_len > 1
+                {
+                    if !self.anim_playing && self.anim_play_idx + 1 >= bg_anim_len {
+                        self.anim_play_idx = 0;
+                    }
+                    self.anim_playing = !self.anim_playing;
+                    self.last_anim_tick = Instant::now();
+                } else {
+                    self.is_playing = !self.is_playing;
+                }
+            }
+            if key_left
+                && self.central_view == CentralView::RenderResult
+                && !bg_is_running
+                && bg_anim_len > 1
+            {
+                self.anim_playing = false;
+                self.anim_play_idx = if self.anim_play_idx > 0 {
+                    self.anim_play_idx - 1
+                } else {
+                    bg_anim_len - 1
+                };
+            }
+            if key_right
+                && self.central_view == CentralView::RenderResult
+                && !bg_is_running
+                && bg_anim_len > 1
+            {
+                self.anim_playing = false;
+                self.anim_play_idx = (self.anim_play_idx + 1) % bg_anim_len;
+            }
             if key_step {
                 let dt = self.fixed_dt * self.sim_speed;
                 self.step_simulation_once(dt);
@@ -4082,7 +5312,12 @@ impl eframe::App for LiquidApp {
                 self.load_preset(self.current_preset);
             }
             if key_cam {
-                self.reset_camera_framing();
+                if self.central_view == CentralView::RenderResult {
+                    self.render_zoom = 0.0;
+                    self.render_pan = egui::Vec2::ZERO;
+                } else {
+                    self.reset_camera_framing();
+                }
             }
             if key_mesh {
                 self.render_mode = match self.render_mode {
@@ -4108,6 +5343,11 @@ impl eframe::App for LiquidApp {
             }
             if key_png {
                 self.export_current_png();
+            }
+            if key_f12 {
+                self.active_tab = InspectorTab::Render;
+                self.central_view = CentralView::RenderResult;
+                self.start_gui_still_render(Some(ctx.clone()), self.render_auto_save_png);
             }
             if key_help {
                 self.show_shortcuts_modal = !self.show_shortcuts_modal;
@@ -4436,39 +5676,57 @@ impl eframe::App for LiquidApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.weak(if self.is_2d {
-                            "Space: Play • R: Reset • M: Mesh • P: PNG • ?: Help • L-Drag: Pull • Shift+L-Drag: Push"
+                            "Space: Play • R: Reset • M: Mesh • F12: Render • P: PNG • ?: Help • L-Drag: Pull"
                         } else {
-                            "Space: Play • R: Reset • M: Mesh • O: Orbit • P: PNG • ?: Help • R-Drag: Orbit"
+                            "Space: Play • R: Reset • M: Mesh • O: Orbit • F12: Render • P: PNG • ?: Help • R-Drag: Orbit"
                         });
                     });
                 });
             });
 
-        // 3. Left Studio Inspector Panel with 4 Organized Tabs
+        // 3. Left Studio Inspector Panel with 5 Organized Tabs (Scene | Physics | Visuals | Render | Export)
         egui::SidePanel::left("studio_inspector")
-            .default_width(332.0)
-            .min_width(310.0)
-            .max_width(430.0)
+            .default_width(372.0)
+            .min_width(352.0)
+            .max_width(450.0)
             .show(ctx, |ui| {
                 ui.add_space(3.0);
                 ui.horizontal(|ui| {
-                    let tab_w = ((ui.available_width() - 21.0) / 4.0).max(68.0);
+                    let sp = ui.spacing().item_spacing.x;
+                    let tab_w = ((ui.available_width() - sp * 4.0) / 5.0).max(58.0);
                     for &(tab, icon, label) in &[
                         (InspectorTab::Scene, UiIcon::Wave, "Scene"),
                         (InspectorTab::Physics, UiIcon::Sliders, "Physics"),
                         (InspectorTab::Surface, UiIcon::Mesh, "Visuals"),
-                        (InspectorTab::RenderCli, UiIcon::Film, "Export"),
+                        (InspectorTab::Render, UiIcon::Camera, "Render"),
+                        (InspectorTab::RenderCli, UiIcon::Save, "Export"),
                     ] {
-                        if Self::icon_button(
+                        if Self::inspector_tab_button(
                             ui,
                             icon,
                             label,
                             self.active_tab == tab,
-                            Some(egui::vec2(tab_w, 26.0)),
+                            tab_w,
                         )
                         .clicked()
                         {
                             self.active_tab = tab;
+                            match tab {
+                                InspectorTab::Render => {
+                                    self.central_view = CentralView::RenderResult;
+                                    if !bg_has_still && bg_anim_len == 0 && !bg_is_running {
+                                        self.start_gui_still_render(Some(ctx.clone()), false);
+                                    }
+                                }
+                                InspectorTab::Scene
+                                | InspectorTab::Physics
+                                | InspectorTab::Surface => {
+                                    if !bg_is_running {
+                                        self.central_view = CentralView::LiveViewport;
+                                    }
+                                }
+                                InspectorTab::RenderCli => {}
+                            }
                         }
                     }
                 });
@@ -4481,19 +5739,453 @@ impl eframe::App for LiquidApp {
                             InspectorTab::Scene => self.draw_scene_tab(ui),
                             InspectorTab::Physics => self.draw_physics_tab(ui),
                             InspectorTab::Surface => self.draw_surface_tab(ui),
+                            InspectorTab::Render => self.draw_render_tab(ctx, ui),
                             InspectorTab::RenderCli => self.draw_render_cli_tab(ctx, ui),
                         }
                         ui.add_space(10.0);
                     });
             });
 
-        // 4. Central Viewport: Custom OpenGL 3D Render (Particles OR Real-Time Surface Mesh)
-        let bg_rgb = self.mesh_config.env_preset.viewport_bg_rgb8();
+        // 3b. Central Workspace View Switcher Bar (Live 3D Viewport <-> Render Result)
+        egui::TopBottomPanel::top("central_workspace_bar")
+            .exact_height(32.0)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    let live_icon = if self.is_2d {
+                        UiIcon::Plane2D
+                    } else {
+                        UiIcon::Cube3D
+                    };
+                    if Self::icon_button(
+                        ui,
+                        live_icon,
+                        "Live 3D Viewport",
+                        self.central_view == CentralView::LiveViewport,
+                        None,
+                    )
+                    .on_hover_text("Interactive real-time simulation viewport")
+                    .clicked()
+                    {
+                        self.central_view = CentralView::LiveViewport;
+                    }
+
+                    let res_lbl = if bg_anim_len > 1 {
+                        format!("Render Result ({}f)", bg_anim_len)
+                    } else {
+                        "Render Result".to_string()
+                    };
+                    if Self::icon_button(
+                        ui,
+                        UiIcon::Image,
+                        &res_lbl,
+                        self.central_view == CentralView::RenderResult,
+                        None,
+                    )
+                    .on_hover_text("Inspect studio rendered image or play rendered video animation (F12)")
+                    .clicked()
+                    {
+                        self.central_view = CentralView::RenderResult;
+                        if !bg_has_still && bg_anim_len == 0 && !bg_is_running {
+                            self.start_gui_still_render(Some(ctx.clone()), false);
+                        }
+                    }
+
+                    if bg_is_running {
+                        ui.separator();
+                        ui.spinner();
+                        let prog_str = if bg_kind == StudioRenderKind::Animation && bg_total > 0 {
+                            format!(
+                                "Rendering {}/{} ({:.1}s)",
+                                bg_done, bg_total, bg_elapsed
+                            )
+                        } else {
+                            "Rendering Studio Frame...".to_string()
+                        };
+                        ui.colored_label(egui::Color32::from_rgb(108, 204, 255), prog_str);
+                    }
+
+                    if self.central_view == CentralView::RenderResult {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if (bg_has_still || bg_anim_len > 0)
+                                && Self::icon_button(ui, UiIcon::Save, "Save PNG", false, None)
+                                    .on_hover_text("Save displayed studio render result as lossless PNG")
+                                    .clicked()
+                            {
+                                self.save_rendered_result_png();
+                            }
+
+                            if !bg_is_running {
+                                let (rr_ic, rr_lbl) = match self.render_kind {
+                                    StudioRenderKind::StillFrame => (UiIcon::Camera, "Re-Render"),
+                                    StudioRenderKind::Animation => (UiIcon::Film, "Render Video"),
+                                };
+                                if Self::icon_button(ui, rr_ic, rr_lbl, false, None)
+                                    .on_hover_text("Trigger a fresh Studio render with current camera & scene")
+                                    .clicked()
+                                {
+                                    match self.render_kind {
+                                        StudioRenderKind::StillFrame => {
+                                            self.start_gui_still_render(
+                                                Some(ctx.clone()),
+                                                self.render_auto_save_png,
+                                            );
+                                        }
+                                        StudioRenderKind::Animation => {
+                                            self.start_gui_mp4_render_with_ctx(Some(ctx.clone()));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if ui
+                                .selectable_label(
+                                    (self.render_zoom - 1.0).abs() < 0.02,
+                                    "1:1",
+                                )
+                                .on_hover_text("Actual 100% pixel resolution")
+                                .clicked()
+                            {
+                                self.render_zoom = 1.0;
+                                self.render_pan = egui::Vec2::ZERO;
+                            }
+                            if ui
+                                .selectable_label(self.render_zoom <= 0.0, "Fit")
+                                .on_hover_text("Fit rendered frame inside workspace (C / Double-Click)")
+                                .clicked()
+                            {
+                                self.render_zoom = 0.0;
+                                self.render_pan = egui::Vec2::ZERO;
+                            }
+
+                            if bg_has_still || bg_anim_len > 0 {
+                                Self::draw_telemetry_pill(
+                                    ui,
+                                    format!("{}×{} • {}", bg_out_w, bg_out_h, bg_qual.slug()),
+                                    egui::Color32::from_rgb(154, 214, 255),
+                                );
+                                if !bg_backend.is_empty() {
+                                    Self::draw_telemetry_pill(
+                                        ui,
+                                        bg_backend.clone(),
+                                        egui::Color32::from_rgb(112, 224, 168),
+                                    );
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+
+        // 3c. Rendered Animation Timeline & Transport Bar (shown when Render Result has an animation)
+        if self.central_view == CentralView::RenderResult && bg_anim_len > 1 {
+            egui::TopBottomPanel::bottom("render_playback_bar")
+                .exact_height(36.0)
+                .show(ctx, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        let (p_ic, p_lbl) = if self.anim_playing {
+                            (UiIcon::Pause, "Pause")
+                        } else {
+                            (UiIcon::Play, "Play")
+                        };
+                        if Self::icon_button(
+                            ui,
+                            p_ic,
+                            p_lbl,
+                            self.anim_playing,
+                            Some(egui::vec2(66.0, 24.0)),
+                        )
+                        .on_hover_text("Play / Pause rendered animation (Space)")
+                        .clicked()
+                            && !bg_is_running
+                        {
+                            if !self.anim_playing && self.anim_play_idx + 1 >= bg_anim_len {
+                                self.anim_play_idx = 0;
+                            }
+                            self.anim_playing = !self.anim_playing;
+                            self.last_anim_tick = Instant::now();
+                        }
+
+                        if Self::icon_button(
+                            ui,
+                            UiIcon::StepBack,
+                            "",
+                            false,
+                            Some(egui::vec2(26.0, 24.0)),
+                        )
+                        .on_hover_text("Previous rendered frame (Left Arrow)")
+                        .clicked()
+                            && !bg_is_running
+                        {
+                            self.anim_playing = false;
+                            self.anim_play_idx = if self.anim_play_idx > 0 {
+                                self.anim_play_idx - 1
+                            } else {
+                                bg_anim_len - 1
+                            };
+                        }
+
+                        if Self::icon_button(
+                            ui,
+                            UiIcon::Step,
+                            "",
+                            false,
+                            Some(egui::vec2(26.0, 24.0)),
+                        )
+                        .on_hover_text("Next rendered frame (Right Arrow)")
+                        .clicked()
+                            && !bg_is_running
+                        {
+                            self.anim_playing = false;
+                            self.anim_play_idx = (self.anim_play_idx + 1) % bg_anim_len;
+                        }
+
+                        if ui
+                            .selectable_label(self.anim_loop, "Loop")
+                            .on_hover_text("Loop animation playback continuously")
+                            .clicked()
+                        {
+                            self.anim_loop = !self.anim_loop;
+                        }
+
+                        for &(spd, lbl) in &[(0.25f32, "0.25x"), (0.5f32, "0.5x"), (1.0f32, "1.0x")]
+                        {
+                            if ui
+                                .selectable_label((self.anim_speed - spd).abs() < 0.03, lbl)
+                                .clicked()
+                            {
+                                self.anim_speed = spd;
+                            }
+                        }
+
+                        ui.separator();
+
+                        let clamped_idx = self.anim_play_idx.min(bg_anim_len - 1);
+                        let cur_secs = clamped_idx as f32 / bg_fps as f32;
+                        let tot_secs = bg_anim_len as f32 / bg_fps as f32;
+                        Self::draw_telemetry_pill(
+                            ui,
+                            format!(
+                                "{:04}/{:04} • {:.2}s/{:.2}s",
+                                clamped_idx + 1,
+                                bg_anim_len,
+                                cur_secs,
+                                tot_secs
+                            ),
+                            egui::Color32::from_rgb(168, 214, 255),
+                        );
+
+                        let mut frame_one_based = clamped_idx + 1;
+                        let slider_w = (ui.available_width() - 8.0).max(80.0);
+                        ui.spacing_mut().slider_width = slider_w;
+                        let resp = ui.add(
+                            egui::Slider::new(&mut frame_one_based, 1..=bg_anim_len)
+                                .show_value(false),
+                        );
+                        if resp.changed() && !bg_is_running {
+                            self.anim_playing = false;
+                            self.anim_play_idx = frame_one_based.saturating_sub(1);
+                        }
+                    });
+                });
+        }
+
+        // 4. Central Workspace: EITHER Live OpenGL 3D Viewport OR Studio Render Result Viewer
+        let bg_rgb = if self.central_view == CentralView::RenderResult {
+            [8u8, 11, 18]
+        } else {
+            self.mesh_config.env_preset.viewport_bg_rgb8()
+        };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE.fill(egui::Color32::from_rgb(bg_rgb[0], bg_rgb[1], bg_rgb[2])),
             )
             .show(ctx, |ui| {
+                if self.central_view == CentralView::RenderResult {
+                    let available_size = ui.available_size();
+                    let (rect, response) =
+                        ui.allocate_exact_size(available_size, egui::Sense::click_and_drag());
+
+                    if response.double_clicked() {
+                        self.render_zoom = 0.0;
+                        self.render_pan = egui::Vec2::ZERO;
+                    }
+
+                    // Fetch active rendered frame & upload to egui GPU texture only when changed
+                    let frame_and_key = {
+                        if let Ok(g) = self.bg_render.lock() {
+                            if !g.anim_frames.is_empty() {
+                                let idx = if g.is_running {
+                                    g.anim_frames.len() - 1
+                                } else {
+                                    self.anim_play_idx.min(g.anim_frames.len() - 1)
+                                };
+                                if !g.is_running
+                                    && idx + 1 == g.anim_frames.len()
+                                    && g.full_res_frame.is_some()
+                                {
+                                    g.full_res_frame
+                                        .clone()
+                                        .map(|f| (f, (g.frame_revision, None)))
+                                } else {
+                                    Some((
+                                        g.anim_frames[idx].clone(),
+                                        (g.anim_generation, Some(idx)),
+                                    ))
+                                }
+                            } else {
+                                g.full_res_frame
+                                    .clone()
+                                    .map(|f| (f, (g.frame_revision, None)))
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some((frame, desired_key)) = frame_and_key {
+                        if self.render_texture.is_none() || self.render_uploaded_key != desired_key
+                        {
+                            let color_img = egui::ColorImage::from_rgb(
+                                [frame.width, frame.height],
+                                &frame.rgb,
+                            );
+                            if let Some(ref mut tex) = self.render_texture {
+                                tex.set(color_img, egui::TextureOptions::LINEAR);
+                            } else {
+                                self.render_texture = Some(ctx.load_texture(
+                                    "studio_render_result",
+                                    color_img,
+                                    egui::TextureOptions::LINEAR,
+                                ));
+                            }
+                            self.render_uploaded_key = desired_key;
+                        }
+
+                        if let Some(ref tex) = self.render_texture {
+                            let ppp = ctx.pixels_per_point().max(0.5);
+                            let img_pts_w = (bg_out_w.max(frame.width) as f32) / ppp;
+                            let img_pts_h = (bg_out_h.max(frame.height) as f32) / ppp;
+                            let pad = 24.0;
+                            let fit_scale = ((rect.width() - pad).max(32.0) / img_pts_w.max(1.0))
+                                .min((rect.height() - pad).max(32.0) / img_pts_h.max(1.0));
+
+                            let scroll_y = ctx.input(|i| i.smooth_scroll_delta.y);
+                            if scroll_y != 0.0 && response.hovered() {
+                                let base_z = if self.render_zoom <= 0.0 {
+                                    fit_scale
+                                } else {
+                                    self.render_zoom
+                                };
+                                self.render_zoom =
+                                    (base_z * (1.0 + scroll_y * 0.0018)).clamp(0.08, 8.0);
+                            }
+
+                            if response.dragged_by(egui::PointerButton::Primary)
+                                || response.dragged_by(egui::PointerButton::Middle)
+                            {
+                                self.render_pan += response.drag_delta();
+                            }
+
+                            let scale = if self.render_zoom <= 0.0 {
+                                fit_scale
+                            } else {
+                                self.render_zoom
+                            };
+                            let draw_size = egui::vec2(img_pts_w * scale, img_pts_h * scale);
+                            let img_rect =
+                                egui::Rect::from_center_size(rect.center() + self.render_pan, draw_size);
+
+                            let clipped = ui.painter().with_clip_rect(rect);
+                            let shadow_rect = img_rect.expand(3.0).translate(egui::vec2(0.0, 3.0));
+                            clipped.rect_filled(
+                                shadow_rect,
+                                egui::CornerRadius::same(4),
+                                egui::Color32::from_black_alpha(140),
+                            );
+                            clipped.image(
+                                tex.id(),
+                                img_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                            clipped.rect_stroke(
+                                img_rect,
+                                egui::CornerRadius::same(2),
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(44, 62, 92)),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                    } else if !bg_is_running {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            ui.centered_and_justified(|ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(rect.height() * 0.38);
+                                    ui.label(
+                                        egui::RichText::new("No Studio Render Generated Yet")
+                                            .size(16.0)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(190, 208, 235)),
+                                    );
+                                    ui.add_space(6.0);
+                                    if Self::icon_button(
+                                        ui,
+                                        UiIcon::Camera,
+                                        "Render Current Frame Now (F12)",
+                                        true,
+                                        Some(egui::vec2(240.0, 32.0)),
+                                    )
+                                    .clicked()
+                                    {
+                                        self.start_gui_still_render(
+                                            Some(ctx.clone()),
+                                            self.render_auto_save_png,
+                                        );
+                                    }
+                                });
+                            });
+                        });
+                    }
+
+                    if bg_is_running {
+                        let banner_txt = if bg_kind == StudioRenderKind::Animation && bg_total > 0 {
+                            format!(
+                                "Rendering Studio Animation — Frame {} / {} ({:.1}s)",
+                                bg_done, bg_total, bg_elapsed
+                            )
+                        } else {
+                            format!(
+                                "Rendering {}×{} Studio Frame ({})...",
+                                self.video_width,
+                                self.video_height,
+                                self.gui_render_quality.name()
+                            )
+                        };
+                        let banner_rect = egui::Rect::from_center_size(
+                            egui::pos2(rect.center().x, rect.top() + 26.0),
+                            egui::vec2(380.0_f32.min(rect.width() - 24.0), 30.0),
+                        );
+                        let p = ui.painter().with_clip_rect(rect);
+                        p.rect(
+                            banner_rect,
+                            egui::CornerRadius::same(6),
+                            egui::Color32::from_rgba_unmultiplied(12, 18, 30, 228),
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 134, 220)),
+                            egui::StrokeKind::Inside,
+                        );
+                        p.text(
+                            banner_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            banner_txt,
+                            egui::FontId::proportional(12.5),
+                            egui::Color32::from_rgb(168, 224, 255),
+                        );
+                    }
+                    return;
+                }
+
                 let available_size = ui.available_size();
                 let (rect, response) =
                     ui.allocate_exact_size(available_size, egui::Sense::click_and_drag());
@@ -4838,7 +6530,9 @@ impl eframe::App for LiquidApp {
                                 ("G", "Toggle 3D studio floor grid"),
                                 ("B", "Toggle chamber & obstacle wireframes"),
                                 ("O", "Toggle 360° turntable auto-orbit"),
-                                ("P / F12", "Capture Studio PNG screenshot"),
+                                ("F12", "Render Studio Frame & open Render Result view"),
+                                ("P", "Quick-save Studio PNG screenshot to exports/"),
+                                ("Left / Right", "Step rendered animation frame in Render View"),
                                 ("? / F1", "Show / hide this shortcuts window"),
                                 ("Left-Drag", "Attract fluid toward cursor ray"),
                                 ("Shift + Left-Drag", "Repel fluid away from cursor ray"),

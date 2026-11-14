@@ -1941,3 +1941,91 @@ fn test_gpu_renderer_particles_and_mesh_visual_parity() {
     }
 }
 
+#[test]
+fn test_gui_render_tab_still_and_animation_end_result() {
+    use liquid_rust::{
+        AnimationStartSource, CentralView, CliRenderQuality, InspectorTab, LiquidApp, RenderMode,
+        SimulationQuality, StudioRenderKind,
+    };
+    use std::time::{Duration, Instant};
+
+    let mut app = LiquidApp::new_headless();
+    app.set_quality(SimulationQuality::Draft);
+    app.active_tab = InspectorTab::Render;
+    app.central_view = CentralView::RenderResult;
+    app.use_gpu = true;
+    app.render_mode = RenderMode::SurfaceMesh;
+    app.video_width = 360;
+    app.video_height = 240;
+    app.gui_render_quality = CliRenderQuality::Studio;
+
+    // 1. Trigger Studio Still Frame render and verify full-res end result
+    app.start_gui_still_render(None, false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let running = app.bg_render.lock().unwrap().is_running;
+        if !running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "Still render timed out");
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    {
+        let g = app.bg_render.lock().unwrap();
+        assert_eq!(g.kind, StudioRenderKind::StillFrame);
+        assert_eq!(g.completed_frames, 1);
+        let still = g.full_res_frame.as_ref().expect("full_res_frame must exist");
+        assert_eq!(still.width, 360);
+        assert_eq!(still.height, 240);
+        assert_eq!(still.rgb.len(), 360 * 240 * 3);
+        let luma: f64 =
+            still.rgb.iter().map(|&b| b as f64).sum::<f64>() / still.rgb.len() as f64;
+        assert!(luma > 5.0, "Rendered studio frame should not be black, luma={}", luma);
+        assert!(!g.backend_label.is_empty());
+    }
+
+    // 2. Save rendered result PNG to temporary folder and verify valid PNG output
+    let tmp_dir = std::env::temp_dir().join("liquid_rust_gui_render_tab_test");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    app.export_path = tmp_dir.to_string_lossy().into_owned();
+    app.save_rendered_result_png();
+    let saved_png = tmp_dir.join("render_result_00000.png");
+    let png_bytes = std::fs::read(&saved_png).expect("saved PNG must exist");
+    assert_eq!(&png_bytes[0..8], b"\x89PNG\r\n\x1a\n");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    // 3. Trigger in-GUI Video Animation render (CurrentState, 5 frames) and verify progressive sequence
+    app.render_kind = StudioRenderKind::Animation;
+    app.render_anim_start = AnimationStartSource::CurrentState;
+    app.render_save_mp4 = false;
+    app.cli_fps = 20;
+    app.cli_duration = 0.25; // 5 frames
+    app.start_gui_mp4_render_with_ctx(None);
+
+    let deadline2 = Instant::now() + Duration::from_secs(30);
+    loop {
+        let running = app.bg_render.lock().unwrap().is_running;
+        if !running {
+            break;
+        }
+        assert!(Instant::now() < deadline2, "Animation render timed out");
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    {
+        let g = app.bg_render.lock().unwrap();
+        assert_eq!(g.kind, StudioRenderKind::Animation);
+        assert_eq!(g.completed_frames, 5);
+        assert_eq!(g.anim_frames.len(), 5);
+        assert!(g.just_finished_anim);
+        assert!(g.full_res_frame.is_some());
+        assert_ne!(
+            &*g.anim_frames[0].rgb,
+            &*g.anim_frames[4].rgb,
+            "Animation frames should evolve across physics timesteps"
+        );
+    }
+}
+
+

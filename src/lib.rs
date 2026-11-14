@@ -7,7 +7,7 @@ pub mod scene_io;
 pub mod sph;
 pub mod updater;
 
-pub use app::LiquidApp;
+pub use app::{AnimationStartSource, CentralView, InspectorTab, LiquidApp, StudioRenderKind};
 pub use export::{Mp4Encoder, PlyExporter, PngExporter, SoftwareRenderer};
 pub use gpu::{GpuRenderer, GpuSphSolver, GpuSurfaceField};
 pub use math::{unproject_mouse_ray, Aabb, Ray};
